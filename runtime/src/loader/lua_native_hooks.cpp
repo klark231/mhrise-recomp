@@ -483,19 +483,6 @@ void index_entries(uintptr_t encoded_base) {
   destinations.swap(targets);
   entries.swap(ordered);
 }
-// The same registers and stack slots for every argument, whatever their types. Value types go by address, so two
-// overloads that only take different structs (snow.PlayerNetwork's 26 receive(packet, int)) pass them the same way.
-bool same_registers(const Layout &a, const Layout &b) {
-  if (a.args.size() != b.args.size() || a.stack_bytes != b.stack_bytes ||
-      a.result.kind != b.result.kind)
-    return false;
-  for (size_t i = 0; i < a.args.size(); ++i)
-    if (a.args[i].type.kind != b.args[i].type.kind ||
-        a.args[i].location != b.args[i].location ||
-        a.args[i].offset != b.args[i].offset)
-      return false;
-  return true;
-}
 void describe_site(Site &site, uint32_t method, const Layout &layout,
                    uintptr_t address) {
   site.stack_bytes = layout.stack_bytes;
@@ -523,10 +510,9 @@ void describe_site(Site &site, uint32_t method, const Layout &layout,
     compatible &= layout == candidate;
     auto [where, fresh] = owners.emplace(owner, candidate);
     if (!fresh && !(where->second == candidate)) {
-      // Overloads of one class the compiler made into one function: nothing at run time says which was called, so a
-      // hook on one of them also sees the others' calls (a script can tell them apart by the argument's type).
-      if (!same_registers(where->second, candidate))
-        throw std::runtime_error("Same receiver has incompatible signatures at shared entry");
+      // Methods of one class the compiler made into one function (PlayerNetwork's 26 receive(packet, int) overloads,
+      // with others). The code is the same, so it reads its registers the same way whichever was called: the hook
+      // reads them as the hooked one declares them, and also sees the others' calls. (The stack size was checked above.)
       folded = true;
     }
   }
