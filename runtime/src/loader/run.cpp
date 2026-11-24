@@ -110,11 +110,27 @@ extern "C" __attribute__((visibility("hidden"))) int dl_iterate_phdr(int (*cb)(d
     return cb(&info, sizeof info, data);
 }
 
+#ifdef MHRISE_LUA_DEBUG
+#include "loader/tdb_lua.h"
+#include "nnsdk/ini.h"
+#include <filesystem>
+#endif
+
 int nier_run(const RunConfig& cfg) {
     install_crash_handler();
     std::string err;
     if (!init_imports(cfg.nnsdk, err)) die(err);
     if (!load_nso(cfg.exefs + "/main", g_main, err)) die(err);
+#ifdef MHRISE_LUA_DEBUG
+    if (const char* priv = getenv("NIER_INTERNO")) {
+        const auto scripts = std::filesystem::path(priv) / "reframework" / "autorun";
+        // The Lua runtime only starts with a script folder, so there's always one: a script mod added while the game
+        // runs then loads in place (the settings menu asks for a reload) instead of waiting for the next start
+        std::error_code ignored;
+        std::filesystem::create_directories(scripts, ignored);
+        run_tdb_autorun(g_main, scripts);
+    }
+#endif
     bool have_sdk = load_nso(cfg.exefs + "/sdk", g_sdk, err);
     if (!have_sdk) printf("[aviso] sin sdk para las constantes: %s\n", err.c_str());
     register_module(&g_main);
@@ -122,7 +138,12 @@ int nier_run(const RunConfig& cfg) {
            g_main.symbols.size(), g_main.relocs.size());
 
     auto resolve = [&](const ElfSym& s) { return resolve_import(s, have_sdk ? &g_sdk : nullptr); };
-    if (!relocate(g_main, resolve, err) || !probe::install(g_main, err) || !tls::patch(g_main, err) ||
+    size_t player_update = 0;
+#ifdef MHRISE_LUA_DEBUG
+    if (const char* priv = getenv("NIER_INTERNO"))
+        player_update = prepare_player_probe(g_main, std::filesystem::path(priv) / "reframework");
+#endif
+    if (!relocate(g_main, resolve, err) || !probe::install(g_main, err, player_update) || !tls::patch(g_main, err) ||
         !protect(g_main, err))
         die(err);
     report_imports(cfg.list_stubs);
@@ -166,6 +187,9 @@ int nier_run(const RunConfig& cfg) {
     const std::string threads_request = std::string(data ? data : ".") + "/hilos";
     for (int tenths = 1, snapshots = 0; !g_done; tenths++) {
         usleep(100'000);
+#ifdef MHRISE_LUA_DEBUG
+        if (tenths % 10 == 0) poll_player_request();
+#endif
         if (tenths % 10 == 0 && list_threads && access(threads_request.c_str(), F_OK) == 0) {
             unlink(threads_request.c_str());
             pthread_t others[64];

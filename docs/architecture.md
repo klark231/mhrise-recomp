@@ -103,19 +103,8 @@ The game's buffers are its own memory, and the GPU can't read that memory direct
 ### Shaders
 
 1. `program.cpp` gets the stage's Maxwell code and its control section, and `runtime/recompiler/nvn_shader.cpp`
-   translates it to SPIR-V with **Eden's shader recompiler**. `tools/setup.sh` fetches Eden at a pinned commit and applies
-   `tools/patches/eden-*.patch`:
-   - `eden-bindless-arrays`: textures indexed from a constant buffer with a dynamic index, counted up to the 64 KB a
-     constant buffer can hold. It also keeps the `& mask | sampler` that the game applies to a handle; without that
-     the fixed sampler is lost (the shadow sampler, for one).
-   - `eden-draw-parameters`: base vertex, base instance and draw ID from Vulkan's draw parameters.
-   - `eden-gs-stream0`: geometry shaders that only use stream 0.
-   - `eden-invariant-position`: the same position math in every shader, so a depth pre-pass and an EQUAL colour pass
-     agree.
-   - `eden-isgeneric`: a fix to which attributes count as generics.
-   - `eden-quad-butterfly`: in pixel shaders, butterfly shuffles by 1..3 become quad swaps, which include the helper
-     pixels on triangle edges.
-   - `eden-unreachable-qualcomm`: an `OpReturn` in place of `OpUnreachable` where Qualcomm's driver mis-optimises.
+   translates it to SPIR-V with **Eden's shader recompiler**, kept with this project's changes in `runtime/eden` (its
+   README lists them).
 2. Some modules then go through **spirv-opt** (`spirv_opt.cpp`): compute shaders always, and graphics shaders that
    contain a switch (BRX). That's because Qualcomm's compiler mishandles the flag-based control flow Eden builds for
    switches. Functions the shader never calls are removed (with the capability they bring), unless
@@ -126,7 +115,7 @@ The game's buffers are its own memory, and the GPU can't read that memory direct
    and `kKeyVersion` in `program.cpp`. **Bump `kKeyVersion` whenever a change alters the SPIR-V produced**, or old
    cached translations keep being used. A graphics stage missing from the cache is translated on a background thread
    (`translate_or_queue`); the draws that need it are skipped until it's ready, instead of the game freezing on it.
-   Compute shaders are still translated where they're used. `no_async_shaders` turns this off.
+   Compute shaders are still translated where they're used. The spirv-opt pass of a new compute shader with a switch runs on that thread, though: the plain translation is used until it's done (`sync_spirv_opt` turns this off). `no_async_shaders` turns this off.
 4. Pipelines: built in the background, with a warm-up at start (`pipelines_estado.bin` lists what was used last time)
    and the driver's pipeline cache. If a driver rejects a pipeline, the stages are retranslated more conservatively
    (`no_safe_translation` turns that off), and the rejected SPIR-V goes to `<data>/pipelines_fallidas/`.

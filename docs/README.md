@@ -1,7 +1,7 @@
 # Developer notes
 
 What the port is made of, and what we learned getting Monster Hunter Rise to run on Android phones. The main
-[README](../README.md) is for players (install, settings, every switch); these pages are for whoever works on the code.
+[README](../README.md) covers installation and first launch. The [settings reference](settings.md) lists runtime switches.
 
 - [How the port works](architecture.md): the loader, the SDK layer, NVN on Vulkan, memory, shaders, presenting.
 - [Monster Hunter Rise, as the port sees it](mh-rise.md): how the game renders, the engine objects and addresses the port

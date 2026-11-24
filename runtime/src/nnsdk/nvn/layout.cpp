@@ -1,6 +1,7 @@
 #include "nnsdk/nvn/layout.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace nvn {
@@ -18,10 +19,11 @@ uint32_t pow2_ceil(uint32_t v) {
     return p;
 }
 
-// Alto del bloque del nivel 0: lo justo para cubrir el alto en GOBs, hasta 16; las mips lo reducen
-// a la mitad mientras el nivel quepa en medio bloque.
-uint32_t base_block_height(uint32_t height_blocks) {
-    return std::min<uint32_t>(16, pow2_ceil(div_ceil(height_blocks, kGobHeight)));
+// Para una textura 2D sin layout empaquetado, NVN elige la potencia de dos de GOBs
+// que cabe en una vez y media las filas de bloques del nivel 0 (entre 1 y 16 GOBs).
+uint32_t default_2d_block_height(uint32_t height_blocks) {
+    const uint64_t gobs = uint64_t{height_blocks} * 3 / (2 * kGobHeight);
+    return std::bit_floor(static_cast<uint32_t>(std::clamp<uint64_t>(gobs, 1, 16)));
 }
 
 uint32_t level_block_height(uint32_t base, uint32_t height_blocks) {
@@ -61,14 +63,20 @@ TextureLayout compute_layout(uint32_t width, uint32_t height, uint32_t depth, ui
     // 3D: como mucho 16 GOBs por bloque, primero en profundidad. Medido en un LUT de color de MH Rise de 32x32x32
     // RGBA8: 1 GOB de alto y 16 de fondo (con 4x32, los cortes se mezclaban y la imagen salía psicodélica).
     uint32_t base_bd = is_3d ? std::min<uint32_t>(16, pow2_ceil(depth)) : 1;
-    uint32_t base_bh = std::min<uint32_t>(base_block_height(div_ceil(height, block_h)), std::max<uint32_t>(16 / base_bd, 1));
     // Texturas empaquetadas (las sparse del streaming de MH Rise traen "03 04 00 00 07 00 01 00"): bloque de 8 GOBs de
     // alto y pitch alineado a 16 GOBs, o sea tiles de 16x8 GOBs = 64 KB, la página sparse. Con el alto calculado (16 en
     // 1024x1024) los niveles 0 y 1 salían revueltos (bandas repetidas y columnas de GOBs cambiadas): las manchas negras
     // y los parches de las caras al acercarse. Medido sobre la memoria del juego: con 8 GOBs la cara de Hinoa (BC1), su
     // mapa de normales (BC7) y las pestañas (BC4) salen limpias; el kimono en ASTC 6x6 necesita además el pitch de 48
     // GOBs en el nivel 0 (43 usados + 5 de relleno, se ve en las páginas a cero) y de 32 en el 1.
-    if (block_height_log2 >= 0) base_bh = 1u << std::min(block_height_log2, 5);
+    const uint32_t height_blocks = div_ceil(height, block_h);
+    uint32_t base_bh;
+    if (block_height_log2 >= 0)
+        base_bh = 1u << std::min(block_height_log2, 5);
+    else if (is_3d)
+        base_bh = level_block_height(16 / base_bd, height_blocks);
+    else
+        base_bh = default_2d_block_height(height_blocks);
     const uint32_t tile_w = 1u << std::min<uint32_t>(tile_width_log2, 5);  // en GOBs
     size_t offset = 0;
     for (uint32_t l = 0; l < levels; l++) {

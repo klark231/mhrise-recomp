@@ -22,10 +22,23 @@ import java.util.regex.Pattern;
 // java ... DumpScanner <carpeta>.
 final class DumpScanner {
 
+    static final class Problem {
+        private final String english, chinese;
+
+        Problem(String english, String chinese) {
+            this.english = english;
+            this.chinese = chinese;
+        }
+
+        String text(boolean useChinese) {
+            return useChinese ? chinese : english;
+        }
+    }
+
     static final class Result {
         String exefs, romfs;
         final TreeMap<Integer, String> dlc = new TreeMap<>();  // índice del DLC -> su RomFS
-        String exefsProblem, romfsProblem;  // por qué no vale lo que se encontró (null: no había nada)
+        Problem exefsProblem, romfsProblem;  // por qué no vale lo que se encontró (null: no había nada)
         int unknownDlc;  // RomFS de DLC sin su id de título en el nombre de ninguna carpeta
 
         boolean ready() {
@@ -84,7 +97,8 @@ final class DumpScanner {
         if (npdm == null || nso == null || npdm.length < 0x80 || nso.length < 0x60) return;
         if (!magic(npdm, 0, "META") || !magic(nso, 0, "NSO0")) {
             if (result.exefsProblem == null)
-                result.exefsProblem = "The ExeFS in \"" + dir.getName() + "\" is encrypted or not an extracted ExeFS.";
+                result.exefsProblem = new Problem("The ExeFS in \"" + dir.getName() + "\" is encrypted or not an extracted ExeFS.",
+                        "“" + dir.getName() + "”中的 ExeFS 仍加密或格式不正确。请选择已提取的 ExeFS。");
             return;
         }
         int aci = (int) le(npdm, 0x70, 4);
@@ -93,10 +107,11 @@ final class DumpScanner {
         for (int k = 0x40; k < 0x54; k++) build.append(String.format("%02x", nso[k] & 0xff));
         if (le(npdm, aci + 0x10, 8) != Game.APP_ID) {
             if (result.exefsProblem == null)
-                result.exefsProblem = "The ExeFS in \"" + dir.getName() + "\" belongs to a different game.";
+                result.exefsProblem = new Problem("The ExeFS in \"" + dir.getName() + "\" belongs to a different game.",
+                        "“" + dir.getName() + "”中的 ExeFS 来自其他游戏。");
         } else if (!build.toString().equals(Game.BUILD_ID)) {
-            result.exefsProblem = "The ExeFS is from a different game version: this port needs " + Game.VERSION
-                    + ". Extract it again with update " + Game.VERSION + " installed.";
+            result.exefsProblem = new Problem("Install update " + Game.VERSION + " and extract the ExeFS again.",
+                    "ExeFS 版本不匹配。请应用 " + Game.VERSION + " 更新后重新提取。");
         } else {
             result.exefs = dir.getPath();
             result.exefsProblem = null;
@@ -109,7 +124,8 @@ final class DumpScanner {
             result.romfs = dir.getPath();
             result.romfsProblem = null;
         } else {
-            result.romfsProblem = "The RomFS does not include update " + Game.VERSION + ": extract it again with the update applied.";
+            result.romfsProblem = new Problem("The RomFS is missing update " + Game.VERSION + ". Apply the update and extract it again.",
+                    "RomFS 缺少 " + Game.VERSION + " 更新。请应用更新后重新提取。");
         }
     }
 
@@ -188,8 +204,8 @@ final class DumpScanner {
 
     public static void main(String[] args) {
         Result r = scan(new File(args[0]));
-        System.out.println("exefs: " + r.exefs + (r.exefsProblem != null ? " — " + r.exefsProblem : ""));
-        System.out.println("romfs: " + r.romfs + (r.romfsProblem != null ? " — " + r.romfsProblem : ""));
+        System.out.println("exefs: " + r.exefs + (r.exefsProblem != null ? " — " + r.exefsProblem.text(false) : ""));
+        System.out.println("romfs: " + r.romfs + (r.romfsProblem != null ? " — " + r.romfsProblem.text(false) : ""));
         System.out.println("dlc: " + r.dlc.size() + (r.dlc.isEmpty() ? "" : " (" + r.dlc.firstKey() + ".." + r.dlc.lastKey() + ")")
                 + ", unknown: " + r.unknownDlc + ", ready: " + r.ready());
     }

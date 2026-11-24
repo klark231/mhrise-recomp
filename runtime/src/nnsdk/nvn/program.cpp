@@ -278,7 +278,7 @@ bool translation_key(const nvn::ProgramStage& stage, size_t bound, const nvnshad
     h.u32(o.subgroup_operations);
     h.u32(o.broken_subgroup_shuffle);
     h.u32(o.broken_unreachable);
-    if (o.broken_pack_half) h.u32(0x48414C46);  // (only where it's on: other GPUs keep their keys)
+    if (o.broken_pack_half) h.u32(0x48414C34);  // (only where it's on; 4: integer packing, F2F.F16.F32 and the point size)
     if (o.demote_reorder) h.u32(0x44454D4F);  // (only where it's on: other GPUs keep their keys)
     if (o.warp_barriers) h.u32(0x57415250);  // (only where it's on: other GPUs keep their keys)
     if (!o.multi_viewport) h.u32(0x4D56);  // (solo sin multiViewport: las claves de siempre no cambian)
@@ -316,6 +316,9 @@ bool qualcomm_7xx_stock() {
     }();
     return yes;
 }
+
+// A compute's spirv-opt translation, to the background thread (defined with it, below)
+void queue_optimized(const nvn::ProgramStage& stage, const nvn::spirv_cache::Key& opt_key);
 
 // safe: el nivel de traducción prudente (nvn::safe_variant; 0, la de siempre). input_types: los de los atributos de un
 // vertex shader (nvnshader::Options; nvn::vertex_variant)
@@ -420,10 +423,15 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
         options.broken_unreachable = (c->props.vendorID == 0x5143 && !NVN_FLAG("no_return_qualcomm")) ||
                                      (c->props.vendorID == 0x13B5 && !NVN_FLAG("no_return_mali"));
         // ARM's older drivers (no draw-indirect-count, as for short subgroups): packHalf2x16 in vertex stages from integer
-        // operations. A Mali-G68's (Vulkan 1.1.177) aborted the game compiling it; the G615's newer driver compiles it fine
+        // operations, and plain f32-to-f16 conversions through them. A Mali-G68's and a G57's (Vulkan 1.1.177) aborted
+        // the game compiling either; the G615's newer driver compiles it fine
         // and keeps its single instruction. <data>/pack_half_fix forces it on any Mali, <data>/no_pack_half_fix turns it off.
         options.broken_pack_half = c->props.vendorID == 0x13B5 && !NVN_FLAG("no_pack_half_fix") &&
                                    (NVN_FLAG("pack_half_fix") || !c->draw_indexed_indirect_count);
+        static bool pack_half_logged = false;
+        if (c->props.vendorID == 0x13B5 && !pack_half_logged && (pack_half_logged = true))
+            NVN_LOG("Mali f16 fix (packHalf2x16 and f32-to-f16 in vertex stages as integer operations): %s\n",
+                    options.broken_pack_half ? "on" : "off");
         // Samsung's Xclipse (vendor 0x144D, AMD RDNA inside) and AMD (0x1002): discards moved to the end, as Eden does
         // for them. <data>/no_demote_reorder at translation: as before; <data>/demote_reorder forces it on any GPU.
         options.demote_reorder = NVN_FLAG("demote_reorder") ||
@@ -520,6 +528,11 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
         if (ok && final_key) {
             nvn::spirv_cache::global().insert(*final_key, out.shader);
             out.cache_key = *final_key;
+            // On the Mali drivers whose compiler aborts the game on some vertex stages, a new one is on disk before
+            // its pipeline is built (the writer thread would lose it to the abort): spirv.bin then has the culprit.
+            if (options.broken_pack_half && out.shader.stage != nvnshader::Stage::Fragment &&
+                out.shader.stage != nvnshader::Stage::Compute)
+                nvn::spirv_cache::global().wait_idle();
         }
         if (ok) note_spirv_opt(print, out.shader);
     }
@@ -537,7 +550,16 @@ bool translate_stage(nvn::ProgramStage& out, uint64_t previous_stores = ~0ull, i
         const bool opt_cacheable = cacheable && translation_key(out, bound, opt, barriers_kept && keep, opt_key);
         nvnshader::Translated optimized;
         bool got = opt_cacheable && nvn::spirv_cache::global().find(opt_key, optimized);
-        if (!got) {
+        // A new compute: spirv-opt on its own thread, and the plain translation meanwhile. On the executor it stopped the
+        // game for seconds (a 200000-word one, 3.1 s on an A725 with Turnip; 6.7 s in one submit with the rest), and an
+        // online hunt took that for a lost connection and closed the session. The first dispatches use the flag-based
+        // flow the driver may get wrong (see spirv_opt_stages), for a moment. <data>/sync_spirv_opt (live): as before.
+        const bool defer = !got && out.shader.stage == nvnshader::Stage::Compute && !t_prefetch && opt_cacheable &&
+                           (out.cache_key.a | out.cache_key.b) != 0 && barrier_entry < 0 && !NVN_FLAG("sync_spirv_opt");
+        if (defer) {
+            queue_optimized(out, opt_key);
+            out.optimize_pending = true;
+        } else if (!got) {
             got = nvnshader::translate(reinterpret_cast<const uint8_t*>(out.code), bound, opt, optimized);
             if (got) {
                 note_spirv_opt(print, optimized);
@@ -830,41 +852,83 @@ void prefetch(uint64_t code, const void* control) {
 // the cache (as the preload does) and the draws that use it wait, a few frames at most: the effect shows a little late
 // the first time instead of the game stopping. Compute shaders still translate here (a dispatch can't wait: its results
 // would be missing). <data>/no_async_shaders (live): all in NvnSubmit, as before.
+// The same thread runs the spirv-opt pass of new compute shaders (queue_optimized), by their plain translation's key.
 struct AsyncShader {
     int state = 0;  // 1 queued or translating, 2 done (in the cache), 3 failed
 };
+struct AsyncJob {
+    uint64_t id;
+    uint64_t code;
+    const void* control;
+    bool optimize = false;  // a compute's spirv-opt
+    nvn::spirv_cache::Key plain;  // (its plain translation's key, in g_optimized)
+};
+struct Optimized {
+    nvn::spirv_cache::Key opt_key;
+    int state = 1;  // as AsyncShader
+};
 std::mutex g_async_mutex;
 std::condition_variable g_async_cv;
-std::deque<std::pair<uint64_t, std::pair<uint64_t, const void*>>> g_async_queue;  // (id, (code, control))
+std::deque<AsyncJob> g_async_queue;
 std::unordered_map<uint64_t, AsyncShader> g_async;
+std::unordered_map<nvn::spirv_cache::Key, Optimized, nvn::spirv_cache::KeyHash> g_optimized;  // by the plain key
+std::atomic<int> g_optimized_late{0};
+
+void start_async_thread();  // (with g_async_mutex held)
 
 void async_shader_loop() {
     pthread_setname_np(pthread_self(), "ShaderAsync");
     setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 5);
     t_prefetch = true;  // (its failures aren't counted or dumped: the executor translates those itself)
     for (;;) {
-        std::pair<uint64_t, std::pair<uint64_t, const void*>> job;
+        AsyncJob job;
+        nvn::spirv_cache::Key opt_key;
         {
             std::unique_lock lock(g_async_mutex);
             g_async_cv.wait(lock, [] { return !g_async_queue.empty(); });
             job = g_async_queue.front();
             g_async_queue.pop_front();
+            if (job.optimize) opt_key = g_optimized[job.plain].opt_key;
         }
         bool ok = false;
         Snapshot snap;
-        if (take_snapshot(job.second.first, job.second.second, snap) && known_stage(snap) && !compute_snapshot(snap)) {
+        if (take_snapshot(job.code, job.control, snap) && known_stage(snap) && compute_snapshot(snap) == job.optimize) {
             nvn::ProgramStage stage;
             stage.code = reinterpret_cast<uint64_t>(snap.code.data());
             stage.control = snap.control.data();
             set_stage_constants(stage);
+            // (a compute comes back from the cache plain and goes through spirv-opt here, as on the executor before)
             ok = translate_stage(stage, ~0ull, 0, snap.code.size());
+            if (job.optimize) {
+                ok = ok && stage.cache_key == opt_key;
+                if (ok) nvn::prefetch_compute_pipeline(stage);  // its pipeline too, if the warm-up thread is running
+            }
             const VkDevice device = nvn::vk()->device;
             if (stage.module) vkDestroyShaderModule(device, stage.module, nullptr);
             if (stage.stripped_module) vkDestroyShaderModule(device, stage.stripped_module, nullptr);
         }
         std::lock_guard lock(g_async_mutex);
-        g_async[job.first].state = ok ? 2 : 3;
+        if (!job.optimize) g_async[job.id].state = ok ? 2 : 3;
+        else g_optimized[job.plain].state = ok ? 2 : 3;
     }
+}
+
+void start_async_thread() {
+    static bool started = false;
+    if (!started) {
+        started = true;
+        std::thread(async_shader_loop).detach();  // lives as long as the process
+    }
+}
+
+void queue_optimized(const nvn::ProgramStage& stage, const nvn::spirv_cache::Key& opt_key) {
+    {
+        std::lock_guard lock(g_async_mutex);
+        if (!g_optimized.emplace(stage.cache_key, Optimized{opt_key}).second) return;  // another program with it
+        start_async_thread();
+        g_async_queue.push_back({0, stage.code, stage.control, true, stage.cache_key});
+    }
+    g_async_cv.notify_one();
 }
 
 }  // namespace
@@ -898,13 +962,9 @@ int nvn::translate_or_queue(ProgramStage& stage) {
     if (!t_cache_missed || state != 0) return ensure_translated(stage), 0;
     {
         std::lock_guard lock(g_async_mutex);
-        static bool started = false;
-        if (!started) {
-            started = true;
-            std::thread(async_shader_loop).detach();  // lives as long as the process
-        }
+        start_async_thread();
         g_async[id].state = 1;
-        g_async_queue.emplace_back(id, std::make_pair(stage.code, stage.control));
+        g_async_queue.push_back({id, stage.code, stage.control});
     }
     g_async_cv.notify_one();
     return 1;
@@ -917,6 +977,33 @@ bool nvn::ensure_translated(ProgramStage& stage) {
         translate_stage(stage);
     }
     return stage.module != VK_NULL_HANDLE;
+}
+
+void nvn::take_optimized(ProgramStage& stage) {
+    nvn::spirv_cache::Key opt_key;
+    {
+        std::lock_guard lock(g_async_mutex);
+        const auto it = g_optimized.find(stage.cache_key);
+        if (it != g_optimized.end() && it->second.state == 1) return;  // not yet
+        stage.optimize_pending = false;
+        if (it == g_optimized.end() || it->second.state != 2) return;  // failed: it keeps the plain one
+        opt_key = it->second.opt_key;
+    }
+    nvnshader::Translated optimized;
+    if (!nvn::spirv_cache::global().find(opt_key, optimized) || optimized.resources.size() != stage.shader.resources.size())
+        return;
+    VkShaderModule module = VK_NULL_HANDLE;
+    nvn::VkContext* c = nvn::vk();
+    if (nvn::create_shader_module(c->device, optimized.spirv, &module) != VK_SUCCESS) return;
+    // (pipelines already made with the plain module don't need it; the new spirv_id gives this one its own)
+    if (stage.module) vkDestroyShaderModule(c->device, stage.module, nullptr);
+    stage.module = module;
+    stage.shader = std::move(optimized);
+    stage.cache_key = opt_key;
+    stage.spirv_id = nvn::spirv_identity(stage.shader);
+    if (g_optimized_late++ < 16)
+        NVN_LOG("shader %016llx (compute): spirv-opt done in the background, swapped in\n",
+                static_cast<unsigned long long>(stage.print));
 }
 
 bool nvn::use_stripped_module(const ProgramStage& stage) {
@@ -945,6 +1032,34 @@ nvn::ProgramStage::Variant nvn::geometry_variant(ProgramStage& stage, uint64_t p
         v.cache_key = variant.cache_key;
     }
     return stage.variants[key] = v;
+}
+
+int nvn::tess_domain(const ProgramStage& control) {
+    // The highest outer and inner level the SPIR-V stores to: quads write four and two, triangles three and one,
+    // isolines two and none (the levels are arrays indexed by constants: OpAccessChain, then OpStore)
+    const std::vector<uint32_t>& w = control.shader.spirv;
+    if (w.size() < 5) return 0;
+    std::unordered_map<uint32_t, uint32_t> level, constant;  // variable -> 0 outer, 1 inner; id -> value
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> chain;  // pointer -> (outer/inner, index)
+    int outer = -1, inner = -1;
+    for (size_t i = 5; i < w.size();) {
+        const uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || i + n > w.size()) return 0;
+        if (op == 71 && n == 4 && w[i + 2] == 11 && (w[i + 3] == 11 || w[i + 3] == 12))  // OpDecorate BuiltIn TessLevel*
+            level[w[i + 1]] = w[i + 3] - 11;
+        else if (op == 43 && n == 4) constant[w[i + 2]] = w[i + 3];  // OpConstant
+        else if (op == 65 && n == 5 && level.count(w[i + 3]) && constant.count(w[i + 4]))  // OpAccessChain
+            chain[w[i + 2]] = {level[w[i + 3]], constant[w[i + 4]]};
+        else if (op == 62 && n >= 3 && chain.count(w[i + 1])) {  // OpStore
+            auto [which, index] = chain[w[i + 1]];
+            int& top = which ? inner : outer;
+            top = std::max(top, static_cast<int>(index));
+        }
+        i += n;
+    }
+    if (outer >= 3 || inner >= 1) return 3;
+    if (outer == 2 || inner == 0) return 2;
+    return outer >= 0 ? 1 : 0;
 }
 
 nvn::ProgramStage::Variant nvn::vertex_variant(ProgramStage& stage, uint64_t input_types) {

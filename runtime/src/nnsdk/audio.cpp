@@ -15,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "nnsdk/activity.h"
 #include "nnsdk/audio_cola.h"
 #include "nnsdk/os.h"
 #include "nnsdk/types.h"
@@ -135,11 +136,34 @@ public:
 // abrir y arrancar AAudio tarda ~65 ms y antes lo hacía el primer OpenDefaultAudioOut, dentro del hilo de audio
 // de Wwise. Mientras no hay AAudio, o si deja de llamar (desconexión, su hilo sin CPU), el reloj de reserva
 // libera los buffers a tiempo real: Wwise nunca ve una salida parada.
+class SharedStream;
+std::atomic<SharedStream*> existing_stream{nullptr};
+
 class SharedStream {
 public:
     static SharedStream& get() {
         static SharedStream s;
         return s;
+    }
+
+    void activity_changed(bool resumed) {
+        std::lock_guard control(control_);
+        {
+            std::lock_guard lock(m_);
+            paused_ = !resumed;
+            last_callback_ns_ = 0;
+            reloj_.ultimo_ns = ahora_ns();
+            reloj_.resto = 0;
+        }
+        if (auto* s = stream_.load(); s && resumed != requested_start_) {
+            aaudio_result_t r = resumed ? AAudioStream_requestStart(s) : AAudioStream_requestPause(s);
+            if (r == AAUDIO_OK) {
+                requested_start_ = resumed;
+            } else {
+                printf("[audio] activity transition: %s\n", AAudio_convertResultToText(r));
+                dead_ = true;
+            }
+        }
     }
 
     void attach(HostAudioOut* out) {
@@ -178,6 +202,7 @@ public:
         {
             std::lock_guard lock(m_);
             const int64_t t = ahora_ns();
+            if (paused_ || !nnsdk::activity_state().foreground()) return nullptr;
             const int64_t last_cb = last_callback_ns_.load(std::memory_order_relaxed);
             if (size_t n = cont ? reloj_.frames(t, last_cb, kSampleRate) : 0) {  // audio_v1: sin reloj de reserva
                 reserva_frames_ += cola_.descartar(n);
@@ -198,6 +223,7 @@ public:
 
 private:
     SharedStream() {
+        existing_stream.store(this);
         std::thread([this] { open(); }).detach();
     }
     void open() {
@@ -218,7 +244,12 @@ private:
                    AAudio_convertResultToText(r));
             return;
         }
-        r = AAudioStream_requestStart(s);
+        std::lock_guard control(control_);
+        requested_start_ = nnsdk::activity_state().foreground();
+        if (requested_start_) {
+            r = AAudioStream_requestStart(s);
+            if (r != AAUDIO_OK) dead_ = true;
+        }
         {
             // Con la ruta de baja latencia (MMAP, ráfagas de 2 ms) 40 ms sin callback es un atasco; con una ruta de
             // ráfagas largas (Bluetooth) el umbral crece para no tirar audio que AAudio sí iba a pedir.
@@ -239,6 +270,7 @@ private:
         {
             // informe_locked usa el stream con m_ tomado: que no se cierre a medias. El cierre va fuera del lock (espera a
             // que acabe el callback, que también toma m_).
+            std::lock_guard control(control_);
             std::lock_guard lock(m_);
             s = stream_.exchange(nullptr);
         }
@@ -286,11 +318,14 @@ private:
     }
     static unsigned long long ull(uint64_t v) { return static_cast<unsigned long long>(v); }
 
+    std::mutex control_;  // serialize stream publication and Activity requests with disconnection
+    bool requested_start_ = false;
     std::atomic<AAudioStream*> stream_{nullptr};
     std::atomic<bool> dead_{false};
     std::atomic<aaudio_result_t> last_error_{0};
     std::atomic<int64_t> last_callback_ns_{0}, max_gap_ns_{0};
     std::mutex m_;
+    bool paused_ = false;
     HostAudioOut* active_ = nullptr;
     nnsdk::audio::ColaContinua cola_{kColaFrames, kStreamChannels};
     nnsdk::audio::RelojDeReserva reloj_;
@@ -303,11 +338,15 @@ private:
 
 aaudio_data_callback_result_t SharedStream::callback(AAudioStream*, void* user, void* audio, int32_t frames) {
     auto* self = static_cast<SharedStream*>(user);
+    std::lock_guard lock(self->m_);
+    if (self->paused_ || !nnsdk::activity_state().foreground()) {
+        memset(audio, 0, size_t(frames) * kStreamChannels * sizeof(int16_t));
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
     const int64_t t = ahora_ns();
     const int64_t before = self->last_callback_ns_.exchange(t, std::memory_order_relaxed);
     if (before && t - before > self->max_gap_ns_.load(std::memory_order_relaxed))
         self->max_gap_ns_.store(t - before, std::memory_order_relaxed);
-    std::lock_guard lock(self->m_);
     const size_t n = self->cola_.leer(static_cast<int16_t*>(audio), size_t(frames));
     self->liberar_locked();
     self->frames_ += frames;
@@ -462,3 +501,7 @@ AudioOutBuffer* GetReleasedAudioOutBuffer(AudioOut* out) {
 }
 
 }  // namespace nn::audio
+
+void nnsdk::update_audio_activity(bool resumed) {
+    if (auto* s = nn::audio::existing_stream.load()) s->activity_changed(resumed);
+}

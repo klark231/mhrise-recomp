@@ -23,18 +23,23 @@ final class BugReport {
     }
 
     // One-shot requests the runtime picks up and deletes (a capture, a GPU profile): plain files, not settings.
-    static void trigger(File folder, String name, String content) {
-        if (folder == null) return;
+    static boolean trigger(File folder, String name, String content) {
+        if (folder == null) return false;
         try {
             Files.write(new File(folder, name).toPath(), content.getBytes());
+            return true;
         } catch (IOException ignored) {
-            // (storage refused: nothing happens)
+            return false;
         }
     }
 
     // Zips log.txt, the settings and the captured frame on a thread of its own; done gets the line to show the user,
     // on that thread.
     static void save(File folder, Consumer<String> done) {
+        save(folder, false, done);
+    }
+
+    static void save(File folder, boolean chinese, Consumer<String> done) {
         new Thread(() -> {
             File out = new File(ZIP);
             String result;
@@ -45,10 +50,10 @@ final class BugReport {
                 if (dumps != null)
                     for (File f : dumps)
                         if (f.isFile()) add(zip, f, "frame/" + f.getName());
-                result = String.format(Locale.ROOT, "Report saved: Download/mhrise-report.zip (%.1f MB).",
+                result = String.format(Locale.ROOT, chinese ? "报告已保存到 Download/mhrise-report.zip（%.1f MB）。" : "Report saved: Download/mhrise-report.zip (%.1f MB).",
                         out.length() / 1048576.0);
             } catch (IOException e) {
-                result = "Couldn't save the report: " + e.getMessage();
+                result = (chinese ? "无法保存报告：" : "Couldn't save the report: ") + e.getMessage();
             }
             done.accept(result);
         }, "Report").start();

@@ -133,4 +133,4 @@ holds the address of a global, and the global points at the object; getter `main
   to NV12 into two textures.
 - **The save** is a folder (400 MB + 8 MB journal in `control.nacp`). DLC indices are the title ID minus the app's,
   minus 0x1000.
-- **Local Play** hubs use link protocol `0x5201`, so MH Rise only ever sees MH Rise hubs.
+- **Local Play** hubs use link protocol `0x5202` (`0x5201` for builds before the UDP links, which were TCP only), so MH Rise only ever sees MH Rise hubs. A host lists itself under both and takes either build's players; a search lists both, and a join speaks the hub's version.

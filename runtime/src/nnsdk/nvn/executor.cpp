@@ -13,6 +13,8 @@
 #include <sys/sysinfo.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -1193,8 +1195,8 @@ private:
     // Lo que la CPU escribió en la textura con WriteTexels desde la última vez (antes de mirar si hay que subirla).
     // true si había algo.
     bool apply_texel_writes(Texture& t);
-    void barrier();
-    void full_barrier();
+    void barrier(bool fragments_only = false);
+    void full_barrier(bool fragments_only = false);
     void nvn_barrier(int bits);
     // full_area: renderArea entero aunque la mirada adelante diga otra cosa (borrados dentro del pase).
     bool ensure_render_pass(bool full_area = false);
@@ -1237,6 +1239,7 @@ private:
         uint32_t level = 0, layer = 0, width = 0, height = 0, wb = 0, hb = 0;
         uint8_t kind = 0;
         bool srgb = false, ok = false;
+        bool cache_only = false;  // the GPU already encoded the level: this is just the better copy for the cache
         std::vector<uint8_t> blocks, astc;
     };
     static constexpr size_t kAstcDeferTexels = 256 * 256;  // smaller levels are quick enough to encode in the submit
@@ -1254,6 +1257,18 @@ private:
     VkPipelineLayout bc_layout_ = VK_NULL_HANDLE;
     VkPipeline bc_pipeline_ = VK_NULL_HANDLE;
     bool bc_setup_done_ = false;
+    // ASTC encoded on the GPU (shaders/astc_encode.comp), for a big level that isn't in the ASTC cache: its texels go to
+    // staging and the shader writes the blocks the image is filled from, in the same submit. No wait for the background
+    // encoder and no smaller level shown meanwhile; that encoder still makes its (better) copy for the cache, which the
+    // next load uses. Where the pipeline doesn't build, or with <data>/cpu_astc (live), it's the background encoder as
+    // before. One partition only, so a few dB under astcenc on blocks with two colour regions (BC7's); the first load only.
+    bool astc_on_gpu();
+    bool astc_gpu_encode(const LevelLayout& lv, bcn::Kind kind, const uint8_t* blocks, const Staging::Alloc& out);
+    VkDescriptorSetLayout astc_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout astc_layout_ = VK_NULL_HANDLE;
+    VkPipeline astc_pipeline_ = VK_NULL_HANDLE;
+    bool astc_setup_done_ = false;
+    uint64_t prof_astc_gpu_ = 0;
     // Draw count check (count_check.h): the vertex stage with it, per stage of the game (code, control, its SPIR-V);
     // null if it didn't translate. The set layout of the count and an empty one for set 1 when there's no bindless.
     std::unordered_map<uint64_t, std::unique_ptr<ProgramStage>> count_check_stages_;
@@ -1580,9 +1595,17 @@ private:
         key.polygon.cull_face = key.polygon.front_face = 0;
         memset(&key.depth_stencil, 0, sizeof key.depth_stencil);
     }
-    // With vertex input dynamic state: the key without the vertex layout (set per draw)
+    // With vertex input dynamic state: the key without the vertex layout (set per draw). Except what the vertex shader
+    // is translated for: an attribute it reads as integers, or through a replacement format it converts (vertex_input),
+    // keeps its format, so its pipeline gets the shader that matches what the per-draw layout feeds it. Plain float ones
+    // go to 0 (read as float too). As Eden keeps each attribute's type in its key with this extension.
     static void normalize_vertex_input(PipelineKey& key) {
-        memset(key.attribs, 0, sizeof key.attribs);
+        for (VertexAttribState& a : key.attribs) {
+            const uint8_t format = a.format;
+            const VertexInput v = vertex_input(format);
+            a = VertexAttribState{};
+            if (v.fetch || v.replaced) a.format = format;
+        }
         memset(key.strides, 0, sizeof key.strides);
         memset(key.divisors, 0, sizeof key.divisors);
     }
@@ -1785,6 +1808,12 @@ private:
     // Perfil del tiler (por 300 frames).
     uint64_t prof_clear_loads_ = 0, prof_clear_flushes_ = 0, prof_store_none_ = 0, prof_area_cut_ = 0;
     uint64_t prof_barriers_deferred_ = 0, prof_barrier_splits_ = 0, prof_rt_kept_ = 0;
+    uint64_t prof_barrier_bits_[256] = {};  // perfil: barreras de NVN por sus bits
+    uint64_t prof_barriers_no_order_ = 0;   // perfil: barreras de NVN sin bits de orden (saltadas con barrier_bits)
+    bool skip_unordered_barriers_ = false;  // <datos>/barrier_bits
+    bool pending_fragments_only_ = false;   // la barrera aplazada solo ordena fragmentos
+    bool fragments_barrier_open_ = false;   // hubo una solo de fragmentos después de la última completa
+    uint64_t prof_barriers_fragments_ = 0;  // perfil: barreras que solo ordenaron fragmentos (barrier_bits)
     uint64_t prof_split_storage_ = 0, prof_split_sample_ = 0;  // perfil: por qué se cortó (escribe storage, lee un adjunto)
     // Perfil de cortes (con registro): por qué se cerró cada pase y qué tiene que ver con él el siguiente. Lo dice quien
     // cierra el pase por su cuenta (split_why_: espejo, textura, barrera, unión de overlays…); si nadie lo dijo, el comando
@@ -3566,7 +3595,9 @@ void Executor::run(const std::vector<const CommandList*>& lists) {
     buffer_cache_.set_generations(generations_);
     prof_count_stage_keys_ = NVN_FLAG("verbose_log");
     per_stage_keys_ = NVN_FLAG("pipelines_per_stage");
-    prof_timing_ = frame_ % kProfileEvery == 0 && NVN_FLAG("verbose_log");  // los tiempos por draw, solo depurando
+    // The per-draw times (one frame in kProfileEvery, a few clock reads per draw): with the detailed log, and with
+    // Performance stats too, since where the executor's time goes in a heavy spot is what those reports are for
+    prof_timing_ = frame_ % kProfileEvery == 0 && (NVN_FLAG("verbose_log") || NVN_FLAG("perf_stats"));
     if (prof_timing_ && prof_timed_frame_ != frame_) prof_timed_frame_ = frame_, prof_timed_frames_++;
     buffer_cache_.prof = prof_timing_ ? &fine_.vtx : nullptr;
     read_flags();
@@ -3638,6 +3669,13 @@ void Executor::read_flags() {
     // flushes its caches for it (on Turnip, a wait for idle each). About half of the ~250 a frame in MH Rise are those.
     // Off by default (Settings → Performance → Skip empty GPU barriers: <datos>/tight_barriers).
     skip_redundant_barriers_ = pass_end_is_barrier_ || NVN_FLAG("tight_barriers");
+    // NVN's barrier takes bits: 0x1-0x8 order work (primitives, fragments, fragments of the same tile, indirect data),
+    // 0x10-0x80 only invalidate the GPU's caches (textures, shader code, texture descriptors, ZCull). With
+    // <datos>/barrier_bits (off by default) they count: one that orders nothing is dropped (the caches it names don't
+    // exist here as such; our uploads and descriptor writes bring their own barriers), and one that only orders
+    // fragments (0x2/0x4, without 0x1 or 0x8) waits for the fragment stages and not for everything. On Turnip that's
+    // the difference between a cache flush and a wait for idle. In a hunt that's over half of the ~200 a frame.
+    skip_unordered_barriers_ = NVN_FLAG("barrier_bits");
     recycle_overlays_ = !NVN_FLAG("no_overlay_gaps");
     patch_overlays_ = !NVN_FLAG("no_patch_overlays");
     keep_gpu_overlays_ = !NVN_FLAG("no_keep_overlays");
@@ -3723,6 +3761,9 @@ void Executor::apply(const Command& c) {
                 if (v.stages & 32) st_.compute = nullptr;
                 st_.pending_stages &= ~static_cast<uint32_t>(v.stages);
                 // El compute va aparte: st_.stages solo lleva las etapas del pipeline gráfico.
+                if (v.program)
+                    for (ProgramStage& ps : v.program->stages)
+                        if (ps.optimize_pending) take_optimized(ps);  // its spirv-opt translation, once it's ready
                 if (v.program)
                     for (ProgramStage& ps : v.program->stages)
                         if (ps.tried ? ps.module != VK_NULL_HANDLE : [&] {
@@ -4141,7 +4182,9 @@ bool Executor::astc_level(Texture& t, const LevelLayout& lv, const uint8_t* bloc
     if (slot < t.astc_pending.size()) t.astc_pending[slot] = 0;
     for (uint32_t z = 0; z < std::max(lv.depth, 1u); z++) {
         const uint8_t* slice = blocks + size_t{z} * slice_bc;
-        Staging::Alloc a = staging_->alloc(slice_astc, 16);
+        // (aligned for a storage buffer too: the GPU encoder can write it)
+        Staging::Alloc a = staging_->alloc(
+            slice_astc, std::max<VkDeviceSize>(vk()->props.limits.minStorageBufferOffsetAlignment, 16));
         if (!a.data) return false;
         // A level the game hasn't streamed in yet is all zeros (it creates its textures with every mip and fills the big
         // ones later). That decodes to one colour: ASTC has a block for that (void extent), so nothing to encode or cache.
@@ -4161,6 +4204,10 @@ bool Executor::astc_level(Texture& t, const LevelLayout& lv, const uint8_t* bloc
             // Block for block, no encoder (astc::from_bc1): about as fast as a copy, so nothing goes to the cache
             LoadTimer timer(*this, kLdDeswizzle, slice_astc);
             astc::from_bc1(slice, a.data, size_t{lv.width_blocks} * lv.height_blocks);
+            prof_astc_direct_++;
+        } else if ((kind == bcn::kBC2 || kind == bcn::kBC3) &&
+                   astc::from_bc2_bc3(kind == bcn::kBC3, slice, a.data, size_t{lv.width_blocks} * lv.height_blocks)) {
+            // A BC2/BC3 level whose alpha is one value in each block: block for block as well, nothing to encode or cache
             prof_astc_direct_++;
         } else {
         // The key: the BC blocks, their kind, size and colour space, and the encoder's version (1 here: change it if the
@@ -4188,13 +4235,18 @@ bool Executor::astc_level(Texture& t, const LevelLayout& lv, const uint8_t* bloc
             job.kind = static_cast<uint8_t>(kind);
             job.srgb = srgb;
             job.blocks.assign(slice, slice + slice_bc);
-            if (t.astc_pending.size() <= slot) t.astc_pending.resize(slot + 1, 0);
-            t.astc_pending[slot] = job.key;
-            defer_astc(std::move(job));
-            prof_astc_deferred_++;
-            continue;  // (nothing for this level now: upload() keeps it out of what's sampled)
-        }
-        if (!cached) {
+            if (astc_on_gpu() && astc_gpu_encode(lv, kind, slice, a)) {
+                job.cache_only = true;
+                defer_astc(std::move(job));
+                prof_astc_gpu_++;  // (on to the copy below: the GPU writes the blocks before it)
+            } else {
+                if (t.astc_pending.size() <= slot) t.astc_pending.resize(slot + 1, 0);
+                t.astc_pending[slot] = job.key;
+                defer_astc(std::move(job));
+                prof_astc_deferred_++;
+                continue;  // (nothing for this level now: upload() keeps it out of what's sampled)
+            }
+        } else if (!cached) {
             LoadTimer timer(*this, kLdDeswizzle, size_t{lv.width} * lv.height * 4);
             // Whole blocks (the edge ones too: the encoder wants them filled), then the encode.
             const uint32_t w = lv.width_blocks * 4, h = lv.height_blocks * 4;
@@ -4249,7 +4301,7 @@ void Executor::refresh_min_level(Texture& t) {
 }
 
 void Executor::defer_astc(AstcJob job) {
-    astc_waiting_[job.texture]++;
+    if (!job.cache_only) astc_waiting_[job.texture]++;
     {
         std::lock_guard lock(astc_mutex_);
         astc_todo_.push_back(std::move(job));
@@ -4297,6 +4349,7 @@ void Executor::apply_astc_results() {
     }
     bool open = false;  // the barrier before the copies, once
     for (AstcJob& j : done) {
+        if (j.cache_only) continue;  // (stored already; the image has the GPU's blocks)
         auto it = astc_waiting_.find(j.texture);
         if (it == astc_waiting_.end()) continue;  // retired meanwhile
         Texture& t = *j.texture;
@@ -4334,6 +4387,90 @@ void Executor::apply_astc_results() {
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
     }
+}
+
+bool Executor::astc_on_gpu() {
+#ifdef HAVE_astc_encode_SPV
+    if (NVN_FLAG("cpu_astc")) return false;
+    if (!astc_setup_done_) {
+        astc_setup_done_ = true;
+        VkContext* c = vk();
+        const VkDescriptorSetLayoutBinding b[2] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dl.bindingCount = 2;
+        dl.pBindings = b;
+        const VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(uint32_t)};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &astc_set_layout_;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pc;
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof k_astc_encode_spv;
+        mi.pCode = k_astc_encode_spv;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateDescriptorSetLayout(c->device, &dl, nullptr, &astc_set_layout_) == VK_SUCCESS &&
+            vkCreatePipelineLayout(c->device, &pl, nullptr, &astc_layout_) == VK_SUCCESS &&
+            vkCreateShaderModule(c->device, &mi, nullptr, &module) == VK_SUCCESS) {
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = module;
+            ci.stage.pName = "main";
+            ci.layout = astc_layout_;
+            if (vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, nullptr, &astc_pipeline_) != VK_SUCCESS)
+                astc_pipeline_ = VK_NULL_HANDLE;
+        }
+        if (module) vkDestroyShaderModule(c->device, module, nullptr);
+        NVN_LOG("ASTC: big levels %s\n", astc_pipeline_ ? "encoded on the GPU at load (the CPU encoder fills the cache)"
+                                                         : "encoded on the CPU (the GPU encoder didn't build)");
+    }
+    return astc_pipeline_ != VK_NULL_HANDLE;
+#else
+    return false;  // (spirv.h from before astc_encode.comp: tools/shaders.sh adds it)
+#endif
+}
+
+// The level's texels (whole blocks) decoded into staging, and a dispatch that writes its ASTC blocks to `out`. false:
+// nothing recorded (too big for one staging range, or no staging or set left), and the caller encodes on the CPU.
+bool Executor::astc_gpu_encode(const LevelLayout& lv, bcn::Kind kind, const uint8_t* blocks, const Staging::Alloc& out) {
+    const VkDeviceSize align = std::max<VkDeviceSize>(vk()->props.limits.minStorageBufferOffsetAlignment, 16);
+    const uint32_t w = lv.width_blocks * 4, h = lv.height_blocks * 4;
+    const size_t bytes = size_t{w} * h * 4, count = size_t{lv.width_blocks} * lv.height_blocks;
+    Staging::Alloc texels = staging_->alloc(bytes, align);  // (up to kStagingChunk: 2048x2048)
+    const VkDescriptorSet set = texels.data ? descriptor_set(astc_set_layout_) : VK_NULL_HANDLE;
+    if (!set) return false;
+    {
+        LoadTimer timer(*this, kLdDeswizzle, bytes);
+        bcn::decode(kind, blocks, lv.width_blocks, lv.height_blocks, texels.data, size_t{w} * 4, w, h);
+    }
+    const VkDescriptorBufferInfo in{texels.buffer, texels.offset, bytes}, to{out.buffer, out.offset, count * 16};
+    VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    for (int k = 0; k < 2; k++) {
+        wr[k].dstSet = set;
+        wr[k].dstBinding = static_cast<uint32_t>(k);
+        wr[k].descriptorCount = 1;
+        wr[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[k].pBufferInfo = k ? &to : &in;
+    }
+    vkUpdateDescriptorSets(vk()->device, 2, wr, 0, nullptr);
+    const uint32_t groups = static_cast<uint32_t>((count + 63) / 64);
+    const uint32_t gx = std::min<uint32_t>(groups, 65535), gy = (groups + gx - 1) / gx;
+    const uint32_t params[3] = {lv.width_blocks, lv.height_blocks, gx};
+    note_gpu_work();
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipeline_);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, astc_layout_, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cmd_, astc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, params);
+    vkCmdDispatch(cmd_, gx, gy, 1);
+    // the blocks, before the copy to the image (recorded by upload after this)
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr,
+                         0, nullptr);
+    return true;
 }
 
 bool Executor::bc_on_gpu(const Texture& t) {
@@ -5559,11 +5696,11 @@ void Executor::end_render_pass() {
     if (crumbs_passes_) crumb_end();
     if (pending_barrier_) {  // la barrera de NVN aplazada (nvn_barrier)
         pending_barrier_ = false;
-        full_barrier();
+        full_barrier(pending_fragments_only_);
     }
 }
 
-void Executor::full_barrier() {
+void Executor::full_barrier(bool fragments_only) {
     storage_since_barrier_ = false;
     // Perfil y tight_barriers (ver gpu_work_): sin nada grabado desde la última, o (_pase) desde el final de un pase.
     prof_full_barriers_++;
@@ -5575,20 +5712,34 @@ void Executor::full_barrier() {
         gpu_work_ = work_after_pass_ = false;
         return;
     }
-    gpu_work_ = work_after_pass_ = false;
     VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    if (fragments_only) {
+        // Solo lo de fragmentos: lo de antes sigue sin ordenar con vértices, compute o copias. Por eso gpu_work_ se
+        // queda como está: una barrera completa justo detrás no cuenta como vacía para tight_barriers.
+        prof_barriers_fragments_++;
+        fragments_barrier_open_ = true;
+        constexpr VkPipelineStageFlags kFragments =
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        vkCmdPipelineBarrier(cmd_, kFragments, kFragments, 0, 1, &b, 0, nullptr, 0, nullptr);
+        return;
+    }
+    gpu_work_ = work_after_pass_ = false;
+    fragments_barrier_open_ = false;
     vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0,
                          nullptr, 0, nullptr);
 }
 
-void Executor::barrier() {
-    pending_barrier_ = false;  // esta la cubre
+void Executor::barrier(bool fragments_only) {
+    // La aplazada va en esta: solo de fragmentos si las dos lo son
+    if (pending_barrier_) fragments_only = fragments_only && pending_fragments_only_;
+    pending_barrier_ = false;
     if (!split_why_) split_why_ = "barrera";
     end_render_pass();
     st_.rt_dirty = true;
-    full_barrier();
+    full_barrier(fragments_only);
 }
 
 // Barrera de NVN. Todo lo de antes del pase abierto ya va ordenado con él por su dependencia externa: dentro del pase
@@ -5596,6 +5747,15 @@ void Executor::barrier() {
 // lo que venga puede leerlos: se corta como siempre. Si no, se aplaza al final del pase (end_render_pass); draw() lo
 // corta antes si un draw muestrea un adjunto del pase o escribe storage.
 void Executor::nvn_barrier(int bits) {
+    prof_barrier_bits_[bits & 0xff]++;
+    if (!(bits & 0xf)) {
+        prof_barriers_no_order_++;
+        if (skip_unordered_barriers_) {
+            if (frame_ == trace_frame_) NVN_LOG("F barrera 0x%x sin orden: saltada\n", bits);
+            return;
+        }
+    }
+    const bool fragments_only = skip_unordered_barriers_ && !(bits & 0x9);
     const bool lazy = opt_.barrera_perezosa && in_render_pass_ && !st_.rt_dirty && !storage_since_barrier_;
     if (frame_ == trace_frame_) NVN_LOG("F barrera 0x%x%s\n", bits, lazy ? " aplazada" : "");
     if (!lazy) {
@@ -5604,9 +5764,10 @@ void Executor::nvn_barrier(int bits) {
             split_why_ = !opt_.barrera_perezosa ? "barrera (no_lazy_barrier)"
                          : st_.rt_dirty         ? "barrera con targets nuevos"
                                                 : "barrera tras escribir storage en el pase";
-        barrier();
+        barrier(fragments_only);
         return;
     }
+    pending_fragments_only_ = pending_barrier_ ? pending_fragments_only_ && fragments_only : fragments_only;
     pending_barrier_ = true;
     prof_barriers_deferred_++;
 }
@@ -6720,23 +6881,17 @@ Layout& Executor::layout_for(const nvnshader::Translated* const* shaders, const 
 // UINT / SINT, enteros que el shader pasa a float; el resto (los escalados de verdad incluidos) float. 0: todo float.
 uint64_t vertex_input_types(const PipelineKey& key, uint64_t vs_inputs) {
     uint64_t types = 0;
-    for (uint32_t k = 0; k < 16; k++) {
-        if (!(vs_inputs & (1ull << k))) continue;
-        const FormatInfo* f = format_info(key.attribs[k].format);
-        if (!f || !f->name) continue;
-        const std::string_view name = f->name;
-        const bool vk_uint = f->vk == VK_FORMAT_R32_UINT || f->vk == VK_FORMAT_R32G32_UINT ||
-                             f->vk == VK_FORMAT_R32G32B32_UINT || f->vk == VK_FORMAT_R32G32B32A32_UINT;
-        const bool vk_sint = f->vk == VK_FORMAT_R32_SINT || f->vk == VK_FORMAT_R32G32_SINT ||
-                             f->vk == VK_FORMAT_R32G32B32_SINT || f->vk == VK_FORMAT_R32G32B32A32_SINT;
-        uint64_t type = 0;
-        if (name.find("_UI2F") != name.npos) type = vk_uint ? 4 : 0;
-        else if (name.find("_I2F") != name.npos) type = vk_sint ? 3 : 0;
-        else if (name.size() > 2 && name.substr(name.size() - 2) == "UI") type = 2;
-        else if (name.back() == 'I') type = 1;
-        types |= type << (4 * k);
-    }
+    for (uint32_t k = 0; k < 16; k++)
+        if (vs_inputs & (1ull << k)) types |= uint64_t(vertex_input(key.attribs[k].format).fetch) << (4 * k);
     return types;
+}
+
+// Whether a vertex shader reads a format the driver doesn't take from vertex buffers (vertex_input): then it needs its
+// attribute types even where they're off, since the replacement only reads right converted in the shader.
+static bool replaced_vertex_input(const PipelineKey& key, uint64_t vs_inputs) {
+    for (uint32_t k = 0; k < 16; k++)
+        if ((vs_inputs & (1ull << k)) && vertex_input(key.attribs[k].format).replaced) return true;
+    return false;
 }
 
 std::string attrib_formats(const PipelineKey& key, uint64_t vs_inputs) {
@@ -6752,6 +6907,120 @@ std::string attrib_formats(const PipelineKey& key, uint64_t vs_inputs) {
     }
     return " atributos" + out + (scaled ? " (con escalados)" : "");
 }
+
+namespace {
+
+// Pipelines that crash the driver. Some drivers kill the whole game inside vkCreateGraphicsPipelines: ARM's older ones
+// (a Dimensity 720's Mali-G57) abort on some vertex shaders ("LLVM ERROR: Cannot select" in __start__position_shader)
+// whose SPIR-V has nothing unusual, Qualcomm's segfaulted on a pipeline worker (an Adreno 732). There's nothing to catch
+// and nothing to fix from here. So each build marks its pipeline (the key's hash: the same content gives the same one
+// in every run) in a small file mapped in memory, a page the kernel keeps when the process dies, and clears it after;
+// a mark still there at the next start was a build the driver died in, and that pipeline goes to the skip list
+// (<data>/pipeline_skip.txt): it isn't built again and its draws are left out. So is every other pipeline with
+// the same vertex shader reading the same formats: ARM's driver compiles a position-only copy of the vertex shader
+// from just those two, and on the G57 the same one died again under another pass and pixel shader. One crash per such
+// vertex shader, then the game goes on without that object. <data>/no_pipeline_skip ignores the list.
+constexpr int kGuardSlots = 64;
+// After the slots, for each build in progress: its vertex half (vertex_id) and what it reads from its vertex buffers
+constexpr int kGuardNote = 192;
+struct GuardNote {
+    uint64_t vertex;
+    char text[kGuardNote - 8];
+};
+// The list's first line. Bumped when a translator change can fix what crashed (2: the point size on ARM's driver; 3:
+// tessellation in its domain), so an older list is dropped and those pipelines are tried again, with the crash the
+// last run left marked (it was the older translation too).
+constexpr const char* kSkipHeader = "pipeline_skip 3";
+struct Guard {
+    std::atomic<uint64_t>* slots = nullptr;  // in the mapped file: the pipeline of each build in progress
+    char* notes = nullptr;
+    std::unordered_set<uint64_t> skip;
+    std::mutex skip_mutex;
+};
+
+Guard* guard() {
+    static Guard* g = [] {
+        auto* g = new Guard;
+        VkContext* c = vk();
+        const char* home = getenv("NIER_INTERNO");
+        if (!c || !home) return g;
+        // The list in the data folder, where it's easy to find and outlives a reinstall. The guard's own file stays in
+        // the app's files: it's mapped and has to outlive the process dying, which a FUSE-backed folder can't promise.
+        const char* data = getenv("NIER_DATA");
+        const std::string list = std::string(data ? data : home) + "/pipeline_skip.txt";
+        if (data) {  // (it was in the app's files before)
+            const std::string old = std::string(home) + "/pipeline_skip.txt";
+            if (access(old.c_str(), F_OK) == 0 && access(list.c_str(), F_OK) != 0 && rename(old.c_str(), list.c_str()) != 0) {
+                // (another filesystem: copied)
+                FILE* from = fopen(old.c_str(), "r");
+                FILE* to = from ? fopen(list.c_str(), "w") : nullptr;
+                if (to) {
+                    char line[64];
+                    while (fgets(line, sizeof line, from)) fputs(line, to);
+                    fclose(to);
+                    unlink(old.c_str());
+                }
+                if (from) fclose(from);
+            }
+        }
+        bool older = false;
+        {
+            char first[64] = "";
+            if (FILE* f = fopen(list.c_str(), "r")) {
+                if (!fgets(first, sizeof first, f)) first[0] = 0;
+                fclose(f);
+            }
+            first[strcspn(first, "\r\n")] = 0;
+            older = first[0] && strcmp(first, kSkipHeader) != 0;
+            if (strcmp(first, kSkipHeader) != 0)
+                if (FILE* f = fopen(list.c_str(), "w")) {
+                    if (first[0]) NVN_LOG("pipelines: the skip list was from an older translator: dropped, they're tried again\n");
+                    fprintf(f, "%s\n", kSkipHeader);
+                    fclose(f);
+                }
+        }
+        // What the last run died building, before anything is marked again
+        int fd = open((std::string(home) + "/pipeline_guard.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        constexpr size_t size = kGuardSlots * (sizeof(uint64_t) + kGuardNote);
+        if (fd >= 0 && ftruncate(fd, size) == 0) {
+            void* m = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED) {
+                g->slots = static_cast<std::atomic<uint64_t>*>(m);
+                g->notes = static_cast<char*>(m) + kGuardSlots * sizeof(uint64_t);
+                if (FILE* f = fopen(list.c_str(), "a")) {
+                    for (int i = 0; i < kGuardSlots; i++)
+                        if (uint64_t id = g->slots[i].exchange(0); id && !older) {
+                            auto* note = reinterpret_cast<GuardNote*>(g->notes + i * kGuardNote);
+                            note->text[sizeof note->text - 1] = 0;
+                            fprintf(f, "%016llx\n", static_cast<unsigned long long>(id));
+                            if (note->vertex) fprintf(f, "%016llx\n", static_cast<unsigned long long>(note->vertex));
+                            NVN_LOG("pipelines: the driver died building pipeline %016llx last time (%s): skipped from now on, "
+                                    "with every pipeline of its vertex shader and formats (%016llx)\n",
+                                    static_cast<unsigned long long>(id), note->text[0] ? note->text : "no vertex input",
+                                    static_cast<unsigned long long>(note->vertex));
+                        }
+                    fclose(f);
+                }
+            }
+        }
+        if (fd >= 0) close(fd);
+        if (!NVN_FLAG("no_pipeline_skip"))
+            if (FILE* f = fopen(list.c_str(), "r")) {
+                char line[64];
+                while (fgets(line, sizeof line, f))
+                    if (unsigned long long id; sscanf(line, "%llx", &id) == 1 && strncmp(line, "pipeline_skip", 13) != 0)
+                        g->skip.insert(id);
+                fclose(f);
+            }
+        if (!g->skip.empty())
+            NVN_LOG("pipelines: %zu that crashed this driver are skipped (%s; delete it to try them again)\n",
+                    g->skip.size(), list.c_str());
+        return g;
+    }();
+    return g;
+}
+
+}  // namespace
 
 VkResult make_graphics_pipeline(const PipelineKey& key, const VkShaderModule* modules, uint64_t vs_inputs,
                                 VkPipelineLayout layout, VkRenderPass rp, VkPipelineCache cache, VkPipeline& p) {
@@ -6772,9 +7041,7 @@ VkResult make_graphics_pipeline(const PipelineKey& key, const VkShaderModule* mo
     std::vector<VkVertexInputBindingDescription> binds;
     for (uint32_t k = 0; k < 16; k++) {
         if (!(vs_inputs & (1ull << k))) continue;
-        const FormatInfo* f = format_info(key.attribs[k].format);
-        VkFormat format = f && f->vk != VK_FORMAT_UNDEFINED ? f->vk : VK_FORMAT_R32G32B32A32_SFLOAT;
-        attrs.push_back({k, k, format, 0});
+        attrs.push_back({k, k, vertex_input(key.attribs[k].format).format, 0});
         binds.push_back({k, key.strides[k], key.divisors[k] ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
     }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -6867,7 +7134,45 @@ VkResult make_graphics_pipeline(const PipelineKey& key, const VkShaderModule* mo
     pi.renderPass = rp;
     // VK_INCOMPLETE con la pipeline hecha: fuera de la especificación, pero así contestan los drivers de las Adreno 5xx y
     // algunas Mali (lo mismo hace Eden): vale.
+    Guard* g = guard();
+    uint64_t id = 0xcbf29ce484222325ull;  // (FNV-1a of the key: zero-filled, padding included, as it's saved)
+    for (size_t i = 0; i < sizeof key; i++) id = (id ^ reinterpret_cast<const uint8_t*>(&key)[i]) * 0x100000001b3ull;
+    id |= 1;
+    // The vertex half: the vertex shader and the format at each location it reads (not offsets or strides)
+    uint64_t vertex = 0;
+    if (const uint64_t vs = key.stages[static_cast<int>(Stage::Vertex)]) {
+        vertex = (0x6a09e667f3bcc909ull ^ vs) * 0x100000001b3ull;
+        for (uint32_t k = 0; k < 16; k++)
+            if (vs_inputs >> k & 1) vertex = (vertex ^ (k << 8 | key.attribs[k].format)) * 0x100000001b3ull;
+        vertex |= 1;
+    }
+    if (!g->skip.empty()) {
+        std::lock_guard lock(g->skip_mutex);
+        // (their draws are skipped like any failed pipeline's)
+        if (g->skip.count(id) || (vertex && g->skip.count(vertex))) return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    int slot = -1;
+    if (g->slots)
+        for (int i = 0; i < kGuardSlots && slot < 0; i++) {
+            uint64_t free = 0;
+            if (g->slots[i].compare_exchange_strong(free, id)) slot = i;
+        }
+    if (slot >= 0) {
+        // Its vertex input, for the log of the next run if the driver dies in here (formats, offset, stream stride)
+        auto* note = reinterpret_cast<GuardNote*>(g->notes + slot * kGuardNote);
+        constexpr int room = sizeof note->text;
+        int n = 0;
+        note->vertex = vertex;
+        note->text[0] = 0;
+        for (uint32_t k = 0; k < 16 && n < room - 40; k++) {
+            if (!(vs_inputs >> k & 1)) continue;
+            const FormatInfo* f = format_info(key.attribs[k].format);
+            n += snprintf(note->text + n, room - n, "%s%u %s+%u/%u", n ? ", " : "", k, f ? f->name : "?",
+                          unsigned(key.attribs[k].offset), unsigned(key.strides[k]));
+        }
+    }
     const VkResult r = vkCreateGraphicsPipelines(vk()->device, cache, 1, &pi, nullptr, &p);
+    if (slot >= 0) g->slots[slot].store(0, std::memory_order_release);
     return r == VK_INCOMPLETE && p ? VK_SUCCESS : r;
 }
 
@@ -7050,7 +7355,7 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
     // through either way, and on Turnip the typed variants made characters flash, so off there by default.
     // <data>/int_attribs or no_int_attribs (at start-up) force it on or off.
     static const bool typed_inputs = NVN_FLAG("int_attribs") || (!NVN_FLAG("no_int_attribs") && vk()->props.vendorID != 0x5143);
-    const uint64_t input_types = typed_inputs ? vertex_input_types(key, inputs) : 0;
+    const uint64_t input_types = typed_inputs || replaced_vertex_input(key, inputs) ? vertex_input_types(key, inputs) : 0;
     PipelineRecord rec;
     memset(&rec, 0, sizeof rec);
     // (not with the draw count check: the warm-up builds from the SPIR-V cache, which keeps the stage without it)
@@ -7064,6 +7369,14 @@ VkPipeline Executor::pipeline(const cmd::Draw& d, VkRenderPass rp, Layout& l, ui
         if (s == static_cast<int>(Stage::Vertex) && input_types) {
             v = vertex_variant(*const_cast<ProgramStage*>(st_.stages[s]), input_types);
             if (!v.module) v = {st_.stages[s]->module, st_.stages[s]->spirv_id, st_.stages[s]->cache_key};
+        }
+        // The evaluation shader in its domain: Eden would make it isolines, and the game's terrain is quads. Lines
+        // drew the wrong thing everywhere, and ARM's G57 driver aborted the game compiling it.
+        if (s == static_cast<int>(Stage::TessEval) && st_.stages[static_cast<int>(Stage::TessControl)] && NVN_FLAG("tess_accurate") && !NVN_FLAG("no_tess")) {
+            if (const int domain = tess_domain(*st_.stages[static_cast<int>(Stage::TessControl)])) {
+                v = geometry_variant(*const_cast<ProgramStage*>(st_.stages[s]), ~0ull, domain);
+                if (!v.module) return pipelines_[h] = VK_NULL_HANDLE;
+            }
         }
         if (s == static_cast<int>(Stage::Geometry) && vs) {
             // Topología de entrada según la primitiva de NVN (orden de OpenGL).
@@ -7595,6 +7908,18 @@ void Executor::draw(const cmd::Draw& in) {
             if (logged++ < 4)
                 NVN_LOG("draw con teselación sin dibujar: control %d, evaluación %d, primitiva %d, feature %d\n", tcs, tes,
                         d.primitive, vk()->tessellation);
+            skip_draw(0);  // (tess)
+            return;
+        }
+        // Settings → Effects → Tessellation (the terrain's): Fast by default, isolines as the port first did, except on the
+        // ARM drivers whose compiler aborts the game on those (there, Off); Accurate, in its domain; Off, not drawn
+        static const int tess_mode = [] {
+            const bool arm_old = vk()->props.vendorID == 0x13B5 && !vk()->draw_indexed_indirect_count;
+            const int mode = NVN_FLAG("no_tess") ? 2 : NVN_FLAG("tess_accurate") ? 0 : arm_old ? 2 : 1;
+            NVN_LOG("tessellation: %s\n", mode == 0 ? "accurate" : mode == 1 ? "fast (isolines)" : "off (not drawn)");
+            return mode;
+        }();
+        if (tess_mode == 2) {
             skip_draw(0);  // (tess)
             return;
         }
@@ -8382,8 +8707,9 @@ void Executor::draw(const cmd::Draw& in) {
             const VertexAttribState a = k < st_.attribs.size() ? st_.attribs[k] : VertexAttribState{};
             const uint32_t stride = a.stream < st_.streams.size() ? st_.streams[a.stream].stride : 0;
             const bool instanced = a.stream < st_.streams.size() && st_.streams[a.stream].divisor;
-            const FormatInfo* f = format_info(a.format);
-            const VkFormat format = f && f->vk != VK_FORMAT_UNDEFINED ? f->vk : VK_FORMAT_R32G32B32A32_SFLOAT;
+            // The format the pipeline would bake: a driver that can't read the game's from a vertex buffer gets the
+            // replacement the vertex shader was translated for (vertex_input), or the shader converts bytes it isn't fed
+            const VkFormat format = vertex_input(a.format).format;
             binds[n] = {VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, nullptr, k, stride,
                         instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, 1};
             attrs[n] = {VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, nullptr, k, k, format, 0};
@@ -9646,6 +9972,33 @@ void Executor::prepare_draw_overlays() {
     }
 }
 
+// Splitting a writable binding is safe when the dispatch has no descriptor that crosses either edge.
+// A wider alias needs a contiguous backing shared with the writer for the duration of the dispatch.
+static bool compute_binding_crosses(const StageBindings& bindings, const ProgramStage& cs, const BufferRange& write) {
+    auto crosses = [&](BufferRange other) {
+        if (!other.address || !other.size) return false;
+        if (other.address < write.address) return write.address - other.address < other.size;
+        const uint64_t at = other.address - write.address;
+        return at < write.size && other.size > write.size - at;
+    };
+    for (const Resource& r : cs.shader.resources) {
+        if (r.kind == Resource::UniformBuffer) {
+            if (r.cbuf_index == kShaderConstantsBank && crosses({cs.constants, cs.constants_size})) return true;
+            if (r.cbuf_index >= kUniformBankBase && r.cbuf_index - kUniformBankBase < kMaxUniforms &&
+                crosses(bindings.uniforms[r.cbuf_index - kUniformBankBase])) return true;
+        } else if (r.kind == Resource::StorageBuffer && r.cbuf_index == kComputeDriverBank) {
+            if (r.cbuf_offset >= kComputeStorageBase) {
+                const uint32_t index = (r.cbuf_offset - kComputeStorageBase) / 16;
+                if (index < kMaxStorage && crosses(bindings.storage[index])) return true;
+            } else if (r.cbuf_offset >= kComputeUbeBase && r.cbuf_offset < kComputeUbeBase + 16 * kComputeUbeCount) {
+                const uint32_t index = kComputeUbeFirst + (r.cbuf_offset - kComputeUbeBase) / 16;
+                if (index < kMaxUniforms && crosses(bindings.uniforms[index])) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Ver la declaración. Mismos rangos y tamaños que los descriptores del dispatch (los SSBO de la tabla de c0; los UBE son
 // uniform buffers aunque se lean como storage: no se unen).
 void Executor::prepare_dispatch_overlays() {
@@ -9661,7 +10014,13 @@ void Executor::prepare_dispatch_overlays() {
         if (!range.address || !range.size) continue;
         const uint64_t size = std::min<uint64_t>(range.size, kStagingChunk);
         if (r.is_written) {
-            if (make_overlay(range.address, size, &off)) note_overlay_written(range.address, kWrittenByCompute);
+            // The guest can reuse the neighbouring bytes independently. Give this write its own
+            // CPU-change check before dispatch, while a split can still copy the old GPU contents.
+            const Overlay* o = find_overlay(range.address, size, &off);
+            if (o && o->size > size && o->writers && split_overlays_ && !write_back_on_ && !o->cpu_reads &&
+                !compute_binding_crosses(sb, *st_.compute, {range.address, size}))
+                o = merge_overlays(range.address, size, &off, false);
+            if (o || make_overlay(range.address, size, &off)) note_overlay_written(range.address, kWrittenByCompute);
         } else if (!find_overlay(range.address, size, &off)) {
             merge_overlays(range.address, size, &off, true);
         }
@@ -10448,6 +10807,9 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         vkCmdFillBuffer(cmd_, crumb_buffer_, 8, 4, ++fill_count_);
     }
     note_gpu_work();
+    // Un compute tras una barrera que solo ordenó fragmentos: lo dibujado antes puede no haber acabado todavía. No
+    // sabemos si el juego cuenta con eso para un compute; por si acaso, la completa.
+    if (fragments_barrier_open_) full_barrier();
     if (gpu_groups)
         vkCmdDispatchIndirect(cmd_, gpu_groups, gpu_groups_offset);
     else
@@ -11559,13 +11921,15 @@ void Executor::profile_frame() {
             prof_forced_levels_ / double(period), (unsigned long long)prof_forced_unseen_,
             prof_full_hash_bytes_ / double(period) / 1048576.0, (unsigned long long)prof_watched_textures_);
     prof_forced_levels_ = prof_forced_unseen_ = prof_full_hash_bytes_ = 0;
-    if (prof_astc_encoded_ || prof_astc_cached_ || prof_astc_empty_ || prof_astc_direct_ || prof_astc_deferred_ || prof_astc_applied_)
-        NVN_LOG("perfil astc: %llu levels encoded, %llu from the cache, %llu BC1 converted directly, %llu empty (not streamed in yet); "
-                "%llu sent to the background encoder, %llu back from it\n",
+    if (prof_astc_encoded_ || prof_astc_cached_ || prof_astc_empty_ || prof_astc_direct_ || prof_astc_deferred_ || prof_astc_applied_ ||
+        prof_astc_gpu_)
+        NVN_LOG("perfil astc: %llu levels encoded, %llu from the cache, %llu converted directly, %llu empty (not streamed in yet); "
+                "%llu encoded on the GPU; %llu sent to the background encoder, %llu back from it\n",
                 (unsigned long long)prof_astc_encoded_, (unsigned long long)prof_astc_cached_,
-                (unsigned long long)prof_astc_direct_, (unsigned long long)prof_astc_empty_,
+                (unsigned long long)prof_astc_direct_, (unsigned long long)prof_astc_empty_, (unsigned long long)prof_astc_gpu_,
                 (unsigned long long)prof_astc_deferred_, (unsigned long long)prof_astc_applied_);
     prof_astc_encoded_ = prof_astc_cached_ = prof_astc_empty_ = prof_astc_direct_ = prof_astc_deferred_ = prof_astc_applied_ = 0;
+    prof_astc_gpu_ = 0;
     if (prof_count_checked_)
         NVN_LOG("perfil multi-draw: %.1f per frame with the draw count check\n", prof_count_checked_ / double(period));
     prof_count_checked_ = 0;
@@ -11766,6 +12130,24 @@ void Executor::profile_frame() {
                 prof_barriers_redundant_ / double(period), prof_barriers_after_pass_ / double(period),
                 prof_barriers_skipped_ / double(period), pass_end_is_barrier_ ? " y _pase" : "");
         prof_full_barriers_ = prof_barriers_redundant_ = prof_barriers_after_pass_ = prof_barriers_skipped_ = 0;
+        {
+            // Las de NVN por sus bits, las más frecuentes primero
+            std::vector<std::pair<uint64_t, int>> by_bits;
+            for (int k = 0; k < 256; ++k)
+                if (prof_barrier_bits_[k]) by_bits.emplace_back(prof_barrier_bits_[k], k);
+            std::sort(by_bits.rbegin(), by_bits.rend());
+            std::string kinds;
+            for (size_t k = 0; k < by_bits.size() && k < 8; ++k) {
+                char b[48];
+                snprintf(b, sizeof b, " 0x%x %.1f;", by_bits[k].second, by_bits[k].first / double(period));
+                kinds += b;
+            }
+            NVN_LOG("perfil barreras de NVN (por frame, por bits):%s %.1f sin bits de orden%s; %.1f solo de fragmentos\n",
+                    kinds.c_str(), prof_barriers_no_order_ / double(period),
+                    skip_unordered_barriers_ ? " (saltadas, barrier_bits)" : "", prof_barriers_fragments_ / double(period));
+            std::fill(std::begin(prof_barrier_bits_), std::end(prof_barrier_bits_), 0);
+            prof_barriers_no_order_ = prof_barriers_fragments_ = 0;
+        }
         NVN_LOG("perfil merged_passes (por frame): %.1f pases con adjuntos de más, %.1f cambios de targets sin cortar%s\n",
                 prof_passes_merged_ / double(period), prof_rt_merged_ / double(period), merge_passes_ ? "" : " (apagado)");
         prof_passes_merged_ = prof_rt_merged_ = 0;

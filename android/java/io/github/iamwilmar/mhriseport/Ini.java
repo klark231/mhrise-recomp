@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -96,6 +97,24 @@ final class Ini {
         save();
     }
 
+    boolean removeSystemMemoryOverride() {
+        String key = "env.TU_DEBUG";
+        String value = get(key);
+        if (value == null) return true;
+        List<String> tokens = new ArrayList<>();
+        boolean removed = false;
+        for (String token : value.split(",")) {
+            token = token.trim();
+            if (token.equals("sysmem")) removed = true;
+            else if (!token.isEmpty()) tokens.add(token);
+        }
+        if (!removed) return true;
+        String expected = String.join(",", tokens);
+        set(key, expected);
+        load();
+        return expected.isEmpty() ? get(key) == null : expected.equals(get(key));
+    }
+
     // driver_env.txt from earlier builds: its variables go into the ini.
     private void migrateDriverEnv() {
         File old = new File(folder, "driver_env.txt");
@@ -120,9 +139,11 @@ final class Ini {
         File tmp = new File(folder, NAME + ".tmp");
         try {
             Files.write(tmp.toPath(), out.toString().getBytes(StandardCharsets.UTF_8));
-            if (!tmp.renameTo(new File(folder, NAME))) tmp.delete();
+            Files.move(tmp.toPath(), new File(folder, NAME).toPath(), StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException ignored) {
             // (storage refused: the row shows the old value next time)
+            tmp.delete();
         }
     }
 }

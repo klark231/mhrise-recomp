@@ -202,6 +202,9 @@ struct ProgramStage {
     int8_t uniform_barrier_entry = -1;  // su índice en kUniformBarrierShaders (-1: no es de la lista)
     // Vertex: translated with the draw count check (count_check.h), for GPU-counted multi-draws on old drivers
     bool count_check = false;
+    // Compute with a switch whose spirv-opt pass runs on a background thread (program.cpp): until it's done, the plain
+    // translation. take_optimized swaps it in when the program is bound again.
+    bool optimize_pending = false;
     // Identidad de lo traducido (spirv_identity: el SPIR-V y lo que el layout toma de los recursos). Las pipelines y los
     // layouts del ejecutor van por ella y no por la dirección de la etapa: el juego crea varios programas con el mismo
     // código (MH Rise: 2200 etapas de 496 huellas en una partida) y cada uno llevaba sus propias pipelines. 0: sin traducir.
@@ -253,6 +256,8 @@ bool ensure_translated(ProgramStage& stage);
 // The same, but a graphics stage that isn't in the SPIR-V cache yet goes to a background thread instead (program.cpp):
 // 0, done here as ensure_translated (stage.module says if it worked); 1, queued (draws with it wait).
 int translate_or_queue(ProgramStage& stage);
+// A compute stage with optimize_pending: its spirv-opt translation if the background thread has it (program.cpp).
+void take_optimized(ProgramStage& stage);
 // Precarga (program.cpp): el hilo que traduce los shaders al fijarlos le pasa al ejecutor cada compute traducido, para
 // crear su pipeline antes del primer dispatch (la toma warm_take).
 void prefetch_compute_pipeline(const ProgramStage& stage);
@@ -285,6 +290,9 @@ bool use_stripped_module(const ProgramStage& stage);
 // Geometry: el módulo para un vertex shader que escribe `previous_stores` y una topología de entrada de
 // Eden; module a VK_NULL_HANDLE si no se puede traducir.
 ProgramStage::Variant geometry_variant(ProgramStage& stage, uint64_t previous_stores, int input_topology);
+// The tessellation domain of a control shader's patches, as nvnshader::Options::input_topology takes it for the
+// evaluation shader (2 triangles, 3 quads, 1 isolines; 0 if its translation doesn't say): from the levels it writes.
+int tess_domain(const ProgramStage& control);
 // La misma etapa traducida con opciones más prudentes, para un driver que rechazó la pipeline (executor.cpp): nivel 1 sin
 // la decoración NonUniform; 2, además pasada por spirv-opt; 3, además sin operaciones de subgrupo. Ninguna cambia los
 // recursos (el layout es el mismo). previous_stores: el de la variante que se usaba (~0: la etapa tal cual).

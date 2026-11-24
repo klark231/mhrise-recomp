@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release CACHE STRING "")
 
-add_subdirectory(../../runtime/recompiler ${CMAKE_BINARY_DIR}/recompiler)
+include(../../runtime/shader_translator.cmake)
 
 add_executable(shadertool main.cpp)
-target_link_libraries(shadertool PRIVATE eden_shader)
+target_include_directories(shadertool PRIVATE ../../runtime/recompiler)
+target_link_libraries(shadertool PRIVATE rise_shader_translator)

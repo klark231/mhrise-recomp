@@ -7,6 +7,7 @@
 // y la imagen de copyright no tienen dónde ir.
 
 #include <sys/system_properties.h>
+#include <jni.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -18,6 +19,18 @@
 #include "nnsdk/runtime.h"
 #include "nnsdk/types.h"
 #include "nnsdk/ini.h"
+#include "nnsdk/activity.h"
+
+namespace {
+nnsdk::ActivityState g_activity;
+}
+
+nnsdk::ActivityState& nnsdk::activity_state() { return g_activity; }
+
+extern "C" JNIEXPORT void JNICALL Java_io_github_iamwilmar_mhriseport_GameActivity_00024RuntimeLifecycle_update(
+    JNIEnv*, jclass, jboolean resumed, jboolean releasing_surface) {
+    if (g_activity.update(resumed, releasing_surface)) nnsdk::update_audio_activity(resumed);
+}
 
 namespace nn {
 namespace os {
@@ -51,14 +64,6 @@ struct DisplayVersion {
 };
 
 namespace {
-
-int64_t monotonic_ns() {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return int64_t{ts.tv_sec} * 1'000'000'000 + ts.tv_nsec;
-}
-
-const int64_t g_start_ns = monotonic_ns();
 
 // El SystemEvent de los mensajes del sistema (en el sdk, un global que devuelve GetNotificationMessageEvent).
 // os.cpp crea su evento al primer uso, sin señalar.
@@ -98,7 +103,9 @@ std::string desired_language() {
 void Initialize() {}
 
 // Tiempo activo desde que arrancó el programa (en la consola no cuenta el tiempo en suspensión).
-TimeSpan GetProgramTotalActiveTime() { return TimeSpan{monotonic_ns() - g_start_ns}; }
+TimeSpan GetProgramTotalActiveTime() {
+    return TimeSpan{std::chrono::duration_cast<std::chrono::nanoseconds>(g_activity.active_time()).count()};
+}
 
 settings::LanguageCode GetDesiredLanguage() {
     static const std::string code = [] {
@@ -133,7 +140,7 @@ namespace nn::oe {
 
 OperationMode GetOperationMode() { return nnsdk::docked() ? OperationMode_Console : OperationMode_Handheld; }
 PerformanceMode GetPerformanceMode() { return nnsdk::docked() ? PerformanceMode_Boost : PerformanceMode_Normal; }
-FocusState GetCurrentFocusState() { return FocusState_InFocus; }
+FocusState GetCurrentFocusState() { return g_activity.foreground() ? FocusState_InFocus : FocusState_Background; }
 bool IsCpuOverclockEnabled() { return false; }
 
 // The handheld's 720p, or the TV's 1080p when docked.

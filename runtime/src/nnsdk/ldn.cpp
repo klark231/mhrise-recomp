@@ -6,9 +6,9 @@
 //    Hubs are listed under this port's own link protocol (kLinkProtocol), so MH Rise only ever sees MH Rise hubs.
 //  - directly: the host also listens on a TCP port (<datos>/hub_port, 0: off), and Scan asks the addresses in
 //    <datos>/hub_hosts (one host[:port] per line) for their network.
-// The game's packets go down the same connection (the host relays them between its players): socket.cpp hands every
-// datagram for a 169.254.x.x address to ldn_net::send, and the ones that arrive are delivered to the game's socket by a
-// loopback helper (ldn_net.h).
+// The game's packets go by UDP when that gets through, else down the same connection (the host relays them between its
+// players; see "game packets by UDP" below): socket.cpp hands every datagram for a 169.254.x.x address to
+// ldn_net::send, and the ones that arrive are delivered to the game's socket by a loopback helper (ldn_net.h).
 //
 // Settings (the game folder, written by the app's Multiplayer settings): hub_servers (one host[:port] per line;
 // "#" in front: kept in the list but not used; missing: the default server; "off": none), hub_key (the matchmaking key: only its SHA-256 is sent), hub_hosts,
@@ -18,15 +18,15 @@
 // "MHGS", u16 server protocol (1), u16 link protocol, room[16] (SHA-256 of the key, the first 16 bytes; zeros without
 // a key). LIST -> HUBS (u32 count, count x (u64 id, NetworkInfo)); HOST + NetworkInfo -> HOSTED (u64 id), then UPDATE
 // / PING from the host and INCOMING (u64 ticket) / PING to it; ATTACH + ticket and JOIN + hub id -> SPLICED (u32 pair,
-// u64 secret), after which the connection is a link.
+// u64 secret: for the server's UDP relay, servers without one send nothing), after which the connection is a link.
 //
 // Link frames (this port's, over a spliced or direct connection): the same u32 size + u8 type framing.
 //   HELLO   station -> host  u16 link version, u16 local communication version, u8 query only, mac[6], name[33]
-//   WELCOME host -> station  u8 node id, u32 address, NetworkInfo
+//   WELCOME host -> station  u8 node id, u32 address, NetworkInfo, u32 UDP token
 //   INFO    host -> station  NetworkInfo (players joined or left, advertise data changed; also a query's answer)
 //   DATA    both ways        u32 from, u16 from port, u32 to, u16 to port, datagram
 //   BYE     both ways        u32 reason
-//   PING    both ways
+//   PING    both ways, every 10 s: either end gives up on a link that has said nothing for 30 s
 //   REJECT  host -> station  u32 reason
 //
 // MakeIpv4Address is called by ~6000 of the game's static constructors, before nnMain and nnsdk_attach: it can't
@@ -135,8 +135,11 @@ using Info = std::array<uint8_t, kInfoSize>;
 // ---- settings ---------------------------------------------------------------------------------------------------------
 
 constexpr uint16_t kServerProtocol = 1;
-constexpr uint16_t kLinkProtocol = 0x5201;  // 'R', 1: MH Rise's hubs, apart from MHGU's (2, 3) and MH4U's (0x4D01)
-constexpr uint16_t kLinkVersion = 1;
+constexpr uint16_t kLinkProtocol = 0x5202;  // 'R', 2: MH Rise's hubs, apart from MHGU's (2, 3) and MH4U's (0x4D01)
+constexpr uint16_t kLinkVersion = 2;         // 2: UDP and pings both ways
+// Builds before the UDP links: TCP only, the station pings the host, and they list under their own link protocol. A
+// host lists itself under both and takes their hellos too; a search lists both, and a join speaks the hub's version.
+constexpr uint16_t kLinkProtocolV1 = 0x5201, kLinkVersionV1 = 1;
 constexpr uint16_t kDefaultPort = 39510;
 // (Not the MHGU hub servers: their owners asked for MH Rise hubs to stay off them.)
 constexpr const char* kDefaultServers[] = {"meoli.viewdns.net"};
@@ -358,10 +361,10 @@ bool read_frame(int fd, uint8_t* type, std::vector<uint8_t>* payload, size_t max
 enum : uint8_t { kList = 1, kHost = 2, kAttach = 3, kJoin = 4, kUpdate = 5, kPing = 6 };
 enum : uint8_t { kHubs = 16, kHosted = 17, kIncoming = 18, kSpliced = 19, kError = 20 };
 
-std::vector<uint8_t> server_header(const std::array<uint8_t, 16>& room) {
+std::vector<uint8_t> server_header(const std::array<uint8_t, 16>& room, uint16_t protocol = kLinkProtocol) {
     std::vector<uint8_t> h = {'M', 'H', 'G', 'S'};
     add16(h, kServerProtocol);
-    add16(h, kLinkProtocol);
+    add16(h, protocol);
     h.insert(h.end(), room.begin(), room.end());
     return h;
 }
@@ -370,13 +373,25 @@ std::vector<uint8_t> server_header(const std::array<uint8_t, 16>& room) {
 
 enum : uint8_t { kHello = 1, kWelcome = 2, kInfoFrame = 3, kData = 4, kBye = 5, kLinkPing = 6, kReject = 7 };
 constexpr size_t kDataHeader = 12;
+constexpr int64_t kLinkPingMs = 10000, kLinkSilenceMs = 30000;
 
 struct Link {
     int fd = -1;
     std::mutex send_mutex;
     int node = -1;           // host side: the station's node id (1..7)
+    uint16_t version = kLinkVersion;  // the other end's (kLinkVersionV1: no UDP, no pings from the host's side)
     uint32_t address = 0;    // host side: its address
     std::atomic<bool> open{true};
+    // UDP (below): the station's token, the hub server's relay pair and our secret (0: a direct link), where this
+    // link's datagrams go (the relay, or the other console once known), and when we last heard the other end by UDP
+    // and it last said it hears us
+    uint32_t token = 0;
+    uint32_t relay_pair = 0;
+    uint64_t relay_secret = 0;
+    std::mutex udp_mutex;
+    sockaddr_in udp_to{};
+    std::atomic<bool> udp_route{false};
+    std::atomic<int64_t> udp_heard{0}, udp_heard_by_peer{0};
 
     bool send(uint8_t type, const std::vector<uint8_t>& payload) {
         const std::vector<uint8_t> f = make_frame(type, payload);
@@ -414,6 +429,7 @@ struct Found {
     int server = -1;  // index in hub_servers(); -1: a direct host
     uint64_t hub = 0;
     Endpoint direct;
+    uint16_t protocol = kLinkProtocol, version = kLinkVersion;  // (an older build's hub: kLinkProtocolV1, kLinkVersionV1)
 };
 std::vector<Found> g_found;
 
@@ -477,6 +493,158 @@ std::vector<uint8_t> data_frame(uint32_t from, uint16_t from_port, uint32_t to, 
 
 bool is_broadcast(uint32_t a) { return a == 0xFFFFFFFFu || (a & 0xFF) == 0xFF; }
 
+// ---- game packets by UDP ---------------------------------------------------------------------------------------------
+//
+// Pia (the game's network library) is made for datagrams: over the TCP link one lost packet holds up everything behind
+// it until it's sent again, a hitch for every player. So the game's packets go as UDP datagrams when those get
+// through: straight to the host's hub port (UDP as well as TCP) on a direct link, or through the hub server's UDP
+// relay on a spliced one. Each end says hello on each link every 2 s, which also keeps NAT mappings open, and tells
+// in it whether it hears the other end. A link uses UDP while both ends have heard each other in the last 6 s;
+// otherwise, and for a packet too big for one datagram on a phone network, the TCP link carries it as before.
+// Datagram: "MHRU", u32 token (the station's, from WELCOME), u8 kind, then the hello's u8 "I hear you" or the same
+// bytes as a DATA frame. Through the relay: "MHGR", u32 pair, u64 secret in front (the server takes it off).
+
+constexpr uint8_t kUdpMagic[4] = {'M', 'H', 'R', 'U'};
+constexpr size_t kUdpHeader = 9;
+constexpr uint8_t kUdpData = 0, kUdpHello = 1;
+constexpr size_t kUdpMaxGameBytes = 1300;  // (with the headers, under the smaller MTUs of mobile networks)
+constexpr int64_t kUdpHelloMs = 2000, kUdpSilenceMs = 6000;
+
+std::atomic<int> g_udp{-1};  // this console's UDP socket while in a network (its thread closes it)
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool udp_usable(const Link& l) {
+    const int64_t now = now_ms();
+    return l.udp_route && now - l.udp_heard.load() < kUdpSilenceMs && now - l.udp_heard_by_peer.load() < kUdpSilenceMs;
+}
+
+bool udp_send(Link& l, uint8_t kind, const uint8_t* body, size_t size) {
+    const int fd = g_udp.load();
+    if (fd < 0 || !l.udp_route || !l.open) return false;
+    std::vector<uint8_t> d;
+    d.reserve(16 + kUdpHeader + size);
+    if (l.relay_pair) {
+        d = {'M', 'H', 'G', 'R'};
+        add32(d, l.relay_pair);
+        add64(d, l.relay_secret);
+    }
+    d.insert(d.end(), kUdpMagic, kUdpMagic + 4);
+    add32(d, l.token);
+    d.push_back(kind);
+    d.insert(d.end(), body, body + size);
+    sockaddr_in to;
+    {
+        std::lock_guard lock(l.udp_mutex);
+        to = l.udp_to;
+    }
+    return ::sendto(fd, d.data(), d.size(), MSG_NOSIGNAL | MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&to), sizeof to) ==
+           static_cast<ssize_t>(d.size());
+}
+
+// A DATA frame's bytes to the other end: by UDP when it's working, else down the link
+void send_data(Link& l, const std::vector<uint8_t>& f) {
+    if (f.size() <= kDataHeader + kUdpMaxGameBytes && udp_usable(l) && udp_send(l, kUdpData, f.data(), f.size())) return;
+    l.send(kData, f);
+}
+
+// Where the other end of a TCP connection is (the hub server, or the other console): its UDP port is the same number
+bool peer_of(int fd, sockaddr_in* out) {
+    socklen_t len = sizeof *out;
+    return getpeername(fd, reinterpret_cast<sockaddr*>(out), &len) == 0 && out->sin_family == AF_INET;
+}
+
+void set_udp_route(Link& l, const sockaddr_in& to) {
+    std::lock_guard lock(l.udp_mutex);
+    l.udp_to = to;
+    l.udp_route = true;
+}
+
+int open_udp(uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    sockaddr_in in{};
+    in.sin_family = AF_INET;
+    in.sin_port = htons(port);
+    // (the last network's socket may still be closing: its thread lets go within 200 ms)
+    for (int tries = 0; ::bind(fd, reinterpret_cast<sockaddr*>(&in), sizeof in) != 0; tries++) {
+        if (errno != EADDRINUSE || tries == 10) {
+            ::close(fd);
+            return -1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return fd;
+}
+
+void host_route(const std::shared_ptr<Link>& source, uint32_t from, uint16_t from_port, uint32_t to, uint16_t to_port,
+                const uint8_t* data, size_t size);
+
+// The network's UDP: hellos out, datagrams in. Ends with the network, and closes the socket then.
+void udp_loop(int fd, uint64_t generation, bool host) {
+    std::vector<uint8_t> buf(65536);
+    int64_t next_hello = 0;
+    while (g_generation == generation) {
+        const int64_t now = now_ms();
+        if (now >= next_hello) {
+            next_hello = now + kUdpHelloMs;
+            std::vector<std::shared_ptr<Link>> links;
+            {
+                std::lock_guard lock(g_mu);
+                links = g_links;
+            }
+            for (auto& l : links) {
+                const uint8_t hearing = now - l->udp_heard.load() < kUdpSilenceMs ? 1 : 0;
+                udp_send(*l, kUdpHello, &hearing, 1);
+            }
+        }
+        pollfd pf{fd, POLLIN, 0};
+        if (poll(&pf, 1, 200) != 1) continue;
+        sockaddr_in from{};
+        socklen_t len = sizeof from;
+        const ssize_t n = ::recvfrom(fd, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&from), &len);
+        if (n < static_cast<ssize_t>(kUdpHeader) || memcmp(buf.data(), kUdpMagic, 4) != 0) continue;
+        const uint32_t token = get32(buf.data() + 4);
+        const uint8_t kind = buf[8];
+        std::shared_ptr<Link> link;
+        {
+            std::lock_guard lock(g_mu);
+            for (auto& l : g_links)
+                if (l->token == token && l->open) link = l;
+        }
+        if (!link) continue;
+        // (a direct station's datagrams tell the host where it is, as its NAT shows it; relayed ones come from the server)
+        if (host && !link->relay_pair) set_udp_route(*link, from);
+        link->udp_heard = now_ms();
+        const uint8_t* p = buf.data() + kUdpHeader;
+        const size_t size = static_cast<size_t>(n) - kUdpHeader;
+        if (kind == kUdpHello) {
+            if (size >= 1 && p[0]) link->udp_heard_by_peer = now_ms();
+            continue;
+        }
+        if (kind != kUdpData || size < kDataHeader) continue;
+        if (host)
+            host_route(link, link->address, get16(p + 4), get32(p + 6), get16(p + 10), p + kDataHeader, size - kDataHeader);
+        else
+            deliver(get32(p), get16(p + 4), get16(p + 10), p + kDataHeader, size - kDataHeader);
+    }
+    ::close(fd);
+}
+
+void start_udp(uint16_t port, uint64_t generation, bool host) {
+    int fd = port ? open_udp(port) : -1;
+    if (fd < 0) fd = open_udp(0);  // (relayed datagrams need no particular port)
+    if (fd < 0) {
+        printf("[ldn] no UDP socket (%s): the game's packets go by the link\n", strerror(errno));
+        return;
+    }
+    g_udp = fd;
+    std::thread(udp_loop, fd, generation, host).detach();
+}
+
 // ---- host ------------------------------------------------------------------------------------------------------------
 
 void update_servers() {
@@ -519,7 +687,7 @@ void host_route(const std::shared_ptr<Link>& source, uint32_t from, uint16_t fro
     if (!broadcast && to == self) return;
     const std::vector<uint8_t> f = data_frame(from, from_port, to, to_port, data, size);
     for (auto& l : links)
-        if (l != source && (broadcast || l->address == to)) l->send(kData, f);
+        if (l != source && (broadcast || l->address == to)) send_data(*l, f);
 }
 
 void host_drop(const std::shared_ptr<Link>& link) {
@@ -546,16 +714,25 @@ void host_drop(const std::shared_ptr<Link>& link) {
 }
 
 // A station's connection to the host (direct or spliced by a server): its hello, a place in the network, then its packets
-void host_serve(int fd, uint64_t generation) {
+void host_serve(int fd, uint64_t generation, uint32_t relay_pair, uint64_t relay_secret) {
     auto link = std::make_shared<Link>();
     link->fd = fd;
+    do link->token = static_cast<uint32_t>(random64());
+    while (!link->token);
     uint8_t type = 0;
     std::vector<uint8_t> p;
     if (!read_frame(fd, &type, &p, kMaxLinkFrame, kAnswerTimeoutMs) || type != kHello || p.size() < 11 + kNameSize ||
-        get16(p.data()) != kLinkVersion) {
+        (get16(p.data()) != kLinkVersion && get16(p.data()) != kLinkVersionV1)) {
         if (type == kHello) link->send(kReject, {4, 0, 0, 0});
         ::close(fd);
         return;
+    }
+    link->version = get16(p.data());
+    sockaddr_in peer{};
+    if (relay_pair && link->version >= kLinkVersion && peer_of(fd, &peer)) {  // (spliced by a server with a UDP relay)
+        link->relay_pair = relay_pair;
+        link->relay_secret = relay_secret;
+        set_udp_route(*link, peer);
     }
     const bool query = p[4] != 0;
     if (query) {  // a search: the network, then goodbye
@@ -606,12 +783,24 @@ void host_serve(int fd, uint64_t generation) {
         std::lock_guard lock(g_mu);
         welcome.insert(welcome.end(), g_info.begin(), g_info.end());
     }
+    if (link->version >= kLinkVersion) add32(welcome, link->token);  // (an older station wants it without)
     link->send(kWelcome, welcome);
-    printf("[ldn] player %d joined (%u.%u.%u.%u)\n", link->node, link->address >> 24, link->address >> 16 & 255,
-           link->address >> 8 & 255, link->address & 255);
+    printf("[ldn] player %d joined (%u.%u.%u.%u)%s\n", link->node, link->address >> 24, link->address >> 16 & 255,
+           link->address >> 8 & 255, link->address & 255, link->version < kLinkVersion ? ", an older build: TCP only" : "");
     broadcast_info();
+    int64_t last_ping = now_ms(), last_heard = now_ms();
     while (g_generation == generation && link->open) {
-        if (!read_frame(fd, &type, &p, kMaxLinkFrame, 30000)) break;
+        if (now_ms() - last_ping > kLinkPingMs) {
+            link->send(kLinkPing, {});
+            last_ping = now_ms();
+        }
+        pollfd pf{fd, POLLIN, 0};
+        if (poll(&pf, 1, 1000) == 0) {
+            if (now_ms() - last_heard > kLinkSilenceMs) break;
+            continue;
+        }
+        if (!read_frame(fd, &type, &p, kMaxLinkFrame, static_cast<int>(kLinkSilenceMs))) break;
+        last_heard = now_ms();
         if (type == kData && p.size() >= kDataHeader)
             host_route(link, link->address, get16(p.data() + 4), get32(p.data() + 6), get16(p.data() + 10),
                        p.data() + kDataHeader, p.size() - kDataHeader);
@@ -622,24 +811,24 @@ void host_serve(int fd, uint64_t generation) {
 }
 
 // The host's listing on one hub server: HOST, then tickets for players who join (ATTACH opens their link)
-void host_on_server(Endpoint server, uint64_t generation) {
+void host_on_server(Endpoint server, uint64_t generation, uint16_t protocol) {
     const std::array<uint8_t, 16> room = room_of_key();
     while (g_generation == generation) {
         const int fd = connect_to(server, kConnectTimeoutMs);
         if (fd >= 0) {
             auto conn = std::make_shared<Link>();
             conn->fd = fd;
-            std::vector<uint8_t> body = server_header(room);
+            std::vector<uint8_t> body = server_header(room, protocol);
             {
                 std::lock_guard lock(g_mu);
                 body.insert(body.end(), g_info.begin(), g_info.end());
             }
-            uint8_t type;
+            uint8_t type = 0;
             std::vector<uint8_t> p;
             if (conn->send(kHost, body) && read_frame(fd, &type, &p, kMaxServerFrame, kAnswerTimeoutMs) &&
                 type == kHosted && p.size() >= 8) {
-                printf("[ldn] hub listed on %s (id %016llx)\n", server.host.c_str(),
-                       static_cast<unsigned long long>(get64(p.data())));
+                printf("[ldn] hub listed on %s (id %016llx)%s\n", server.host.c_str(),
+                       static_cast<unsigned long long>(get64(p.data())), protocol == kLinkProtocolV1 ? " for older builds" : "");
                 {
                     std::lock_guard lock(g_mu);
                     g_server_conns.push_back(conn);
@@ -656,10 +845,10 @@ void host_on_server(Endpoint server, uint64_t generation) {
                     if (!read_frame(fd, &type, &p, kMaxServerFrame, 5000)) break;
                     if (type == kIncoming && p.size() >= 8) {
                         const uint64_t ticket = get64(p.data());
-                        std::thread([server, room, ticket, generation] {
+                        std::thread([server, room, ticket, generation, protocol] {
                             const int afd = connect_to(server, kConnectTimeoutMs);
                             if (afd < 0) return;
-                            std::vector<uint8_t> req = server_header(room);
+                            std::vector<uint8_t> req = server_header(room, protocol);
                             add64(req, ticket);
                             const std::vector<uint8_t> f = make_frame(kAttach, req);
                             uint8_t t;
@@ -669,13 +858,13 @@ void host_on_server(Endpoint server, uint64_t generation) {
                                 ::close(afd);
                                 return;
                             }
-                            host_serve(afd, generation);
+                            host_serve(afd, generation, a.size() >= 12 ? get32(a.data()) : 0, a.size() >= 12 ? get64(a.data() + 4) : 0);
                         }).detach();
                     }
                 }
                 std::lock_guard lock(g_mu);
                 g_server_conns.erase(std::remove(g_server_conns.begin(), g_server_conns.end(), conn), g_server_conns.end());
-            } else if (type == kError && p.size() >= 4) {
+            } else if (type == kError && p.size() >= 4 && protocol == kLinkProtocol) {
                 printf("[ldn] %s didn't list the hub (error %u)\n", server.host.c_str(), get32(p.data()));
             }
             conn->close();
@@ -696,7 +885,7 @@ void host_listen(uint64_t generation) {
         if (fd < 0) continue;
         const int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        std::thread(host_serve, fd, generation).detach();
+        std::thread(host_serve, fd, generation, 0u, uint64_t{0}).detach();
     }
 }
 
@@ -706,15 +895,22 @@ void station_run(std::shared_ptr<Link> link, uint64_t generation) {
     uint8_t type;
     std::vector<uint8_t> p;
     int reason = DisconnectReason_SignalLost;
-    auto last_ping = std::chrono::steady_clock::now();
+    int64_t last_ping = now_ms(), last_heard = now_ms();
     while (g_generation == generation && link->open) {
-        if (std::chrono::steady_clock::now() - last_ping > std::chrono::seconds(10)) {
+        if (now_ms() - last_ping > kLinkPingMs) {
             link->send(kLinkPing, {});
-            last_ping = std::chrono::steady_clock::now();
+            last_ping = now_ms();
         }
         pollfd pf{link->fd, POLLIN, 0};
-        if (poll(&pf, 1, 1000) == 0) continue;
-        if (!read_frame(link->fd, &type, &p, kMaxLinkFrame, 30000)) break;
+        if (poll(&pf, 1, 1000) == 0) {
+            if (link->version >= kLinkVersion && now_ms() - last_heard > kLinkSilenceMs) {  // (an older host never pings)
+                printf("[ldn] the host said nothing for %lld s\n", static_cast<long long>(kLinkSilenceMs / 1000));
+                break;
+            }
+            continue;
+        }
+        if (!read_frame(link->fd, &type, &p, kMaxLinkFrame, static_cast<int>(kLinkSilenceMs))) break;
+        last_heard = now_ms();
         if (type == kData && p.size() >= kDataHeader) {
             deliver(get32(p.data()), get16(p.data() + 4), get16(p.data() + 10), p.data() + kDataHeader,
                     p.size() - kDataHeader);
@@ -742,9 +938,10 @@ void station_run(std::shared_ptr<Link> link, uint64_t generation) {
 }
 
 // Hello, welcome: the station's place in the network
-bool station_join(int fd, const UserConfig& user, uint16_t lcv) {
+bool station_join(int fd, const UserConfig& user, uint16_t lcv, bool direct, uint32_t relay_pair, uint64_t relay_secret,
+                  uint16_t version) {
     std::vector<uint8_t> hello;
-    add16(hello, kLinkVersion);
+    add16(hello, version);
     add16(hello, lcv);
     hello.push_back(0);
     hello.insert(hello.end(), g_mac, g_mac + 6);
@@ -758,10 +955,20 @@ bool station_join(int fd, const UserConfig& user, uint16_t lcv) {
         printf("[ldn] the host turned us away (%u)\n", p.size() >= 4 ? get32(p.data()) : 0);
         return false;
     }
-    if (type != kWelcome || p.size() != 5 + kInfoSize) return false;
+    const bool older = version < kLinkVersion;  // (an older host: no token, no UDP)
+    if (type != kWelcome || p.size() < (older ? 5 : 9) + kInfoSize) return false;
     const uint64_t generation = ++g_generation;
     auto link = std::make_shared<Link>();
     link->fd = fd;
+    link->version = version;
+    if (!older) {
+        link->token = get32(p.data() + 5 + kInfoSize);
+        link->relay_pair = relay_pair;
+        link->relay_secret = relay_secret;
+        sockaddr_in peer{};
+        // (the relay, or the host's own hub port; a server without the relay only splices the TCP connection)
+        if ((direct || relay_pair) && peer_of(fd, &peer)) set_udp_route(*link, peer);
+    }
     {
         std::lock_guard lock(g_mu);
         g_address = get32(p.data() + 1);
@@ -770,19 +977,21 @@ bool station_join(int fd, const UserConfig& user, uint16_t lcv) {
         g_disconnect_reason = DisconnectReason_None;
     }
     ensure_helper();
-    printf("[ldn] in the network as player %u (%u.%u.%u.%u)\n", p[0], g_address >> 24, g_address >> 16 & 255,
-           g_address >> 8 & 255, g_address & 255);
+    start_udp(0, generation, false);
+    printf("[ldn] in the network as player %u (%u.%u.%u.%u)%s\n", p[0], g_address >> 24, g_address >> 16 & 255,
+           g_address >> 8 & 255, g_address & 255,
+           older ? ", an older build's hub: TCP only" : relay_pair ? ", UDP through the hub server" : "");
     std::thread(station_run, link, generation).detach();
     return true;
 }
 
 // ---- search ----------------------------------------------------------------------------------------------------------
 
-std::vector<Found> list_server(int index, const Endpoint& server, const std::array<uint8_t, 16>& room) {
+std::vector<Found> list_server(int index, const Endpoint& server, const std::array<uint8_t, 16>& room, uint16_t protocol) {
     std::vector<Found> out;
     const int fd = connect_to(server, kConnectTimeoutMs);
     if (fd < 0) return out;
-    const std::vector<uint8_t> f = make_frame(kList, server_header(room));
+    const std::vector<uint8_t> f = make_frame(kList, server_header(room, protocol));
     uint8_t type;
     std::vector<uint8_t> p;
     if (send_all(fd, f.data(), f.size()) && read_frame(fd, &type, &p, kMaxServerFrame, kAnswerTimeoutMs) && type == kHubs &&
@@ -791,6 +1000,8 @@ std::vector<Found> list_server(int index, const Endpoint& server, const std::arr
         for (uint32_t i = 0; i < count && 4 + (i + 1) * (8 + kInfoSize) <= p.size(); i++) {
             Found h;
             h.server = index;
+            h.protocol = protocol;
+            h.version = protocol == kLinkProtocolV1 ? kLinkVersionV1 : kLinkVersion;
             h.hub = get64(p.data() + 4 + i * (8 + kInfoSize));
             memcpy(h.info.data(), p.data() + 4 + i * (8 + kInfoSize) + 8, kInfoSize);
             out.push_back(h);
@@ -802,24 +1013,29 @@ std::vector<Found> list_server(int index, const Endpoint& server, const std::arr
 
 std::vector<Found> query_host(const Endpoint& host) {
     std::vector<Found> out;
-    const int fd = connect_to(host, 2500);
-    if (fd < 0) return out;
-    std::vector<uint8_t> hello;
-    add16(hello, kLinkVersion);
-    add16(hello, 0);
-    hello.push_back(1);
-    hello.insert(hello.end(), 6 + kNameSize, 0);
-    const std::vector<uint8_t> f = make_frame(kHello, hello);
-    uint8_t type;
-    std::vector<uint8_t> p;
-    if (send_all(fd, f.data(), f.size()) && read_frame(fd, &type, &p, kMaxLinkFrame, 3000) && type == kInfoFrame &&
-        p.size() == kInfoSize) {
-        Found h;
-        memcpy(h.info.data(), p.data(), kInfoSize);
-        h.direct = host;
-        out.push_back(h);
+    for (uint16_t version : {kLinkVersion, kLinkVersionV1}) {  // (an older host turns the newer hello away)
+        const int fd = connect_to(host, 2500);
+        if (fd < 0) return out;
+        std::vector<uint8_t> hello;
+        add16(hello, version);
+        add16(hello, 0);
+        hello.push_back(1);
+        hello.insert(hello.end(), 6 + kNameSize, 0);
+        const std::vector<uint8_t> f = make_frame(kHello, hello);
+        uint8_t type = 0;
+        std::vector<uint8_t> p;
+        const bool answered = send_all(fd, f.data(), f.size()) && read_frame(fd, &type, &p, kMaxLinkFrame, 3000);
+        ::close(fd);
+        if (answered && type == kInfoFrame && p.size() == kInfoSize) {
+            Found h;
+            memcpy(h.info.data(), p.data(), kInfoSize);
+            h.direct = host;
+            h.version = version;
+            out.push_back(h);
+            return out;
+        }
+        if (!answered || type != kReject) return out;
     }
-    ::close(fd);
     return out;
 }
 
@@ -842,12 +1058,16 @@ Result scan(NetworkInfo* out, int* count, int max, const ScanFilter& filter) {
     const std::vector<Endpoint> servers = hub_servers();
     const std::vector<Endpoint> hosts = search_hosts();
     const std::array<uint8_t, 16> room = room_of_key();
-    std::vector<std::vector<Found>> results(servers.size() + hosts.size());
+    // (this version's hubs first: a newer host is also listed for older builds, and the duplicate is dropped below)
+    std::vector<std::vector<Found>> results(2 * servers.size() + hosts.size());
     std::vector<std::thread> threads;
-    for (size_t i = 0; i < servers.size(); i++)
-        threads.emplace_back([&, i] { results[i] = list_server(static_cast<int>(i), servers[i], room); });
+    for (size_t i = 0; i < servers.size(); i++) {
+        threads.emplace_back([&, i] { results[i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocol); });
+        threads.emplace_back(
+            [&, i] { results[servers.size() + i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocolV1); });
+    }
     for (size_t i = 0; i < hosts.size(); i++)
-        threads.emplace_back([&, i] { results[servers.size() + i] = query_host(hosts[i]); });
+        threads.emplace_back([&, i] { results[2 * servers.size() + i] = query_host(hosts[i]); });
     for (auto& t : threads) t.join();
     std::vector<Found> all;
     for (auto& r : results)
@@ -889,15 +1109,17 @@ Result connect(const uint8_t* session, const UserConfig& user, uint16_t lcv) {
         return kResultConnectionFailed;
     }
     int fd = -1;
+    uint32_t relay_pair = 0;
+    uint64_t relay_secret = 0;
     if (target.server >= 0) {
         const std::vector<Endpoint> servers = hub_servers();
         if (target.server >= static_cast<int>(servers.size())) return kResultConnectionFailed;
         fd = connect_to(servers[target.server], kConnectTimeoutMs);
         if (fd < 0) return kResultConnectionFailed;
-        std::vector<uint8_t> req = server_header(room_of_key());
+        std::vector<uint8_t> req = server_header(room_of_key(), target.protocol);
         add64(req, target.hub);
         const std::vector<uint8_t> f = make_frame(kJoin, req);
-        uint8_t type;
+        uint8_t type = 0;
         std::vector<uint8_t> p;
         if (!send_all(fd, f.data(), f.size()) || !read_frame(fd, &type, &p, kMaxServerFrame, 15000) || type != kSpliced) {
             printf("[ldn] join: the server didn't connect us (%s)\n",
@@ -905,11 +1127,12 @@ Result connect(const uint8_t* session, const UserConfig& user, uint16_t lcv) {
             ::close(fd);
             return kResultConnectionFailed;
         }
+        if (p.size() >= 12) relay_pair = get32(p.data()), relay_secret = get64(p.data() + 4);
     } else {
         fd = connect_to(target.direct, kConnectTimeoutMs);
         if (fd < 0) return kResultConnectionFailed;
     }
-    if (!station_join(fd, user, lcv)) {
+    if (!station_join(fd, user, lcv, target.server < 0, relay_pair, relay_secret, target.version)) {
         ::close(fd);
         return kResultConnectionFailed;
     }
@@ -927,6 +1150,7 @@ void leave(bool tell) {
         conns.swap(g_server_conns);
         g_address = 0;
     }
+    g_udp = -1;  // (its thread sees the new generation and closes it)
     for (auto& l : links) {
         if (tell) l->send(kBye, {3, 0, 0, 0});
         l->close();
@@ -997,8 +1221,10 @@ Result create(const NetworkConfig& config_ref, const SecurityConfig& security_re
             if (g_listen >= 0) ::close(g_listen), g_listen = -1;
         }
     }
+    start_udp(g_listen >= 0 ? port : 0, generation, true);
     const std::vector<Endpoint> servers = hub_servers();
-    for (const Endpoint& s : servers) std::thread(host_on_server, s, generation).detach();
+    for (const Endpoint& s : servers)
+        for (uint16_t protocol : {kLinkProtocol, kLinkProtocolV1}) std::thread(host_on_server, s, generation, protocol).detach();
     printf("[ldn] network created (%u players at most; %zu hub servers, port %u)\n", g_info[kNiNodeMax], servers.size(), port);
     set_state(State_AccessPointCreated);
     return ResultSuccess;
@@ -1251,7 +1477,7 @@ void send(uint16_t src_port, uint32_t dst, uint16_t dst_port, const void* data, 
         std::lock_guard lock(g_mu);
         if (!g_links.empty()) link = g_links[0];
     }
-    if (link) link->send(kData, data_frame(self, src_port, dst, dst_port, data, size));
+    if (link) send_data(*link, data_frame(self, src_port, dst, dst_port, data, size));
 }
 
 }  // namespace nnsdk::ldn_net

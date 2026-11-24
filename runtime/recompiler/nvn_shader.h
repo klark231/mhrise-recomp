@@ -91,12 +91,15 @@ struct Options {
     // admite 128 componentes y declarar los 32 + la posición se pasa) y topología de entrada
     // (InputTopology de Eden: puntos 0, líneas 1, líneas con adyacencia 2, triángulos 3, con adyacencia 4).
     uint64_t previous_stores = ~0ull;
+    // Tessellation evaluation: the domain instead, 1 + Eden's TessPrimitive (isolines, triangles, quads); 0, isolines.
+    // NVN keeps it out of the shader's code; nvn::tess_domain reads it from what the control shader writes.
     int input_topology = 0;
     // Vertex: el tipo de cada atributo según el formato con el que llega (4 bits por atributo, el AttributeType de Eden:
     // 0 float, 1 entero con signo, 2 sin signo, 3 y 4 enteros que se pasan a float). El Maxwell lee los atributos
     // enteros tal cual, como bits en el registro; Vulkan solo define un formato UINT/SINT en una entrada entera. Con todo
     // declarado float, el Adreno y Turnip dan los bits igual, pero la Mali los convierte (5 → 5.0) y los índices de
-    // hueso del skinning salían disparados: personajes con picos hasta el infinito. 0: todo float, como antes.
+    // hueso del skinning salían disparados: personajes con picos hasta el infinito. 0: todo float, como antes. El bit 3 (8):
+    // un formato de tres componentes que se lee como de cuatro porque el driver no tiene el de tres, y w tiene que dar 1.
     uint64_t input_types = 0;
     // Subgrupos del dispositivo (VkPhysicalDeviceSubgroupProperties): tamaño, etapas (bits de
     // VkShaderStageFlagBits) y operaciones (VkSubgroupFeatureFlagBits). Sin nada, no se usan.
@@ -112,7 +115,7 @@ struct Options {
     bool broken_unreachable = false;
     // packHalf2x16 in a vertex stage: Mali-G68's compiler (driver r32, Vulkan 1.1.177) fails on it in the position shader
     // with an LLVM "Cannot select" and aborts the whole process. Built from integer operations there instead
-    // (has_broken_pack_half, eden-pack-half-mali.patch).
+    // (has_broken_pack_half, in runtime/eden).
     bool broken_pack_half = false;
     // Pixel discards (KIL) gathered into one at the end of the shader (Eden's needs_demote_reorder, which it sets for
     // AMD and Samsung's Xclipse). Their compilers get an early discard wrong: alpha-tested cards (foliage, smoke, the

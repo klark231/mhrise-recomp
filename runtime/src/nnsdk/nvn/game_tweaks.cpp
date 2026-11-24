@@ -16,14 +16,20 @@
 //   Effects buffer   ReducedTransparentBuffer +0x1a68: how much smaller the buffer for particles and other transparent
 //                    effects is (the Switch game uses 2; the PC's quality table goes 1, 1, 2, 3, 4)
 //   Ambient occlusion GeometryAOQuality +0x1a8c (the Switch game uses 1)
-// And logged only, until we know what their numbers mean: SmallObjectCullingRatio +0x1a30, DefaultShadowLodBias +0x1a44.
+//   Render distance  SmallObjectCullingRatio +0x1a30 (float). The culling pass (main+0x7461cf8 and on) projects each
+//                    object's box to the screen and keeps it only if its size there is over this ratio times a
+//                    factor of the camera's (main+0x74977b4 multiplies them). So a higher ratio drops small or far
+//                    things sooner: twice the ratio, half the distance an object stays drawn at. The game sets 12 in
+//                    the village and 11.2 in hunts.
+// And logged only, until we know what its number means: DefaultShadowLodBias +0x1a44.
 // Each one is read once from the game as its default, changed while its switch is on and put back when it's off.
 // Called from the thread that presents, once per frame: the game calls these setters from its own threads too, and
 // the shadow setter only stores the new size and lets the engine rebuild the maps.
 // Before touching anything the instructions at those addresses are checked, so another build of main is left alone.
 // What's in effect goes to <datos>/game_settings.txt (one line per setting) whenever it changes, for the settings menu.
 // Switches (live): shadow_half, shadow_quarter / model_detail_low, model_detail_lowest, model_detail_high /
-// texture_bias_1, texture_bias_2 / no_foliage_sway, no_dynamic_shadows / effects_lower, effects_lowest / no_ao.
+// texture_bias_1, texture_bias_2 / no_foliage_sway, no_dynamic_shadows / effects_lower, effects_lowest / no_ao /
+// draw_distance_75, draw_distance_50, draw_distance_33, draw_distance_25.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -263,6 +269,34 @@ void int_switch(uint8_t* renderer, IntSwitch& s, bool on, Want want) {
     s.ours = on;
 }
 
+// Render distance: the share of the game's distance that small objects stay drawn at (the culling ratio divided by it)
+float wanted_draw_distance() {
+    if (NVN_FLAG("draw_distance_25")) return 0.25f;
+    if (NVN_FLAG("draw_distance_33")) return 1.0f / 3;
+    if (NVN_FLAG("draw_distance_50")) return 0.5f;
+    if (NVN_FLAG("draw_distance_75")) return 0.75f;
+    return 1.0f;
+}
+
+void draw_distance(uint8_t* renderer) {
+    volatile float* ratio = reinterpret_cast<volatile float*>(renderer + 0x1a30);
+    static float game = 0, last = 0;
+    static bool seen = false, ours = false;
+    if (!seen || !ours || *ratio != last) {  // the game set it (a new area): that's the new default
+        if (!seen || *ratio != game) NVN_LOG("game settings: SmallObjectCullingRatio = %g\n", *ratio);
+        game = *ratio;
+    }
+    seen = true;
+    const float share = wanted_draw_distance();
+    const float target = share < 1.0f ? game / share : game;
+    if (*ratio != target) {
+        *ratio = target;
+        NVN_LOG("game settings: render distance %.0f%% (culling ratio %g, game's %g)\n", share * 100, target, game);
+    }
+    last = target;
+    ours = share < 1.0f;
+}
+
 IntSwitch g_effects{"effects buffer", 0x1a68};
 IntSwitch g_ao{"ambient occlusion", 0x1a8c};
 
@@ -298,6 +332,7 @@ void renderer_switches(const uint8_t* base) {
         int_switch(renderer, g_effects, steps != 0, [&](uint32_t game) { return std::min<uint32_t>(game + steps, 4); });
         int_switch(renderer, g_ao, NVN_FLAG("no_ao"), [](uint32_t) { return 0u; });
     }
+    draw_distance(renderer);
 
     // The numbers we don't change yet: logged when the game sets them, to learn what it uses.
     struct Logged {
@@ -307,8 +342,7 @@ void renderer_switches(const uint8_t* base) {
         uint32_t last;
         bool seen;
     };
-    static Logged logged[] = {{"SmallObjectCullingRatio", 0x1a30, true, 0, false},
-                              {"DefaultShadowLodBias", 0x1a44, true, 0, false}};
+    static Logged logged[] = {{"DefaultShadowLodBias", 0x1a44, true, 0, false}};
     for (Logged& l : logged) {
         uint32_t v;
         memcpy(&v, renderer + l.offset, 4);

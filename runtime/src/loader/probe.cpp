@@ -1,4 +1,7 @@
 #include "loader/probe.h"
+#ifdef MHRISE_LUA_DEBUG
+#include "loader/tdb_lua.h"
+#endif
 
 #include <pthread.h>
 #include <time.h>
@@ -19,6 +22,7 @@ struct Probe {
     uint64_t offset;  // en main
     uint32_t limit;
     std::atomic<uint32_t> hits{0};
+    bool player_update = false;
 };
 
 Probe g_probes[64];
@@ -44,9 +48,15 @@ uint32_t branch(const void* from, const void* to, uint32_t opcode) {
 
 // Lo llama nier_probe_slow (probe_slow.S) con todo guardado. regs: x0..x15, x18, y luego x19..x28; stub: lo que
 // guardó el stub (x16, x17, x30 del juego).
-extern "C" void nier_on_probe(uint64_t id, const uint64_t* regs, const uint64_t* stub) {
+extern "C" void nier_on_probe(uint64_t id, uint64_t* regs, const uint64_t* stub) {
     if (id >= g_count) return;
     Probe& p = g_probes[id];
+#ifdef MHRISE_LUA_DEBUG
+    if (p.player_update) {
+        on_player_update(regs[0], regs[1]);
+        return;
+    }
+#endif
     const uint32_t n = p.hits++;
     if (n >= p.limit) return;
     char name[32] = "?";
@@ -62,10 +72,10 @@ extern "C" void nier_on_probe(uint64_t id, const uint64_t* regs, const uint64_t*
     if (n + 1 == p.limit) printf("[sonda] main+%#lx: más llamadas, ya no las registro\n", p.offset);
 }
 
-bool install(Module& mod, std::string& err) {
+bool install(Module& mod, std::string& err, size_t player_update) {
     const char* data = getenv("NIER_DATA");
     std::ifstream in(std::string(data ? data : ".") + "/sondas");
-    if (!in) return true;
+    if (!in && !player_update) return true;
     // Al final del área de parches; los stubs de TLS van desde el principio (tls.cpp comprueba que no lleguen).
     uint8_t* area = mod.patch_area + Module::kPatchAreaSize - Module::kProbeAreaSize;
     auto* veneer = reinterpret_cast<uint32_t*>(area);
@@ -75,10 +85,20 @@ bool install(Module& mod, std::string& err) {
     memcpy(&veneer[2], &slow, sizeof slow);
     auto* text = mod.base + mod.seg_off[0];
     std::string line;
-    while (std::getline(in, line) && g_count < 64) {
+    while (g_count < 64) {
         uint64_t offset = 0;
         unsigned limit = 40;
-        if (sscanf(line.c_str(), "main+%lx %u", &offset, &limit) < 1) continue;
+        const bool player = player_update != 0;
+        if (player) {
+            offset = player_update;
+            player_update = 0;
+        } else {
+            if (!std::getline(in, line)) break;
+            if (sscanf(line.c_str(), "main+%lx %u", &offset, &limit) < 1) continue;
+            bool duplicate = false;
+            for (unsigned k = 0; k < g_count; ++k) duplicate |= g_probes[k].offset == offset;
+            if (duplicate) continue;
+        }
         if (offset % 4 || offset >= mod.seg_size[0]) {
             printf("[sonda] main+%#lx no está en el text\n", offset);
             continue;
@@ -100,6 +120,7 @@ bool install(Module& mod, std::string& err) {
         stub[7] = branch(&stub[7], site + 1, 0x14000000);  // b de vuelta
         g_probes[id].offset = offset;
         g_probes[id].limit = limit;
+        g_probes[id].player_update = player;
         *site = branch(site, stub, 0x14000000);
         printf("[sonda] puesta en main+%#lx (%u veces)\n", offset, limit);
         g_count++;

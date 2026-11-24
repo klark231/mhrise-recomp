@@ -12,6 +12,12 @@ build/
 *.apk
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.apk.idsig
+/exefs/
+/romfs/
+*.pak
 __pycache__/
 .claude/
 .DS_Store

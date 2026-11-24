@@ -1,5 +1,7 @@
 package io.github.iamwilmar.mhriseport;
 
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 import android.app.NativeActivity;
 import android.content.Context;
 import android.content.Intent;
@@ -33,9 +35,112 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     static native void nativePad(float deadzone, float trigger, int rightAxes, long[] combos, long[] mapping);
     static native void nativeTextAnswer(int serial, String text);
     static native void nativeTurbo(boolean on);
+    // Load after the NativeActivity has configured the game paths and driver environment.
+    private static final class RuntimeLifecycle {
+        static { System.loadLibrary("nnsdk"); }
+        static native void update(boolean resumed, boolean releasingSurface);
+    }
+    private boolean resumed;
 
     private Controls controls;
     private TouchPad pad;
+    private ModUi modUi;
+    void showModUi() {
+        if (modUi != null && modUiReady()) modUi.setMenu(true);
+    }
+
+    // The MOD UI draws the Lua scripts' windows: with no script running there's nothing to draw, and the button seemed
+    // to do nothing. Says why instead.
+    // ---- Mods changed while the game runs ----
+    // Scripts reload in place: the Lua runtime reads the mods folder again (a request file it looks for each frame).
+    // Game files only load when the game starts, so those wait for a restart, offered by the settings menu. Returns
+    // whether this change needs one.
+    boolean restartPending;
+    boolean modsChanged(boolean gameFiles, boolean scripts) {
+        if (scripts && !reloadScripts()) gameFiles = true;
+        if (gameFiles) restartPending = true;
+        if (pad != null) pad.setModsAvailable(luaScripts());
+        return gameFiles;
+    }
+
+    private boolean reloadScripts() {
+        if (!luaBuild(this) || ModUi.runtime() == 0) return false;  // (no runtime: only a start loads them)
+        File dir = new File(getFilesDir(), "reframework");
+        try {
+            if (!dir.isDirectory() && !dir.mkdirs()) return false;
+            File request = new File(dir, "reload.request");
+            return request.exists() || request.createNewFile();
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    // Closes the game and opens it again (the launcher's activity, in a new task, started as this process ends)
+    void restartGame() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launch != null && launch.getComponent() != null)
+            startActivity(Intent.makeRestartActivityTask(launch.getComponent()));
+        finishAffinity();
+        android.os.Process.killProcess(android.os.Process.myPid());
+    }
+
+    private boolean luaAtLaunch;  // (the runtime only reads the scripts when the game starts)
+    private boolean modUiReady() {
+        String why;
+        switch (ModUi.runtime()) {
+            case 2: return true;
+            case 1:
+                why = "The scripts start once you're in the village or a quest (not on the title screen). Open the MOD UI then.";
+                break;
+            default:
+                if (luaAtLaunch) {
+                    why = "The Lua runtime didn't start. Settings → Debug → Lua / TDB shows why.";
+                    break;
+                }
+                if (luaScripts()) {
+                    why = "Lua mods added since the game started load the next time it starts: close the game fully "
+                            + "and open it again.";
+                    break;
+                }
+                why = "No Lua scripts are installed, so the MOD UI has nothing to show. Add a REFramework script mod in "
+                        + "Settings → Mods & cheats, or turn on Debug → Object Explorer, and restart the game.";
+        }
+        Toast.makeText(this, why, Toast.LENGTH_LONG).show();
+        return false;
+    }
+
+    // The frame rate the game is limited to (Display → FPS limit): the touch controls animate no faster
+    private int gameFps() {
+        File folder = SettingsMenu.gameFolder(this);
+        if (folder == null) return 30;
+        Ini ini = new Ini(folder);
+        if (ini.on("60fps")) return 60;
+        for (int fps : new int[] {45, 40, 25, 20})
+            if (ini.on("fps_" + fps)) return fps;
+        return 30;
+    }
+    // The controller hotkey (android_main.cpp, from a thread of its own) and the floating button
+    public void toggleModUi() {
+        runOnUiThread(() -> {
+            if (modUi == null) return;
+            if (modUi.menuOpen()) modUi.setMenu(false);
+            else if (modUiReady()) modUi.setMenu(true);
+        });
+    }
+
+    // A build with the Lua runtime (tools/build_apk.sh LUA_LAB=1, the releases): it ships assets/lua_build. The script
+    // menus and the mod UI only exist there.
+    private static Boolean lua;
+    static boolean luaBuild(android.content.Context c) {
+        if (lua == null) {
+            try (java.io.InputStream in = c.getAssets().open("lua_build")) {
+                lua = true;
+            } catch (java.io.IOException e) {
+                lua = false;
+            }
+        }
+        return lua;
+    }
     private boolean shown;
     private Vibrator vibrator;
     private CaptureButton capture;  // the floating capture button, while Debug → Capture button is on
@@ -43,6 +148,12 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
 
     @Override
     protected void onCreate(Bundle state) {
+        noteLastExit();  // (before the game starts and opens its log)
+        // First-run lighter settings for small Mali GPUs (MediaTek); once, never over the user's own choices
+        try {
+            DeviceProfile.applyOnce(SettingsMenu.gameFolder(this));
+        } catch (RuntimeException ignored) {
+        }
         super.onCreate(state);
         // Expand into the cutout (Settings → Display): the game's window over the strip beside the camera too
         File cutoutFolder = SettingsMenu.gameFolder(this);
@@ -55,9 +166,38 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
         applyPad();
         pad = new TouchPad(this, controls, this);
+        pad.setGameFps(gameFps());
+        luaAtLaunch = luaScripts();
+        pad.setModsAvailable(luaAtLaunch);
         // La ventana del juego tiene que estar puesta para colgarle el panel: después del primer paso por la cola.
         getWindow().getDecorView().post(this::showPad);
         showSaveMessage();
+    }
+
+    private static final String[] EXIT_REASONS = {"unknown", "the game closed itself", "killed by a signal",
+        "killed by Android's low memory killer", "a Java crash", "a native crash", "not responding (ANR)",
+        "failed to start", "a permission change", "too much CPU or memory use", "closed by the user (recent apps)",
+        "force-stopped", "a process it depends on died", "other", "frozen", "a package change", "the app was updated"};
+
+    // Why the last run ended, as Android recorded it, for the game to put in its log (<data>/last_exit.txt): a run killed
+    // by the low memory killer or swiped away from recent apps gets no chance to write a line of its own.
+    private void noteLastExit() {
+        File folder = SettingsMenu.gameFolder(this);
+        if (folder == null) return;
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            java.util.List<ApplicationExitInfo> exits = am.getHistoricalProcessExitReasons(getPackageName(), 0, 1);
+            if (exits.isEmpty()) return;
+            ApplicationExitInfo e = exits.get(0);
+            int reason = e.getReason();
+            String line = String.format(java.util.Locale.ROOT, "last run ended %tF %<tT: %s%s (memory %d MB, %d MB resident)\n",
+                    e.getTimestamp(), reason >= 0 && reason < EXIT_REASONS.length ? EXIT_REASONS[reason] : "reason " + reason,
+                    e.getDescription() != null ? " (" + e.getDescription() + ")" : "", e.getPss() / 1024, e.getRss() / 1024);
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(new File(folder, "last_exit.txt"))) {
+                out.write(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+        } catch (java.io.IOException | RuntimeException ignored) {
+        }
     }
 
     // Full screen for real: the Fullscreen theme only drops the status bar, so with three-button navigation (or a visible
@@ -98,6 +238,10 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         try {
             getWindowManager().addView(pad, lp);
             shown = true;
+            if (luaBuild(this)) {
+                modUi = new ModUi(this);
+                if (resumed) modUi.onResume();
+            }
             showCapture();
         } catch (RuntimeException e) {
             // (sin panel el juego sigue con el mando físico y el panel del HUD, como antes)
@@ -141,15 +285,32 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
+        RuntimeLifecycle.update(true, false);
+        if (modUi != null) modUi.onResume();
         applyTurbo(true);
     }
 
     @Override
     protected void onPause() {
+        if (modUi != null) modUi.onPause();
         applyTurbo(false);
         if (pad != null) pad.releaseAll();  // (un dedo que se queda en un botón al irse la app no lo deja pulsado)
         if (controls != null) controls.saveNow();  // (the app may not come back: swiped away from recents, killed for memory)
+        resumed = false;
+        RuntimeLifecycle.update(false, false);
         super.onPause();
+    }
+
+    @Override
+    public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+        // NativeActivity waits for the frame consumer to release its old swapchain.
+        RuntimeLifecycle.update(resumed, true);
+        try {
+            super.surfaceDestroyed(holder);
+        } finally {
+            RuntimeLifecycle.update(resumed, false);
+        }
     }
 
     // The capture button goes in its own small window above the controls' one, only as big as the button, so touches
@@ -207,6 +368,9 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
 
     @Override
     protected void onDestroy() {
+        // NativeActivity will tear down the runtime. Let parked threads finish cleanup with audio paused.
+        RuntimeLifecycle.update(false, true);
+        if (modUi != null) modUi.dispose();
         if (capture != null) {
             try {
                 getWindowManager().removeViewImmediate(capture);
@@ -237,8 +401,10 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     void refresh() {
         controls.save();
         applyPad();
+        pad.setGameFps(gameFps());
         pad.invalidate();
         showCapture();
+        pad.setModsAvailable(luaScripts());
         applyTurbo(true);
     }
 
@@ -256,6 +422,11 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
             nativeTouch(buttons, sticksOn, lx, ly, rx, ry);
         } catch (UnsatisfiedLinkError ignored) {
         }
+    }
+
+    @Override
+    public boolean modTouch(int action, int id, float screenX, float screenY) {
+        return modUi != null && modUi.routeTouch(action, id, screenX, screenY);
     }
 
     @Override
@@ -312,6 +483,27 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         controls.save();
     }
 
+    @Override
+    public void buttonRemoved() {
+        controls.save();
+        applyPad();  // (its controller buttons go with it)
+    }
+
+    // Lua scripts the MOD UI can show: an enabled mod with REFramework scripts, or the Object Explorer. The MOD control
+    // is only on the screen then.
+    private boolean luaScripts() {
+        if (!luaBuild(this)) return false;
+        File folder = SettingsMenu.gameFolder(this);
+        if (folder == null) return false;
+        if (new Ini(folder).on("object_explorer")) return true;
+        try {
+            for (ModFiles.Mod m : ModFiles.list(folder))
+                if (m.on && new File(m.dir, "reframework/autorun").isDirectory()) return true;
+        } catch (RuntimeException ignored) {
+        }
+        return false;
+    }
+
     // ---- pictures for buttons, and layout files (the system's file picker answers in onActivityResult) ----------------
 
     private static final int PICK_IMAGE = 41, EXPORT_LAYOUT = 42, IMPORT_LAYOUT = 43, IMPORT_MOD = 44, IMPORT_CHEATS = 45, IMPORT_DRIVER = 46, IMPORT_DLL = 47;
@@ -341,9 +533,8 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
 
     // Settings → Mods & cheats: a mod's zip or a cheat file, copied into the mods folder (ModFiles), then the menu again
     void importMod() {
-        start(new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
-                .putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/zip", "application/x-zip-compressed",
-                        "application/octet-stream"}), IMPORT_MOD);
+        // SAF providers disagree on MIME types for RAR and 7z. Detect the format from the contents.
+        start(new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), IMPORT_MOD);
     }
 
     void importCheats() {
@@ -372,17 +563,27 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         new Thread(() -> {
             String done;
             try {
-                if (request == IMPORT_MOD) done = "Mod added: " + ModFiles.importZip(getContentResolver(), uri, data);
+                if (request == IMPORT_MOD) {
+                    ModFiles.lastImported = null;
+                    done = "Mod added: " + ModFiles.importArchive(getContentResolver(), uri, data);
+                }
                 else if (request == IMPORT_CHEATS) done = "Cheats added: " + ModFiles.importCheats(getContentResolver(), uri, data);
                 else if (request == IMPORT_DRIVER) done = "Driver added: " + Drivers.unpack(this, uri) + ". Choose it in the list to use it.";
                 else done = "Lossless.dll imported (" + Drivers.importDll(this, uri, data) + "). It's used from the next start.";
             } catch (java.io.IOException | RuntimeException e) {
                 done = "Couldn't add it: " + e.getMessage();
             }
+            final File made = ModFiles.lastImported;
+            final File added = request == IMPORT_MOD && made != null && made.isDirectory() ? made : null;
             final String msg = done;
             runOnUiThread(() -> {
-                Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
-                if (!isFinishing()) new SettingsMenu(this, controls).show();
+                boolean restart = added != null && modsChanged(ModFiles.gameFiles(added), ModFiles.scripts(added));
+                Toast.makeText(this, msg + (added != null && ModFiles.scripts(added) && !restart ? ". Its scripts load without a restart." : "."),
+                        Toast.LENGTH_LONG).show();
+                if (isFinishing()) return;
+                SettingsMenu menu = new SettingsMenu(this, controls);
+                menu.show();
+                if (restart) menu.askRestart();
             });
         }, "ModImport").start();
     }

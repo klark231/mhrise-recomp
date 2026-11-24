@@ -6,10 +6,8 @@ import android.net.Uri;
 import android.provider.OpenableColumns;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -17,8 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import java.util.Map;
 
 // The mods folder, as Eden lays out a game's add-ons: <data>/mods/<name>/romfs/... (files that replace the game's,
 // fs.cpp) and <data>/mods/<name>/cheats/<build id>.txt (Atmosphere cheats, cheats.cpp). A folder whose name starts with
@@ -66,7 +63,7 @@ final class ModFiles {
     }
 
     // On or off: the folder gets or loses its '#'
-    static boolean setOn(Mod m, boolean on) {
+    static synchronized boolean setOn(Mod m, boolean on) {
         File to = new File(m.dir.getParentFile(), (on ? "" : "#") + m.name);
         if (to.equals(m.dir)) return true;
         if (to.exists() || !m.dir.renameTo(to)) return false;
@@ -75,7 +72,16 @@ final class ModFiles {
         return true;
     }
 
-    static boolean delete(Mod m) {
+    // What a change to this mod needs: game files only load when the game starts; scripts reload in place
+    static boolean gameFiles(File dir) {
+        return new File(dir, "romfs").isDirectory() || new File(dir, "exefs").isDirectory();
+    }
+
+    static boolean scripts(File dir) {
+        return new File(dir, "reframework").isDirectory();
+    }
+
+    static synchronized boolean delete(Mod m) {
         return deleteTree(m.dir);
     }
 
@@ -167,6 +173,7 @@ final class ModFiles {
         String n = file != null ? file : fallback;
         int dot = n.lastIndexOf('.');
         if (dot > 0) n = n.substring(0, dot);
+        if (n.toLowerCase(Locale.ROOT).endsWith(".tar")) n = n.substring(0, n.length() - 4);
         n = n.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
         while (n.startsWith("#") || n.startsWith(".")) n = n.substring(1);
         return n.isEmpty() ? fallback : n;
@@ -179,67 +186,159 @@ final class ModFiles {
         return d;
     }
 
-    // A mod's zip, as made for Eden or Yuzu: somewhere inside it a romfs, exefs or cheats folder (maybe under the title ID
-    // or the mod's own folder), or just the game's own folders (natives/...), which then go into romfs. Returns what
-    // went in, for the toast.
-    static String importZip(ContentResolver cr, Uri uri, File data) throws IOException {
-        List<String> names = new ArrayList<>();
-        try (InputStream in = cr.openInputStream(uri); ZipInputStream z = new ZipInputStream(in)) {
-            for (ZipEntry e; (e = z.getNextEntry()) != null; )
-                if (!e.isDirectory()) names.add(e.getName().replace('\\', '/'));
+    static synchronized void prepareForLaunch(File data) throws IOException {
+        PcLooseMod.prepareSlots(data);
+    }
+
+    static String importArchive(ContentResolver cr, Uri uri, File data) throws IOException {
+        try (InputStream in = cr.openInputStream(uri)) {
+            if (in == null) throw new IOException("Cannot open archive");
+            return importArchive(in, displayName(cr, uri), data);
         }
-        if (names.isEmpty()) throw new IOException("the zip is empty");
-        // Where the mod starts: the shortest path before a romfs, exefs or cheats folder
-        String prefix = null, into = "";
-        for (String n : names) {
-            String[] parts = n.split("/");
-            for (int i = 0; i < parts.length - 1; i++) {
-                String p = parts[i].toLowerCase(Locale.ROOT);
-                if (p.equals("romfs") || p.equals("exefs") || p.equals("cheats")) {
-                    String pre = String.join("/", Arrays.copyOfRange(parts, 0, i));
-                    if (prefix == null || pre.length() < prefix.length()) prefix = pre;
-                    break;
-                }
+    }
+
+    static synchronized String importArchive(InputStream source, String filename, File data) throws IOException {
+        File mods = modsDir(data);
+        Files.createDirectories(mods.toPath());
+        File work = Files.createTempDirectory(mods.toPath(), ".import-").toFile();
+        try {
+            File archive = new File(work, "archive");
+            Files.copy(source, archive.toPath());
+            return installUnpacked(ModArchive.unpack(archive, work), filename, data, work);
+        } finally {
+            deleteTree(work);
+        }
+    }
+
+    static volatile File lastImported;  // (what the last import made: GameActivity says whether it needs a restart)
+
+    static String installUnpacked(Map<String, File> files, String filename, File data, File work) throws IOException {
+        File dest = freeDir(data, folderName(filename, "Mod"));
+        lastImported = dest;
+        File staged = new File(work, "ready");
+        Files.createDirectory(staged.toPath());
+        Map<String, File> pc = PcLooseMod.select(files);
+        int scripts = stageFramework(files, staged);
+        String description;
+        if (!pc.isEmpty()) {
+            File game = PcLooseMod.romfs(data);
+            int slot = PcLooseMod.nextSlot(data, game);
+            File romfs = new File(staged, "romfs");
+            Files.createDirectory(romfs.toPath());
+            int count = PcLooseMod.convert(pc, game, work, new File(romfs, PcLooseMod.name(slot)));
+            Files.write(new File(staged, PcLooseMod.MARKER).toPath(),
+                    Long.toString(PcLooseMod.nextOrder(data)).getBytes(StandardCharsets.UTF_8));
+            description = count + " PC resources converted";
+            long inactive =
+                    files.keySet().stream().filter(n -> n.matches("(?i)(?:.*/)?natives/stm/.+")).count() - pc.size();
+            if (inactive > 0)
+                description += ", " + inactive + " inactive or metadata files skipped";
+        } else if (scripts == 0
+                || files.keySet().stream().anyMatch(
+                        n -> n.matches("(?i)(?:.*/)?(?:natives|romfs|cheats|exefs)/.+"))) {
+            description = installSwitch(files, staged);
+        } else {
+            description = "";
+        }
+        if (scripts > 0) {
+            if (pc.isEmpty())
+                Files.write(new File(staged, PcLooseMod.LUA_ORDER).toPath(),
+                        Long.toString(PcLooseMod.nextOrder(data)).getBytes(StandardCharsets.UTF_8));
+            description += (description.isEmpty() ? "" : ", ") + scripts + " Lua/data files";
+        }
+        Files.move(staged.toPath(), dest.toPath());
+        return "\"" + dest.getName() + "\": " + description;
+    }
+
+    private static int stageFramework(Map<String, File> files, File staged) throws IOException {
+        boolean explicit =
+                files.keySet().stream().anyMatch(p -> p.matches("(?i)(?:.*/)?reframework/(autorun|data|images|fonts)/.+"));
+        String wrapper = null;
+        if (!explicit) {
+            java.util.regex.Pattern autorun = java.util.regex.Pattern.compile("(?i)^((?:.*/)?)autorun/.+");
+            for (String path : files.keySet()) {
+                java.util.regex.Matcher m = autorun.matcher(path);
+                if (!m.matches())
+                    continue;
+                if (wrapper != null && !wrapper.equalsIgnoreCase(m.group(1)))
+                    throw new IOException("Multiple autorun folders. Select one mod variant.");
+                wrapper = m.group(1);
             }
         }
-        if (prefix == null) {
-            for (String n : names) {
-                int at = ("/" + n).toLowerCase(Locale.ROOT).indexOf("/natives/");
-                if (at >= 0) {
-                    String pre = n.substring(0, Math.max(0, at - 1));  // (at is in "/" + n: the part before "/natives/")
-                    if (prefix == null || pre.length() < prefix.length()) prefix = pre;
-                }
+        boolean bare = !explicit && wrapper == null;
+        if (bare) {
+            for (String path : files.keySet()) {
+                if (!path.toLowerCase(Locale.ROOT).endsWith(".lua"))
+                    continue;
+                String prefix = path.substring(0, path.lastIndexOf('/') + 1);
+                if (wrapper == null)
+                    wrapper = prefix;
+                while (!prefix.startsWith(wrapper))
+                    wrapper = wrapper.substring(0, wrapper.lastIndexOf('/', wrapper.length() - 2) + 1);
             }
-            if (prefix == null) throw new IOException("no romfs, exefs or cheats folder in it (is it a Switch mod?)");
-            into = "romfs/";
+            if (wrapper == null)
+                return 0;
         }
-        String start = prefix.isEmpty() ? "" : prefix + "/";
-        File dir = freeDir(data, folderName(displayName(cr, uri), "Mod"));
-        int files = 0;
+        String prefixPattern = explicit ? "(?:(.*)/)?reframework/" : java.util.regex.Pattern.quote(wrapper);
+        java.util.regex.Pattern layout =
+                java.util.regex.Pattern.compile("(?i)^" + prefixPattern + "(autorun|data|images|fonts)/(.+)$");
+        java.util.Set<String> paths = new java.util.HashSet<>();
+        String root = null;
+        for (Map.Entry<String, File> entry : files.entrySet()) {
+            java.util.regex.Matcher m = layout.matcher(entry.getKey());
+            String relative;
+            if (m.matches()) {
+                int group = explicit ? 2 : 1;
+                String prefix = explicit && m.group(1) != null ? m.group(1) : "";
+                if (root != null && !root.equalsIgnoreCase(prefix))
+                    throw new IOException("Multiple REFramework variants in archive");
+                root = prefix;
+                relative = m.group(group).toLowerCase(Locale.ROOT) + "/" + m.group(group + 1);
+            } else if (bare && entry.getKey().startsWith(wrapper)
+                    && entry.getKey().toLowerCase(Locale.ROOT).endsWith(".lua")) {
+                relative = "autorun/" + entry.getKey().substring(wrapper.length());
+            } else
+                continue;
+            if (!paths.add(relative.toLowerCase(Locale.ROOT)))
+                throw new IOException("Duplicate REFramework file: " + relative);
+            File dest = new File(new File(staged, "reframework"), relative);
+            Files.createDirectories(dest.getParentFile().toPath());
+            Files.copy(entry.getValue().toPath(), dest.toPath());
+        }
+        return paths.size();
+    }
+
+    private static String installSwitch(Map<String, File> files, File staged) throws IOException {
+        String prefix = null;
+        boolean loose = false;
+        for (String marker : new String[]{"romfs|exefs|cheats", "natives"}) {
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+                    "^((?:.*/)?)(" + marker + ")/.+$", java.util.regex.Pattern.CASE_INSENSITIVE);
+            for (String n : files.keySet()) {
+                java.util.regex.Matcher m = pattern.matcher(n);
+                if (m.matches() && (prefix == null || m.group(1).length() < prefix.length())) prefix = m.group(1);
+            }
+            if (prefix != null) break;
+            loose = true;
+        }
+        if (prefix == null) throw new IOException("No natives/STM, romfs, exefs, cheats or natives folder");
+        int count = 0;
         boolean exefs = false;
-        String root = dir.getCanonicalPath() + File.separator;
-        try (InputStream in = cr.openInputStream(uri); ZipInputStream z = new ZipInputStream(in)) {
-            byte[] buf = new byte[1 << 16];
-            for (ZipEntry e; (e = z.getNextEntry()) != null; ) {
-                String n = e.getName().replace('\\', '/');
-                if (e.isDirectory() || !n.startsWith(start)) continue;
-                String rest = n.substring(start.length());
-                // romfs/exefs/cheats in whatever case the zip has them
-                int slash = rest.indexOf('/');
-                if (into.isEmpty() && slash > 0) rest = rest.substring(0, slash).toLowerCase(Locale.ROOT) + rest.substring(slash);
-                if (rest.startsWith("exefs/")) exefs = true;
-                File out = new File(dir, into + rest);
-                if (!out.getCanonicalPath().startsWith(root)) continue;  // (a "../" name: not outside the folder)
-                File parent = out.getParentFile();
-                if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("can't write " + parent);
-                try (OutputStream o = new FileOutputStream(out)) {
-                    for (int k; (k = z.read(buf)) > 0; ) o.write(buf, 0, k);
-                }
-                files++;
-            }
+        for (Map.Entry<String, File> e : files.entrySet()) {
+            if (!e.getKey().startsWith(prefix)) continue;
+            String rest = e.getKey().substring(prefix.length());
+            int slash = rest.indexOf('/');
+            String first = slash > 0 ? rest.substring(0, slash).toLowerCase(Locale.ROOT) : "";
+            if (loose && first.equals("reframework")) continue;
+            if (!loose && !Arrays.asList("romfs","exefs","cheats").contains(first)) continue;
+            String relative = loose ? "romfs/" + rest : first + rest.substring(slash);
+            File out = new File(staged, relative);
+            Files.createDirectories(out.getParentFile().toPath());
+            Files.move(e.getValue().toPath(), out.toPath());
+            count++;
+            exefs |= first.equals("exefs");
         }
-        if (files == 0) throw new IOException("nothing to take from it");
-        return "\"" + dir.getName() + "\": " + files + " file(s)" + (exefs ? " (its exefs patches aren't used by this port)" : "");
+        return count + " file(s)" + (exefs ? " (exefs patches aren't used by this port)" : "");
     }
 
     // One cheat file (.txt), into a mod of its own name: mods/<name>/cheats/<build id>.txt. A file named after another

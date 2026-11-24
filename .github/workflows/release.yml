@@ -29,6 +29,11 @@ jobs:
         run: bash tools/setup.sh
       - name: Runtime compute shaders
         run: bash tools/shaders.sh
+      - name: Mod archive library cache
+        uses: actions/cache@v4
+        with:
+          path: build/mod-dependencies
+          key: mod-dependencies-${{ hashFiles('tools/mod_archive_dependency.py') }}
       - name: FFmpeg cache
         uses: actions/cache@v4
         with:
@@ -40,6 +45,7 @@ jobs:
         env:
           KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
           KS_PASS: ${{ secrets.RELEASE_KS_PASS }}
+          LUA_LAB: '1'
         run: |
           echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
           if [ -z "$KEYSTORE_B64" ] || [ -z "$KS_PASS" ]; then

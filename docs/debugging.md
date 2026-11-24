@@ -101,6 +101,6 @@ address in [mh-rise.md](mh-rise.md) was found.
 
 ## Other switches for debugging
 
-All in the README's table. The ones used most: `no_fsr` (rules out the upscaler), `no_split_overlays`,
+See the [settings reference](settings.md). The ones used most: `no_fsr` (rules out the upscaler), `no_split_overlays`,
 `no_readback_copies` and `use_return` (memory coherence), `no_safe_translation`, `keep_dead_functions`,
 `no_spirv_opt_brx` (translation), `no_ubwc` and `env.TU_DEBUG` (driver), and `perf_stats` (CPU time).

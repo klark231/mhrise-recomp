@@ -28,5 +28,8 @@ void set_template(const void* image, size_t image_size, size_t total_size, size_
 // Al empezar un hilo del juego: crea su bloque. Si un hilo llega al código del juego sin pasar por aquí (un
 // pthread_create del propio juego), el stub lo crea la primera vez que el juego lee su TLS.
 void thread_start();
+#ifdef MHRISE_LUA_DEBUG
+const uintptr_t* observed_layout(size_t& words);
+#endif
 
 }  // namespace tls

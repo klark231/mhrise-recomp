@@ -1,7 +1,7 @@
 # GPUs and drivers
 
 The port was written for the Adreno 650 with Qualcomm's driver (Retroid Pocket 5 / Flip 2) and has since been made to
-run on other phones. Each section lists what that family needs and why. The README's switch table has the switch for
+run on other phones. Each section lists what that family needs and why. The [settings reference](settings.md) has the switch for
 each workaround.
 
 **Tell drivers apart by `driverID`** (`VkPhysicalDeviceDriverProperties`), not by the device name. Some Turnip builds
@@ -76,9 +76,10 @@ Turnip was still being brought up on the A8xx while this was written, and builds
   the CPU does no decoding (`no_gpu_bc` goes back to the CPU). BC6H and BC7 are still decompressed on the CPU (`bcn.cpp`,
   written from the format specification). `bc_on_cpu` tests these paths on an Adreno.
   Unsigned BC6H (skies, lighting) is stored as B10G11R11, half the size of RGBA16F.
-  With `bc_astc` (Graphics → Textures as ASTC), BC1/BC2/BC3/BC7 are stored as ASTC 4x4 instead, which Mali reads
-  natively: RGBA8 is 4 times the size of BC3/BC7 and 8 times BC1, ASTC 4x4 the same as BC3/BC7. The encode uses ARM's
-  astcenc (fastest preset, 4 threads) the first time a level loads, and the result goes to the app's own files folder (`astc_cache`,
+  With `bc_astc` (Graphics → Textures as ASTC, offered on any driver without BC), BC1/BC2/BC3/BC7 are stored as ASTC 4x4
+  instead, which these GPUs read natively: RGBA8 is 4 times the size of BC3/BC7 and 8 times BC1, ASTC 4x4 the same as BC3/BC7. The encode uses ARM's
+  astcenc (fastest preset, 4 threads) the first time a level loads (a level of 256x256 or more is encoded on the GPU at
+  once meanwhile, by `shaders/astc_encode.comp`, so it shows at full size straight away; `cpu_astc` turns that off), and the result goes to the app's own files folder (`astc_cache`,
   keyed by the BC blocks): shared storage goes through FUSE, which costs time on every file opened. Levels that are
   still all zeros (not streamed in yet) become one-colour ASTC blocks, with nothing encoded or cached. The idea came from the mesa-wrapper that transcodes BC to ASTC for Winlator; the code is the port's
   own plus astcenc. The idea came from the bionic

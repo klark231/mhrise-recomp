@@ -30,10 +30,16 @@ final class TextPrompt {
 
     private final GameActivity activity;
     private final float scale;
+    private final boolean chinese;
 
     TextPrompt(GameActivity activity) {
+        this(activity, false);
+    }
+
+    TextPrompt(GameActivity activity, boolean chinese) {
         this.activity = activity;
-        this.scale = SettingsMenu.menuScale(activity) / 100f;
+        this.chinese = chinese;
+        this.scale = SettingsMenu.sizeFactor(activity);
     }
 
     void show(String header, String guide, String initial, String error, int minLength, int maxLength, boolean password,
@@ -44,7 +50,7 @@ final class TextPrompt {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(16), dp(12), dp(16), dp(14));
         box.setBackground(plate(SettingsMenu.PANEL, 2, 0));
-        TextView title = text(header.isEmpty() ? "Type" : header, 20, SettingsMenu.GOLD, true);
+        TextView title = text(header.isEmpty() ? (chinese ? "输入" : "Type") : header, 20, SettingsMenu.GOLD, true);
         title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         box.addView(title);
         box.addView(rule(SettingsMenu.RED, 2));
@@ -76,6 +82,7 @@ final class TextPrompt {
         if (maxLength > 0) {
             String limits = minLength > 1 ? minLength + " to " + maxLength + " characters"
                     : "Up to " + maxLength + " characters";
+            if (chinese) limits = minLength > 1 ? minLength + " 至 " + maxLength + " 个字符" : "最多 " + maxLength + " 个字符";
             box.addView(text(limits, 13, SettingsMenu.DIM, false));
         }
 
@@ -83,7 +90,7 @@ final class TextPrompt {
         Runnable accept = () -> {
             String s = edit.getText().toString();
             if (s.length() < Math.max(minLength, 0)) {
-                note.setText("It needs at least " + minLength + " characters.");
+                note.setText(chinese ? "至少需要 " + minLength + " 个字符。" : "It needs at least " + minLength + " characters.");
                 note.setVisibility(TextView.VISIBLE);
                 return;
             }
@@ -99,9 +106,9 @@ final class TextPrompt {
 
         LinearLayout buttons = new LinearLayout(activity);
         buttons.setPadding(0, dp(12), 0, 0);
-        TextView cancel = button("Cancel", false);
+        TextView cancel = button(chinese ? "取消" : "Cancel", false);
         cancel.setOnClickListener(v -> d.cancel());
-        TextView ok = button("OK", true);
+        TextView ok = button(chinese ? "确定" : "OK", true);
         ok.setOnClickListener(v -> accept.run());
         LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, dp(46), 1);
         half.setMargins(dp(4), 0, dp(4), 0);

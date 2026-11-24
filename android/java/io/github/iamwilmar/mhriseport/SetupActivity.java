@@ -1,6 +1,8 @@
 package io.github.iamwilmar.mhriseport;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.SharedPreferences;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Typeface;
@@ -32,6 +34,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Supplier;
 
 // The start screen. The first time it asks for the files permission and two folders:
 //   - the game folder, where the user copied the game files (ExeFS and RomFS already extracted on their own console, and
@@ -56,6 +59,7 @@ public final class SetupActivity extends Activity {
     private boolean forData;    // what the browser is choosing
     private boolean inBrowser;
     private boolean shown, waitingAccess;
+    private boolean chinese;
     private DumpScanner.Result found;  // the game files of the game folder, once scanned
 
     private LinearLayout body, buttons;
@@ -64,6 +68,7 @@ public final class SetupActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        chinese = SettingsMenu.usesChinese(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
@@ -126,14 +131,19 @@ public final class SetupActivity extends Activity {
 
     // ---- the pages ------------------------------------------------------------------------------------------------------
 
+    private String tr(String english, String simplifiedChinese) {
+        return chinese ? simplifiedChinese : english;
+    }
+
     private void showPermission() {
         inBrowser = false;
-        page("GAME FILES", "To read your game files the app needs access to all files. It only reads the game folder "
-                + "and writes to the data folder you choose.");
+        page(tr("FILE ACCESS", "文件访问权限"),
+                tr("Allow file access in Android settings, then return here to choose your game folder.",
+                   "请在系统设置中开启“允许访问所有文件”，再返回此处选择游戏文件夹。"), this::showPermission);
         gameGuide();
-        Button grant = action("Give permission", true, v -> {
+        Button grant = action(tr("Open permission settings", "打开权限设置"), true, v -> {
             waitingAccess = true;
-            say("Turn on access to all files and come back.", GOLD);
+            say(tr("Allow access to all files, then return here.", "开启“允许访问所有文件”后返回此处。"), GOLD);
             try {
                 startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                         Uri.parse("package:" + getPackageName())));
@@ -141,42 +151,44 @@ public final class SetupActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
             }
         });
-        action("Exit", false, v -> finish());
+        action(tr("Exit", "退出"), false, v -> finish());
         grant.requestFocus();
     }
 
     private void showWelcome() {
         inBrowser = false;
-        page("GAME FILES", "Choose the folder that holds your copy of the game. It's read from there: nothing is copied.");
+        page(tr("GAME FILES", "游戏文件"),
+                tr("Choose the folder containing your extracted ExeFS and RomFS. MHRise reads the files in place.",
+                   "请选择包含已提取的 ExeFS 和 RomFS 的文件夹。MHRise 会直接从这里读取游戏。"), this::showWelcome);
         gameGuide();
-        Button pick = action("Choose game folder", true, v -> showBrowser(null, false));
-        action("GPU driver", false, v -> startActivity(new Intent(this, DriverActivity.class)));
-        action("Exit", false, v -> finish());
+        Button pick = action(tr("Choose game folder", "选择游戏文件夹"), true, v -> showBrowser(null, false));
+        action(tr("GPU driver", "GPU 驱动"), false, v -> startActivity(new Intent(this, DriverActivity.class)));
+        action(tr("Exit", "退出"), false, v -> finish());
         pick.requestFocus();
     }
 
     // What the game folder has to look like, and what each part is
     private void gameGuide() {
         LinearLayout cols = columns();
-        LinearLayout left = panel(cols, "THE FOLDER SHOULD LOOK LIKE THIS");
+        LinearLayout left = panel(cols, tr("EXAMPLE FOLDER", "游戏文件夹示例"));
         left.addView(tree(new String[] {
-            "Your game folder",
+            tr("Your game folder", "游戏文件夹"),
             "├─ exefs",
             "│    main, main.npdm",
             "│    rtld, sdk, subsdk0",
             "├─ romfs",
-            "│    re_chunk_000.pak",
-            "│    re_chunk_000.pak.patch_0xx.pak",
-            "└─ DLC (optional)",
-            "     <title ID> romfs",
+            "│    " + Game.ROMFS_MARKER,
+            "│    … " + Game.UPDATE_MARKER,
+            tr("└─ DLC (optional)", "└─ DLC（可选）"),
+            tr("     <title ID>/romfs", "     <标题 ID>/romfs"),
         }, 0, 1, 4, 7));
-        LinearLayout right = column(cols, "WHAT EACH ONE MUST BE");
-        right.addView(notes("• exefs: the one from the " + Game.VERSION + " update.\n"
-                + "• romfs: the base game's, with the " + Game.VERSION + " update applied over it.\n"
-                + (Game.DLC_MARKER != null
-                        ? "• DLC: each one's romfs, in a folder named with its title ID, as your extraction tool made it.\n" : "")
-                + "• Folder names can differ: the app looks for them anywhere inside the folder you pick.\n"
-                + "• Your saves don't go here: you choose a data folder next."));
+        LinearLayout right = column(cols, tr("GAME VERSION " + Game.VERSION, "游戏版本 " + Game.VERSION));
+        right.addView(notes(tr("Use the ExeFS from this update and the base RomFS with the update applied.\n\n"
+                        + "Setup searches the folder you choose and its subfolders. Keep each DLC’s title ID in its folder name.\n\n"
+                        + "Next, choose a writable folder for saves and settings.",
+                "请使用此版本的 ExeFS，以及已合并此更新的完整 RomFS。\n\n"
+                        + "程序会检查所选文件夹及其子文件夹。若有 DLC，请保留文件夹名称中的标题 ID。\n\n"
+                        + "下一步将选择可写入的数据文件夹，用于存放存档和设置。")));
     }
 
     // ---- the folder browser ---------------------------------------------------------------------------------------------
@@ -185,14 +197,14 @@ public final class SetupActivity extends Activity {
         inBrowser = true;
         browsing = dir;
         forData = data;
-        if (data) {
-            page("DATA FOLDER", "Where the port keeps your saves, the shader cache, log.txt and its settings. "
-                    + "Any folder you like.");
-        } else {
-            page("CHOOSE YOUR GAME FOLDER", "Open the folder with your game files and choose \"Use this folder\".");
-        }
+        page(data ? tr("DATA FOLDER", "数据文件夹") : tr("CHOOSE YOUR GAME FOLDER", "选择游戏文件夹"),
+                data ? tr("Choose a writable folder for your saves, shader cache, log and settings.",
+                          "请选择一个可写入的文件夹，用于存放存档、着色器缓存、日志和设置。")
+                     : tr("Open the folder containing ExeFS and RomFS, then select “Use this folder”.",
+                          "打开包含 ExeFS 和 RomFS 的文件夹，然后选择“使用此文件夹”。"),
+                () -> showBrowser(dir, data));
         LinearLayout where = panel(body, null);
-        TextView path = text(dir == null ? "Storage" : dir.getPath(), 14, GOLD, true);
+        TextView path = text(dir == null ? tr("Storage", "存储设备") : dir.getPath(), 14, GOLD, true);
         path.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         where.addView(path);
         if (dir == null) {
@@ -201,7 +213,7 @@ public final class SetupActivity extends Activity {
                 if (d != null) item(where, "💾   " + volume.getDescription(this), v -> showBrowser(d, data));
             }
         } else {
-            item(where, "⬆   Up", v -> showBrowser(parentOf(dir), data));
+            item(where, tr("⬆   Up", "⬆   上一级"), v -> showBrowser(parentOf(dir), data));
             File[] subs = dir.listFiles(File::isDirectory);
             int n = 0;
             if (subs != null) {
@@ -212,23 +224,23 @@ public final class SetupActivity extends Activity {
                     n++;
                 }
             }
-            if (n == 0) where.addView(notes("(no folders in here)"));
+            if (n == 0) where.addView(notes(tr("No subfolders", "没有子文件夹")));
         }
         Button first = null;
         if (dir != null) {
-            first = action("Use this folder", true, v -> {
+            first = action(tr("Use this folder", "使用此文件夹"), true, v -> {
                 if (data) useDataFolder(dir);
                 else scan(dir);
             });
-            if (data) action("New folder here", false, v -> {
+            if (data) action(tr("New folder here", "新建文件夹"), false, v -> {
                 File fresh = new File(dir, "MH Rise port");
                 for (int k = 2; fresh.exists() && !fresh.isDirectory(); k++) fresh = new File(dir, "MH Rise port " + k);
                 if (fresh.isDirectory() || fresh.mkdirs()) showBrowser(fresh, true);
-                else say("Can't make a folder in " + dir.getPath() + ".", ALERT);
+                else say(tr("Could not create a folder in ", "无法在此位置新建文件夹：") + dir.getPath(), ALERT);
             });
         }
         boolean back = found != null && found.ready();
-        action(back ? "Cancel" : "Exit", false, v -> {
+        action(back ? tr("Cancel", "取消") : tr("Exit", "退出"), false, v -> {
             if (back) showResult();
             else finish();
         });
@@ -238,7 +250,7 @@ public final class SetupActivity extends Activity {
 
     private void showBusy(String title, String what) {
         inBrowser = false;
-        page(title, what);
+        page(title, what, null);
         LinearLayout p = panel(body, null);
         p.addView(new android.widget.ProgressBar(this));
     }
@@ -246,7 +258,7 @@ public final class SetupActivity extends Activity {
     // ---- the game folder ------------------------------------------------------------------------------------------------
 
     private void scan(File dir) {
-        showBusy("LOOKING FOR YOUR GAME…", dir.getPath());
+        showBusy(tr("CHECKING GAME FILES…", "正在检查游戏文件…"), dir.getPath());
         new Thread(() -> {
             DumpScanner.Result r = DumpScanner.scan(dir);
             String error = null;
@@ -257,7 +269,7 @@ public final class SetupActivity extends Activity {
                     // (an install from before kept everything in the game folder: that stays its data folder)
                     if (data != null && data.isDirectory()) DumpScanner.writePaths(data, r);
                 } catch (IOException e) {
-                    error = "Can't write to " + data + ": " + e.getMessage();
+                    error = e.toString();
                 }
             }
             String failure = error;
@@ -267,8 +279,8 @@ public final class SetupActivity extends Activity {
                     askDataFolder(dir);
                     return;
                 }
-                showResult();
-                if (failure != null) say(failure, ALERT);
+                if (failure != null) showResult(() -> tr("Could not save the folder selection. ", "无法保存所选文件夹。") + failure, ALERT);
+                else showResult();
             });
         }, "FindGame").start();
     }
@@ -276,24 +288,26 @@ public final class SetupActivity extends Activity {
     // The first time: the game files are fine, now where the port's own files go
     private void askDataFolder(File game) {
         inBrowser = false;
-        page("SAVES AND SETTINGS", "Game found. Now choose where the port keeps its own files.");
+        page(tr("SAVES AND SETTINGS", "存档和设置"),
+                tr("Game files verified. Choose where to keep your saves and settings.",
+                   "游戏文件检查通过。请选择存放存档和设置的位置。"), () -> askDataFolder(game));
         LinearLayout cols = columns();
-        LinearLayout left = panel(cols, "THE DATA FOLDER WILL HAVE");
+        LinearLayout left = panel(cols, tr("DATA FOLDER CONTENTS", "数据文件夹内容"));
         left.addView(tree(new String[] {
-            "Your data folder",
-            "├─ save          your hunts",
-            "├─ save.bak      the last good save",
-            "├─ shaders       the shader cache",
+            tr("Your data folder", "数据文件夹"),
+            tr("├─ save          saved game", "├─ save          游戏存档"),
+            tr("├─ save.bak      save backup", "├─ save.bak      存档备份"),
+            tr("├─ shaders       shader cache", "├─ shaders       着色器缓存"),
             "├─ log.txt",
-            "└─ settings      (from the in-game menu)",
+            tr("└─ mhr.ini       settings", "└─ mhr.ini       设置"),
         }, 0));
-        LinearLayout right = column(cols, "WHY ITS OWN FOLDER");
-        right.addView(notes("• The game files stay untouched, and can even be on a card you only read from.\n"
-                + "• Back up or move your saves without the 10+ GB of game files.\n"
-                + "• The game folder still works if you'd rather keep everything together."));
+        LinearLayout right = column(cols, tr("WHERE TO KEEP SAVES", "存放位置"));
+        right.addView(notes(tr("A separate data folder makes saves easier to back up and lets you keep game files on a read-only card. "
+                        + "You can also use the game folder if it is writable.",
+                "单独存放便于备份存档，游戏文件也可以放在只读存储卡上。如果游戏文件夹可写，也可以将两者放在一起。")));
         say("✓  " + game.getPath(), GOOD);
-        Button other = action("Choose data folder", true, v -> showBrowser(game.getParentFile(), true));
-        action("Use the game folder", false, v -> useDataFolder(game));
+        Button other = action(tr("Choose data folder", "选择数据文件夹"), true, v -> showBrowser(game.getParentFile(), true));
+        action(tr("Use the game folder", "使用游戏文件夹"), false, v -> useDataFolder(game));
         other.requestFocus();
     }
 
@@ -302,34 +316,35 @@ public final class SetupActivity extends Activity {
     private void useDataFolder(File dir) {
         File old = saved(DATA_FILE);
         if (old != null && (sameFolder(old, dir) || !old.isDirectory())) old = null;
-        showBusy(old != null ? "MOVING YOUR SAVES…" : "SETTING UP…", dir.getPath());
+        showBusy(old != null ? tr("COPYING SAVES…", "正在复制存档…") : tr("SETTING UP…", "正在设置…"), dir.getPath());
         final File from = old;
         final DumpScanner.Result r = found;
         new Thread(() -> {
-            String error = null, note = null;
+            String error = null;
+            Supplier<String> note = null;
             try {
-                if (r == null || !r.ready()) throw new IOException("the game folder isn't set up yet");
-                if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("can't make the folder");
+                if (r == null || !r.ready()) throw new IOException(tr("Choose a valid game folder first.", "请先选择有效的游戏文件夹。"));
+                if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException(tr("Could not create the folder.", "无法创建文件夹。"));
                 if (from != null) note = copyPortFiles(from, dir, r);
                 DumpScanner.writePaths(dir, r);
                 write(DATA_FILE, dir);
             } catch (IOException e) {
-                error = "Can't use " + dir + ": " + e.getMessage();
+                error = e.toString();
             }
-            String failure = error, done = note;
+            String failure = error;
+            Supplier<String> done = note;
             runOnUiThread(() -> {
-                showResult();
-                if (failure != null) say(failure, ALERT);
-                else if (done != null) say(done, GOLD);
+                if (failure != null) showResult(() -> tr("Could not use ", "无法使用文件夹 ") + dir + " — " + failure, ALERT);
+                else showResult(done, GOLD);
             });
         }, "DataFolder").start();
     }
 
     // The old data folder's contents, copied (not moved) to the new one: everything except the game files themselves.
     // A folder that already has saves keeps them: nothing is copied over them.
-    private static String copyPortFiles(File from, File to, DumpScanner.Result r) throws IOException {
+    private Supplier<String> copyPortFiles(File from, File to, DumpScanner.Result r) throws IOException {
         if (new File(to, "save").isDirectory())
-            return "This folder already has saves, so those are used. Nothing was copied from " + from.getPath() + ".";
+            return () -> tr("Using the saves already in ", "已使用这里的现有存档：") + to;
         List<String> game = new ArrayList<>();
         game.add(r.exefs);
         game.add(r.romfs);
@@ -345,8 +360,7 @@ public final class SetupActivity extends Activity {
             copied++;
         }
         return copied == 0 ? null
-                : "Your saves and settings were copied here. The old copy is still in " + from.getPath()
-                        + ": delete it once the game runs fine.";
+                : () -> tr("Saves and settings copied. The originals are in ", "存档和设置已复制。原文件仍位于 ") + from;
     }
 
     // Is this a game folder, or one with game files somewhere inside?
@@ -375,53 +389,84 @@ public final class SetupActivity extends Activity {
     // ---- what's chosen --------------------------------------------------------------------------------------------------
 
     private void showResult() {
+        showResult(null, GOLD);
+    }
+
+    private void showResult(Supplier<String> message, int color) {
         inBrowser = false;
         browsing = null;
         DumpScanner.Result r = found != null ? found : new DumpScanner.Result();
         File game = gameFolder(), data = saved(DATA_FILE);
         boolean dataOk = data != null && data.isDirectory();
         boolean ready = r.ready() && dataOk;
-        page(Game.NAME.toUpperCase(java.util.Locale.ROOT), ready ? "Everything's in place." : "Something's missing: see below.");
+        page(Game.NAME.toUpperCase(java.util.Locale.ROOT),
+                ready ? tr("Ready to start.", "可以启动游戏。") : tr("Check the items marked below.", "请检查下方标记的项目。"),
+                () -> showResult(message, color));
         LinearLayout cols = columns();
 
-        LinearLayout left = panel(cols, "GAME FOLDER");
-        left.addView(pathLine(game != null ? game.getPath() : "none"));
-        left.addView(check(r.exefs != null, r.exefs != null ? "Game, version " + Game.VERSION
-                : r.exefsProblem != null ? r.exefsProblem : "ExeFS not found (the folder with main and main.npdm)."));
-        left.addView(check(r.romfs != null, r.romfs != null ? "Game RomFS"
-                : r.romfsProblem != null ? r.romfsProblem : "RomFS not found."));
+        LinearLayout left = panel(cols, tr("GAME FOLDER", "游戏文件夹"));
+        left.addView(pathLine(game != null ? game.getPath() : tr("None selected", "尚未选择")));
+        left.addView(check(r.exefs != null, r.exefs != null ? tr("Game version ", "游戏版本 ") + Game.VERSION
+                : r.exefsProblem != null ? r.exefsProblem.text(chinese)
+                : tr("ExeFS not found. Look for the folder with main and main.npdm.", "未找到 ExeFS。请检查是否包含 main 和 main.npdm。")));
+        left.addView(check(r.romfs != null, r.romfs != null ? tr("Game RomFS", "游戏 RomFS")
+                : r.romfsProblem != null ? r.romfsProblem.text(chinese) : tr("RomFS not found.", "未找到 RomFS。")));
         if (Game.DLC_MARKER != null) {
-            left.addView(r.dlc.isEmpty() ? line("·  No DLC (optional)", DIM) : check(true, r.dlc.size() + " DLC"));
+            left.addView(r.dlc.isEmpty() ? line(tr("·  No DLC (optional)", "·  未找到 DLC（可选）"), DIM)
+                    : check(true, r.dlc.size() + tr(" DLC", " 个 DLC")));
             if (r.unknownDlc > 0)
-                left.addView(line("·  " + r.unknownDlc + " DLC skipped: keep their folders named with their title ID, "
-                        + "as your extraction tool made them.", DIM));
+                left.addView(line("·  " + r.unknownDlc + tr(" DLC skipped. Keep the title ID in each folder name.",
+                        " 个 DLC 已跳过。请保留文件夹名称中的标题 ID。"), DIM));
         }
 
-        LinearLayout right = panel(cols, "DATA FOLDER");
-        right.addView(pathLine(dataOk ? data.getPath() : "not chosen yet"));
+        LinearLayout right = panel(cols, tr("DATA FOLDER", "数据文件夹"));
+        right.addView(pathLine(dataOk ? data.getPath() : tr("None selected", "尚未选择")));
         if (dataOk) {
             boolean same = game != null && sameFolder(game, data);
-            right.addView(check(true, same ? "Saves, cache and log next to the game files" : "Saves, cache and log"));
-            right.addView(line(new File(data, "save").isDirectory() ? "·  Has saves" : "·  No saves yet", DIM));
+            right.addView(check(true, same ? tr("Saves, cache and log alongside game files", "存档、缓存和日志与游戏文件一起存放")
+                    : tr("Saves, cache and log", "存档、缓存和日志")));
+            right.addView(line(new File(data, "save").isDirectory() ? tr("·  Has saves", "·  已有存档")
+                    : tr("·  No saves yet", "·  暂无存档"), DIM));
         } else {
-            right.addView(check(false, "Choose where your saves go."));
+            right.addView(check(false, tr("Choose a folder for saves.", "请选择存档的存放位置。")));
         }
 
         Button first = null;
-        if (ready) first = action("Start game", true, v -> startGame());
-        Button changeGame = action(r.ready() ? "Game folder" : "Choose game folder", !r.ready(),
+        if (ready) first = action(tr("Start game", "启动游戏"), true, v -> startGame());
+        Button changeGame = action(r.ready() ? tr("Game folder", "游戏文件夹") : tr("Choose game folder", "选择游戏文件夹"), !r.ready(),
                 v -> showBrowser(game != null && game.isDirectory() ? game : null, false));
         if (first == null && !r.ready()) first = changeGame;
         if (r.ready()) {
-            Button changeData = action(dataOk ? "Data folder" : "Choose data folder", !dataOk,
+            Button changeData = action(dataOk ? tr("Data folder", "数据文件夹") : tr("Choose data folder", "选择数据文件夹"), !dataOk,
                     v -> showBrowser(dataOk ? data : null, true));
             if (first == null) first = changeData;
         }
-        action("GPU driver", false, v -> startActivity(new Intent(this, DriverActivity.class)));
+        action(tr("GPU driver", "GPU 驱动"), false, v -> startActivity(new Intent(this, DriverActivity.class)));
+        if (message != null) say(message.get(), color);
         first.requestFocus();
     }
 
     private void startGame() {
+        File data = saved(DATA_FILE);
+        if (data != null) {
+            String migration = "scissoredClears:" + data.getAbsolutePath();
+            SharedPreferences prefs = getPreferences(MODE_PRIVATE);
+            if (!prefs.getBoolean(migration, false)) {
+                if (!new Ini(data).removeSystemMemoryOverride()) {
+                    showResult(() -> tr("Could not update TU_DEBUG in ", "无法更新 TU_DEBUG，文件为 ") + new File(data, Ini.NAME), ALERT);
+                    return;
+                }
+                prefs.edit().putBoolean(migration, true).apply();
+            }
+            try {
+                ModFiles.prepareForLaunch(data);
+            } catch (IOException e) {
+                showResult();
+                android.widget.Toast.makeText(this, tr("Could not prepare PC mod patches: ", "无法准备 PC MOD 补丁：") + e.getMessage(),
+                        android.widget.Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
         startActivity(new Intent(this, GameActivity.class));
         overridePendingTransition(0, 0);
         finish();
@@ -472,7 +517,7 @@ public final class SetupActivity extends Activity {
     // ---- the frame ------------------------------------------------------------------------------------------------------
 
     // A new page: title, the line under it, an empty body, the status line and an empty row of buttons
-    private void page(String title, String intro) {
+    private void page(String title, String intro, Runnable redraw) {
         int pad = dp(14);
         LinearLayout whole = new LinearLayout(this);
         whole.setOrientation(LinearLayout.VERTICAL);
@@ -481,10 +526,31 @@ public final class SetupActivity extends Activity {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.VERTICAL);
         top.setPadding(pad * 2, pad, pad * 2, dp(8));
+        LinearLayout heading = new LinearLayout(this);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
         TextView t = text(title, 20, GOLD, true);
         t.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-        t.setGravity(Gravity.CENTER);
-        top.addView(t);
+        heading.addView(t, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        if (redraw != null) {
+            Button language = new Button(this);
+            language.setAllCaps(false);
+            language.setText("⚙  Language / 语言");
+            language.setTextColor(CREAM);
+            language.setPadding(dp(12), 0, dp(12), 0);
+            language.setMinHeight(dp(48));
+            language.setBackground(states(BRONZE, LIT, 1, 6));
+            language.setOnClickListener(v -> new AlertDialog.Builder(this)
+                    .setTitle("Language / 语言")
+                    .setSingleChoiceItems(SettingsMenu.LANGUAGES, chinese ? 1 : 0, (dialog, choice) -> {
+                        dialog.dismiss();
+                        if (chinese == (choice == 1)) return;
+                        chinese = choice == 1;
+                        SettingsMenu.setChinese(this, chinese);
+                        redraw.run();
+                    }).show());
+            heading.addView(language);
+        }
+        top.addView(heading);
         TextView i = text(intro, 14, CREAM, false);
         i.setGravity(Gravity.CENTER);
         i.setPadding(0, dp(4), 0, 0);

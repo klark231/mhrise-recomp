@@ -9,7 +9,7 @@ where one exists, so the old behaviour can be compared.
 The main scenery pixel shaders compute their own derivatives with `SHFL.BFLY` by 1 and 2. Eden translated those to
 `OpGroupNonUniformShuffleXor`, which Vulkan doesn't guarantee to run for helper invocations, so pixels on triangle
 edges read garbage. Butterflies by 1..3 in pixel shaders are now quad swaps, which always include helper invocations
-(`tools/patches/eden-quad-butterfly.patch`, cache key version 3). Early on this was wrongly ruled out after counting
+(the quad-butterfly change in `runtime/eden`, cache key version 3). Early on this was wrongly ruled out after counting
 the wrong SPIR-V opcode: `OpGroupNonUniformShuffleXor` is 346, `QuadBroadcast` 365, `QuadSwap` 366.
 
 **Endemic life, wirebugs and some lights invisible but still gatherable** (also on Eden).
@@ -94,10 +94,22 @@ mixed each time. It's now one continuous queue (`audio_cola.h`).
 
 ## Performance
 
+- **The renderer is v1.0.85's again.** yun-wulian's fork brought a rewrite of the renderer (resource ownership and
+  lifetimes, a texture registry, pipeline workers with futures, a new presenter) that cost about 3 ms of CPU and 2 ms of
+  GPU a frame on a Mali-G615, and whose new translator fingerprint emptied the
+  pipeline warm-up list. This build keeps v1.0.85's renderer with only what was worth keeping from that work on top:
+  2D textures' block heights and the compute particles' sub-ranges (the blood splashes as big patches and the magnified
+  collision particles), the pipeline crash guard and skip list, the vertex formats a driver can't read read through ones
+  it can, tessellation in its domain, BC as ASTC on the GPU, barrier bits, and the Mali half-packing fixes. The Lua
+  runtime, the MOD UI, PC mod import and everything outside the renderer are as they were.
+- **Render distance** (`draw_distance_*`, Settings → Detail): small and medium objects stop being drawn sooner in the
+  distance, through the game's own small-object culling (its ratio divided by the share picked).
 - **First-use freezes on Turnip:** every compute shader went through spirv-opt, which took 4.3 s for 4 new shaders the
   first time an attack used them (plus 1.5 s of their pipelines). That was a fix for Qualcomm's own compiler; on Mesa
-  drivers only compute shaders with a switch (BRX) go through it now (`spirv_opt_compute` restores the old rule).
-- **BC textures as ASTC on Mali** (`bc_astc`, off by default until tested): 2-8 times less texture memory traffic
+  drivers only compute shaders with a switch (BRX) go through it now (`spirv_opt_compute` restores the old rule), and
+  on a background thread, with the plain translation until it's done (`sync_spirv_opt`: as before). Up to 6 s of freeze
+  the first time an effect appeared was enough for an online hunt to close the session.
+- **BC textures as ASTC on drivers without BC** (`bc_astc`, off by default until tested; BC1, and BC2/BC3 with one alpha per block, convert without the encoder): 2-8 times less texture memory traffic
   than RGBA8. The first load of each texture is slower (CPU encode); the cache in the data folder makes the next ones a
   file read.
 - **BC textures on Mali and PowerVR:** BC1–BC5 are decoded on the GPU (`no_gpu_bc`), so loading and streaming no longer

@@ -1,0 +1,364 @@
+#version 450
+// ASTC 4x4 encoding on the GPU, for BC textures on drivers without BC (Textures as ASTC). The CPU path (astc.cpp,
+// ARM's astcenc) is the fallback, and the one used where this pipeline doesn't build. One invocation per block, from
+// RGBA8 texels in rows of blocks_x * 4 (whole blocks: executor.cpp decodes the BC level into them). One partition and
+// three fixed block shapes that need no search over block modes:
+// - opaque: RGB endpoints of 8 bits (CEM 8) with 3-bit weights, or of 192 levels (a trit and 6 bits) with 4-bit ones;
+// - RGBA on one line: CEM 12 endpoints of 8 bits, 2-bit weights (alpha that follows the colour, or one value);
+// - RGBA, alpha apart: two weight planes of 2 bits (the second one alpha), CEM 12 endpoints in the 45 bits left,
+//   which the decoder reads as 48 levels (a trit and 4 bits each).
+// Each fits a line through the texels (power iteration), assigns weights, refits the endpoints by least squares (up
+// to twice, while it helps); the smaller error of the two opaque shapes, or of the two with alpha, wins. A block of one colour is a void
+// extent block. Doing this on the GPU at load (instead of the CPU encoder and its cache) is the approach of GameNative's
+// Mesa wrapper (MIT), whose upload path encodes BC images to ASTC with a compute shader; this shader is written for
+// this project from the ASTC specification.
+//
+// The code between ASTC_CODE_BEGIN and ASTC_CODE_END is also built as C++ (tools/astc_gpu_test.cpp) to check its blocks
+// against ARM's decoder, so it keeps to what both languages read alike: scalars, fixed arrays, globals, no swizzles.
+
+#ifndef ASTC_CPP
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer Texels { uint src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Blocks { uint dst[]; };
+layout(push_constant) uniform Params {
+    uint blocks_x;  // blocks per row (the texel rows are 4 times as wide)
+    uint blocks_y;
+    uint groups_x;  // workgroups per row of the dispatch (it wraps past 65535)
+} p;
+#define CONST_ARRAY(type, name, n) const type name[n] = type[]
+#define SHARED shared
+#endif
+
+// ASTC_CODE_BEGIN
+// The trit blocks: for k trits (t0 + 3 t1 + 9 t2 ...), the bits that decode to them with the rest zero (2, 4, 5, 7 or 8
+// bits for k = 1 to 5), at TRIT_AT[k], four to a uint. Made by decoding every pattern as the specification does.
+CONST_ARRAY(uint, TRITS, 91) (131328u, 84148737u, 168364038u, 67240192u, 151520773u, 303108106u, 404100372u, 117643801u,
+    454497035u, 920844u, 84148737u, 168364038u, 336728336u, 421008917u, 185008922u, 203101971u, 555748877u, 639968290u,
+    808069416u, 892613169u, 976828470u, 858466083u, 757873463u, 505224238u, 1212038460u, 1364216393u, 1448432722u,
+    526014808u, 1465076543u, 1313688667u, 67240192u, 151520773u, 303108106u, 404100372u, 117643801u, 454497035u,
+    537791756u, 623125025u, 707340326u, 875704624u, 959985205u, 723985210u, 742078259u, 1094725165u, 1178944578u,
+    1347045704u, 1431589457u, 1515804758u, 1397442371u, 1296849751u, 2189525070u, 2290517380u, 2442168969u, 2526385298u,
+    2207947160u, 2543029127u, 2391641243u, 2762121632u, 2846402213u, 2997989546u, 3098981812u, 2812525241u, 3149378475u,
+    3232673196u, 3318006465u, 3402221766u, 3570586064u, 3654866645u, 3418866650u, 3436959699u, 1633734349u, 1717920866u,
+    1886021992u, 1970565745u, 2054781046u, 1936418659u, 1835826039u, 3806453870u, 3907446244u, 4059097833u, 4143314162u,
+    3824876024u, 4159957991u, 4008570107u, 1008606492u, 1566326333u, 2661129310u, 3703487932u, 1059053277u, 3753877343u,
+    8289660u);
+CONST_ARRAY(uint, TRIT_AT, 6) (0u, 0u, 3u, 12u, 39u, 120u);
+
+// Nearest colour value of the 48 (bits 4) and 192 (bits 6) level ranges for each 8-bit target, built once per workgroup:
+// [0, 256) for 48, [256, 512) for 192
+SHARED uint qtab[512];
+
+uint px[16];        // the block's texels, RGBA8
+float tx[16][4];    // ...as floats
+uint ob[4];         // the block being written, bit 0 first
+float e0[4], e1[4]; // endpoints being fitted (0-255)
+uint wt[32];        // weights as stored (dual plane: colour, alpha per texel)
+
+void put_bits(uint pos, uint n, uint v) {
+    for (uint i = 0u; i < n; i++)
+        if (((v >> i) & 1u) != 0u) ob[(pos + i) >> 5] |= 1u << ((pos + i) & 31u);
+}
+
+// Weights are read from bit 127 down
+void put_weight_bits(uint pos, uint n, uint v) {
+    for (uint i = 0u; i < n; i++)
+        if (((v >> i) & 1u) != 0u) ob[(127u - pos - i) >> 5] |= 1u << ((127u - pos - i) & 31u);
+}
+
+// A colour value of a trit range (trit t and `bits` bits m: the value is t << bits | m) as the decoder widens it to 8
+// bits; bits 4 (48 levels) and 6 (192)
+uint unquant_trit(uint v, uint bits) {
+    uint t = v >> bits, m = v & ((1u << bits) - 1u);
+    uint A = (m & 1u) != 0u ? 511u : 0u;
+    uint b = (m >> 1) & 1u, c = (m >> 2) & 1u, d = (m >> 3) & 1u, e = (m >> 4) & 1u, f = (m >> 5) & 1u;
+    uint B = bits == 4u ? (d << 8) | (c << 7) | (b << 6) | (d << 2) | (c << 1) | b
+                        : (f << 8) | (e << 7) | (d << 6) | (c << 5) | (b << 4) | f;
+    uint T = ((t * (bits == 4u ? 22u : 5u)) + B) ^ A;
+    return (A & 128u) | (T >> 2);
+}
+
+// The workgroup's lanes fill qtab between them (then a barrier)
+void build_tables(uint lane, uint lanes) {
+    for (uint i = lane; i < 512u; i += lanes) {
+        uint bits = i < 256u ? 4u : 6u, x = i & 255u, n = 3u << bits, best = 0u, err = 1000u;
+        for (uint v = 0u; v < n; v++) {
+            uint u = unquant_trit(v, bits), d = u > x ? u - x : x - u;
+            if (d < err) {
+                err = d;
+                best = v;
+            }
+        }
+        qtab[i] = best;
+    }
+}
+
+uint quant_trit(float x, uint bits) {
+    return qtab[(bits == 4u ? 0u : 256u) + uint(clamp(x + 0.5, 0.0, 255.0))];
+}
+
+// count values of `bits` bits plus a trit each, from bit `pos`: groups of five, each value's bits with the group's trit
+// block bits between them as the specification interleaves them (2, 2, 1, 2, 1 after values 0 to 4)
+void put_trit_values(uint pos, uint count, uint bits, uint q[8]) {
+    for (uint g = 0u; g < count; g += 5u) {
+        uint k = min(5u, count - g), key = 0u;
+        for (uint i = k; i > 0u; i--) key = key * 3u + (q[g + i - 1u] >> bits);
+        uint at = TRIT_AT[k] + key;
+        uint T = (TRITS[at >> 2] >> ((at & 3u) * 8u)) & 255u, tb = 0u;
+        for (uint i = 0u; i < k; i++) {
+            put_bits(pos, bits, q[g + i] & ((1u << bits) - 1u));
+            pos += bits;
+            uint n = (i == 2u || i == 4u) ? 1u : 2u;
+            put_bits(pos, n, (T >> tb) & ((1u << n) - 1u));
+            pos += n;
+            tb += n;
+        }
+    }
+}
+
+// A line through the texels in channels [0, nc): e0 and e1 at the ends of their spread along it
+void fit_line(uint nc) {
+    float mean[4], cov[10], axis[4], lo = 1e9, hi = -1e9;
+    for (uint c = 0u; c < 4u; c++) mean[c] = 0.0;
+    for (uint i = 0u; i < 16u; i++)
+        for (uint c = 0u; c < nc; c++) mean[c] += tx[i][c] / 16.0;
+    for (uint k = 0u; k < 10u; k++) cov[k] = 0.0;
+    for (uint i = 0u; i < 16u; i++) {
+        uint k = 0u;
+        for (uint a = 0u; a < 4u; a++)
+            for (uint b = a; b < 4u; b++) {
+                if (a < nc && b < nc) cov[k] += (tx[i][a] - mean[a]) * (tx[i][b] - mean[b]);
+                k++;
+            }
+    }
+    // Power iteration from the channel with the largest spread
+    for (uint c = 0u; c < 4u; c++) axis[c] = 0.0;
+    uint widest = 0u;
+    float wv = -1.0;
+    for (uint c = 0u; c < nc; c++) {
+        uint k = c == 0u ? 0u : c == 1u ? 4u : c == 2u ? 7u : 9u;  // (the diagonal of the packed covariance)
+        if (cov[k] > wv) {
+            wv = cov[k];
+            widest = c;
+        }
+    }
+    axis[widest] = 1.0;
+    for (uint it = 0u; it < 8u; it++) {
+        float next[4];
+        for (uint a = 0u; a < 4u; a++) {
+            next[a] = 0.0;
+            for (uint b = 0u; b < nc; b++) {
+                uint lo2 = min(a, b), hi2 = max(a, b);
+                uint k = lo2 == 0u ? hi2 : lo2 == 1u ? 3u + hi2 : lo2 == 2u ? 5u + hi2 : 9u;
+                if (a < nc) next[a] += cov[k] * axis[b];
+            }
+        }
+        float len = 0.0;
+        for (uint a = 0u; a < nc; a++) len += next[a] * next[a];
+        if (len < 1e-12) break;
+        len = sqrt(len);
+        for (uint a = 0u; a < nc; a++) axis[a] = next[a] / len;
+    }
+    for (uint i = 0u; i < 16u; i++) {
+        float t = 0.0;
+        for (uint c = 0u; c < nc; c++) t += (tx[i][c] - mean[c]) * axis[c];
+        lo = min(lo, t);
+        hi = max(hi, t);
+    }
+    for (uint c = 0u; c < nc; c++) {
+        e0[c] = clamp(mean[c] + axis[c] * lo, 0.0, 255.0);
+        e1[c] = clamp(mean[c] + axis[c] * hi, 0.0, 255.0);
+    }
+}
+
+// Least squares endpoints for channels [c0, c1) given the weights of plane `plane` (stride: 1 or 2), weight top `top`
+void refit(uint c0, uint c1, uint plane, uint stride, float top) {
+    float a = 0.0, b = 0.0, c = 0.0;
+    float d0[4], d1[4];
+    for (uint k = 0u; k < 4u; k++) {
+        d0[k] = 0.0;
+        d1[k] = 0.0;
+    }
+    for (uint i = 0u; i < 16u; i++) {
+        float w = float(wt[i * stride + plane]) / top, v = 1.0 - w;
+        a += v * v;
+        b += v * w;
+        c += w * w;
+        for (uint k = c0; k < c1; k++) {
+            d0[k] += v * tx[i][k];
+            d1[k] += w * tx[i][k];
+        }
+    }
+    float det = a * c - b * b;
+    if (abs(det) < 1e-6) return;
+    for (uint k = c0; k < c1; k++) {
+        e0[k] = clamp((c * d0[k] - b * d1[k]) / det, 0.0, 255.0);
+        e1[k] = clamp((a * d1[k] - b * d0[k]) / det, 0.0, 255.0);
+    }
+}
+
+// The shapes: 0 opaque with 8-bit endpoints and 3-bit weights, 1 RGBA on one line, 2 two planes, 3 opaque with
+// 192-level endpoints and 4-bit weights
+uint shape_weight_bits(uint shape) { return shape == 0u ? 3u : shape == 3u ? 4u : 2u; }
+uint shape_trit_bits(uint shape) { return shape == 2u ? 4u : shape == 3u ? 6u : 0u; }  // (0: plain 8-bit endpoints)
+
+// A weight as the decoder widens it to 0-64: its bits repeated to 6, plus 1 past the middle
+uint weight64(uint w, uint nb) {
+    uint v = nb == 2u ? (w << 4) | (w << 2) | w : nb == 3u ? (w << 3) | w : (w << 2) | (w >> 2);
+    return v > 32u ? v + 1u : v;
+}
+
+// Encodes e0/e1 as `shape` into ob (weights in wt) and returns the squared error of what the decoder will give back
+float encode_shape(uint shape) {
+    uint nb = shape_weight_bits(shape), tb = shape_trit_bits(shape), levels = 1u << nb;
+    bool opaque = shape == 0u || shape == 3u;
+    uint q0[4], q1[4], u0[4], u1[4];
+    for (uint c = 0u; c < 4u; c++) {
+        if (tb != 0u) {
+            q0[c] = quant_trit(e0[c], tb);
+            q1[c] = quant_trit(e1[c], tb);
+            u0[c] = unquant_trit(q0[c], tb);
+            u1[c] = unquant_trit(q1[c], tb);
+        } else {
+            q0[c] = uint(clamp(e0[c] + 0.5, 0.0, 255.0));
+            q1[c] = uint(clamp(e1[c] + 0.5, 0.0, 255.0));
+            u0[c] = q0[c];
+            u1[c] = q1[c];
+        }
+    }
+    if (opaque) {
+        u0[3] = 255u;
+        u1[3] = 255u;
+    }
+    // The decoder blue-contracts when the second endpoint's RGB sums less than the first's: swap so it doesn't
+    if (u1[0] + u1[1] + u1[2] < u0[0] + u0[1] + u0[2]) {
+        for (uint c = 0u; c < 4u; c++) {
+            uint t = q0[c]; q0[c] = q1[c]; q1[c] = t;
+            t = u0[c]; u0[c] = u1[c]; u1[c] = t;
+        }
+    }
+    float err = 0.0;
+    uint planes = shape == 2u ? 2u : 1u;
+    for (uint i = 0u; i < 16u; i++) {
+        for (uint pl = 0u; pl < planes; pl++) {
+            uint cs = pl == 1u ? 3u : 0u, ce = pl == 1u ? 4u : (shape == 1u ? 4u : 3u);
+            float best = 1e9;
+            uint pick = 0u;
+            for (uint w = 0u; w < levels; w++) {
+                uint w64 = weight64(w, nb);
+                float e = 0.0;
+                for (uint c = cs; c < ce; c++) {
+                    // as the decoder: 16-bit endpoints (x * 257), interpolated, back to 8 bits
+                    uint v = ((u0[c] * 257u) * (64u - w64) + (u1[c] * 257u) * w64 + 32u) >> 6;
+                    float d = float(v >> 8) - tx[i][c];
+                    e += d * d;
+                }
+                if (e < best) {
+                    best = e;
+                    pick = w;
+                }
+            }
+            wt[i * planes + pl] = pick;
+            err += best;
+        }
+    }
+    for (uint k = 0u; k < 4u; k++) ob[k] = 0u;
+    // Block modes, all with a 4x4 weight grid: 8 levels 0x053, 16 levels 0x242, 4 levels 0x042 (two planes 0x442)
+    put_bits(0u, 11u, shape == 0u ? 0x053u : shape == 3u ? 0x242u : shape == 2u ? 0x442u : 0x042u);
+    put_bits(13u, 4u, opaque ? 8u : 12u);  // CEM 8: RGB, direct; CEM 12: RGBA, direct
+    uint q[8];
+    for (uint c = 0u; c < 4u; c++) {
+        q[2u * c] = q0[c];
+        q[2u * c + 1u] = q1[c];
+    }
+    uint values = opaque ? 6u : 8u;
+    if (tb != 0u) {
+        put_trit_values(17u, values, tb, q);
+    } else {
+        for (uint v = 0u; v < values; v++) put_bits(17u + 8u * v, 8u, q[v]);
+    }
+    if (shape == 2u) put_bits(62u, 2u, 3u);  // the second plane is alpha (just below the 64 bits of weights)
+    for (uint i = 0u; i < 16u * planes; i++) put_weight_bits(nb * i, nb, wt[i]);
+    return err;
+}
+
+// Fit, encode, then refit the endpoints by least squares to the weights it chose, twice, keeping the best; the block
+// it leaves in ob, its error returned
+float try_shape(uint shape) {
+    if (shape == 2u) {
+        fit_line(3u);
+        float amin = 255.0, amax = 0.0;
+        for (uint i = 0u; i < 16u; i++) {
+            amin = min(amin, tx[i][3]);
+            amax = max(amax, tx[i][3]);
+        }
+        e0[3] = amin;
+        e1[3] = amax;
+    } else {
+        fit_line(shape == 1u ? 4u : 3u);
+    }
+    float err = encode_shape(shape);
+    float top = float((1u << shape_weight_bits(shape)) - 1u);
+    uint keep[4];
+    for (uint k = 0u; k < 4u; k++) keep[k] = ob[k];
+    for (uint pass = 0u; pass < 2u; pass++) {
+        // (the weights may be in swapped order: the refit takes whatever endpoints they now mean)
+        if (shape == 2u) {
+            refit(0u, 3u, 0u, 2u, top);
+            refit(3u, 4u, 1u, 2u, top);
+        } else {
+            refit(0u, shape == 1u ? 4u : 3u, 0u, 1u, top);
+        }
+        float next = encode_shape(shape);
+        if (next >= err) break;
+        err = next;
+        for (uint k = 0u; k < 4u; k++) keep[k] = ob[k];
+    }
+    for (uint k = 0u; k < 4u; k++) ob[k] = keep[k];
+    return err;
+}
+
+// The block's texels (px, tx filled) to ob
+void encode_block() {
+    bool same = true, opaque = true;
+    for (uint i = 0u; i < 16u; i++) {
+        same = same && px[i] == px[0];
+        opaque = opaque && (px[i] >> 24) == 255u;
+    }
+    if (same) {  // void extent: one colour, LDR, no extent coordinates
+        ob[0] = 0xFFFFFDFCu;
+        ob[1] = 0xFFFFFFFFu;
+        uint r = (px[0] & 255u) * 257u, g = ((px[0] >> 8) & 255u) * 257u;
+        uint b = ((px[0] >> 16) & 255u) * 257u, a = (px[0] >> 24) * 257u;
+        ob[2] = r | (g << 16);
+        ob[3] = b | (a << 16);
+        return;
+    }
+    float first = try_shape(opaque ? 0u : 1u);
+    uint keep[4];
+    for (uint k = 0u; k < 4u; k++) keep[k] = ob[k];
+    float second = try_shape(opaque ? 3u : 2u);
+    if (first <= second)
+        for (uint k = 0u; k < 4u; k++) ob[k] = keep[k];
+}
+// ASTC_CODE_END
+
+#ifndef ASTC_CPP
+void main() {
+    build_tables(gl_LocalInvocationID.x, 64u);
+    barrier();
+    uint block = (gl_WorkGroupID.y * p.groups_x + gl_WorkGroupID.x) * 64u + gl_LocalInvocationID.x;
+    if (block >= p.blocks_x * p.blocks_y) return;
+    uint bx = block % p.blocks_x, by = block / p.blocks_x, row = p.blocks_x * 4u;
+    for (uint i = 0u; i < 16u; i++) {
+        uint v = src[(by * 4u + (i >> 2)) * row + bx * 4u + (i & 3u)];
+        px[i] = v;
+        tx[i][0] = float(v & 255u);
+        tx[i][1] = float((v >> 8) & 255u);
+        tx[i][2] = float((v >> 16) & 255u);
+        tx[i][3] = float(v >> 24);
+    }
+    encode_block();
+    for (uint k = 0u; k < 4u; k++) dst[block * 4u + k] = ob[k];
+}
+#endif

@@ -82,6 +82,15 @@ uint32_t branch(const void* from, const void* to, uint32_t opcode) {
 extern "C" uintptr_t nier_tls_ensure_thread() { return ensure(); }
 
 void thread_start() { ensure(); }
+#ifdef MHRISE_LUA_DEBUG
+const uintptr_t* observed_layout(size_t& words) {
+    std::lock_guard lock(g_m);
+    words=g_tpl.known ? (g_tpl.offset+g_tpl.total_size)/sizeof(uintptr_t) : 0;
+    auto* block=reinterpret_cast<uint8_t*>(bionic_tp()[kSlot]);
+    if(std::find(g_blocks.begin(),g_blocks.end(),block)==g_blocks.end())return nullptr;
+    return reinterpret_cast<const uintptr_t*>(block);
+}
+#endif
 
 void set_template(const void* image, size_t image_size, size_t total_size, size_t align) {
     std::lock_guard lock(g_m);

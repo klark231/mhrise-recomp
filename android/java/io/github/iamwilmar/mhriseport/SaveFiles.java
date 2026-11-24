@@ -65,11 +65,11 @@ final class SaveFiles {
 
         void offer(String path, byte[] data) {
             String p = path.replace('\\', '/');
-            String name = p.substring(p.lastIndexOf('/') + 1);
+            String name = storeName(p.substring(p.lastIndexOf('/') + 1));
             int d = p.split("/").length;
             Matcher m = USERDATA.matcher(p);
             if (m.find()) id(SaveData.steamId(m.group(1)));
-            if (name.startsWith("SS1_") && data.length > 0x18 && SaveData.le32(data, 8) == SaveData.FLAG_HAS_ID)
+            if (album(name) && data.length > 0x18 && SaveData.le32(data, 8) == SaveData.FLAG_HAS_ID)
                 id(SaveData.steamId(Long.toString(SaveData.le64(data, 0x10))));
             if (name.equalsIgnoreCase("configs.user.ini")) {
                 Matcher a = GSE_ID.matcher(new String(data, StandardCharsets.UTF_8));
@@ -78,7 +78,7 @@ final class SaveFiles {
             String key = null;
             for (String main : MAIN)
                 if (name.equalsIgnoreCase(main)) key = main;
-            if (ss1(name) && name.toLowerCase(Locale.ROOT).endsWith(".bin")) key = name;
+            if (album(name) && name.toLowerCase(Locale.ROOT).endsWith(".bin")) key = name;
             // The one nearest the top, if there are several (a backup folder inside, say)
             if (key != null && (!depth.containsKey(key) || d < depth.get(key))) {
                 files.put(key, data);
@@ -92,16 +92,29 @@ final class SaveFiles {
         }
 
         static boolean wanted(String name) {
+            name = storeName(name);
             for (String main : MAIN)
                 if (name.equalsIgnoreCase(main)) return true;
-            return name.startsWith("SS1_") || name.equalsIgnoreCase("configs.user.ini");
+            return album(name) || name.equalsIgnoreCase("configs.user.ini");
         }
     }
 
-    // The SS1_* files: the photos taken in the game (a 960x960 JPEG in each of 002-009, its thumbnail in 302-309, the list
-    // of them in 001), plain on the Switch, with the account's number on Steam
-    static boolean ss1(String name) {
-        return name.startsWith("SS1_");
+    // The album files, SS<n>_*: SS1_ the photos taken in the game (a 960x960 JPEG in each of 002-009, its thumbnail in
+    // 302-309, the list of them in 001), SS2_ and the others more of the same kind (a Steam save had 85 SS2_ files).
+    // Plain on the Switch, with the account's number on Steam. (Groups from mhrise-save-converter.)
+    private static final Pattern ALBUM = Pattern.compile("SS[1-9][0-9]*_.*");
+
+    static boolean album(String name) {
+        return ALBUM.matcher(name).matches();
+    }
+
+    // The Microsoft Store version's names, as a save tool takes them out of its container: SaveData001Slot,
+    // SaveData00-1, SS1_SaveData001Slot... (no extension). As Steam's: data001Slot.bin and so on.
+    private static final Pattern STORE_NAME = Pattern.compile("(SS[1-9][0-9]*_)?SaveData([0-9-]+(?:Slot)?)");
+
+    static String storeName(String name) {
+        Matcher m = STORE_NAME.matcher(name);
+        return m.matches() ? (m.group(1) != null ? m.group(1) : "") + "data" + m.group(2) + ".bin" : name;
     }
 
     private static final Pattern USERDATA = Pattern.compile("(?i)userdata/(\\d{1,10})/1446780/");
@@ -157,7 +170,7 @@ final class SaveFiles {
     // Every main file it has, opened; a Steam one with the IDs it gave, the one remembered and the one typed in (0 if
     // none). Throws SaveData.Citrus.NeedId when its ID isn't among them.
     static Map<String, SaveData.Opened> open(Context c, Incoming in, File data, long typed) throws IOException {
-        if (in.files.isEmpty()) throw new IOException("no save files in it (data00-1.bin, data001Slot.bin...)");
+        if (in.files.isEmpty()) throw new IOException("no save files in it (data00-1.bin, data001Slot.bin..., or the Microsoft Store's SaveData001Slot...)");
         Ini ini = new Ini(data);
         List<Long> ids = new ArrayList<>();
         if (typed != 0) ids.add(typed);
@@ -181,6 +194,7 @@ final class SaveFiles {
                 ini.set("steam_id", Long.toString(o.steamId));
                 ini.set("steam_curve", Integer.toString(curve));
             }
+            o.drop();  // (each is parsed again when it's converted: see SaveData.Opened.roots)
             out.put(f.getKey(), o);
         }
         return out;
@@ -233,7 +247,7 @@ final class SaveFiles {
 
     // A Steam file as the Switch's, filled into the port's own save (its layout) when there is one
     private static byte[] toSwitch(File data, SaveData.Opened o, StringBuilder notes) throws IOException {
-        if (ss1(o.name)) return SaveData.switchFile(o.name, SaveData.write(o.roots, SaveData.SWITCH_BASE));
+        if (album(o.name)) return SaveData.switchFile(o.name, SaveData.write(o.roots(), SaveData.SWITCH_BASE));
         List<SaveData.Root> template = current(data, o.name);
         // Another release's file left as it is would crash the game: it needs 1.16's layout to fill
         if (template == null && o.foreign)
@@ -242,7 +256,7 @@ final class SaveFiles {
         String none = " No Switch save was here to take the layout from, so only what Steam alone has was left out.";
         if (template == null && notes.indexOf(none) < 0) notes.append(none);
         SaveData.Counts n = new SaveData.Counts();
-        return SaveData.switchFile(o.name, SaveData.write(SaveData.fill(template, o.roots, o.name, true, n), SaveData.SWITCH_BASE));
+        return SaveData.switchFile(o.name, SaveData.write(SaveData.fill(template, o.roots(), o.name, true, n), SaveData.SWITCH_BASE));
     }
 
     // A Switch file as Steam's: filled into the last Steam save brought in, and encrypted for its account if that's known
@@ -251,13 +265,15 @@ final class SaveFiles {
         Ini ini = new Ini(data);
         long id = SaveData.steamId(ini.get("steam_id"));
         int curve = curve(ini);
-        if (ss1(o.name)) {
+        if (album(o.name)) {
             // (photos: nothing in them differs between the two, so no filling; and no encryption on Steam either)
-            if (id != 0 && curve >= 0) return SaveData.steamSs1File(SaveData.write(o.roots, SaveData.STEAM_SS1_BASE), id);
-            return SaveData.plainFile(SaveData.write(o.roots, SaveData.SWITCH_BASE));
+            if (id != 0 && curve >= 0) return SaveData.steamSs1File(SaveData.write(o.roots(), SaveData.STEAM_SS1_BASE), id);
+            return SaveData.plainFile(SaveData.write(o.roots(), SaveData.SWITCH_BASE));
         }
         List<SaveData.Root> template = steamTemplate(data, o.name);
-        List<SaveData.Root> roots = SaveData.fill(template, o.roots, o.name, false, new SaveData.Counts());
+        List<SaveData.Root> roots = SaveData.fill(template, o.roots(), o.name, false, new SaveData.Counts());
+        // No Steam save of the player's to fill: what only the PC version has, as a new PC save starts with it
+        if (template == null) roots = SteamDefaults.add(roots);
         if (id != 0 && curve >= 0) {
             encrypted[0] = true;
             return SaveData.steamFile(SaveData.write(roots, SaveData.STEAM_BASE), id, citrus(c), curve);
@@ -270,16 +286,18 @@ final class SaveFiles {
         String s = encrypted ? " Encrypted for the Steam account set in Saves."
                 : " Not encrypted: set the Steam account first (Saves → Set from a Steam save), or encrypt these with a save "
                         + "editor such as ree-save-editor.";
-        if (!template) s += " Without a Steam save of yours to fill, a few things only the PC version has are missing.";
+        if (!template) s += " Without a Steam save of yours to fill, the settings only the PC version has start at their defaults.";
         return s;
     }
 
     // Kept to fill when a save goes back to Steam: what only the PC version has comes from here
     private static void keepSteam(File data, SaveData.Opened o) throws IOException {
-        if (ss1(o.name)) return;
+        if (album(o.name)) return;
         File dir = steamDir(data);
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("can't write " + dir);
-        writeFile(new File(dir, o.name + ".steam"), SaveData.write(o.roots, SaveData.STEAM_BASE));
+        // (a Microsoft Store slot made plain has Steam's roots in another order: Steam's, to fill later)
+        List<SaveData.Root> roots = o.flags == 0 && SaveData.slot(o.name) ? SteamDefaults.reorder(o.roots(), SteamDefaults.SLOT_ORDER) : o.roots();
+        writeFile(new File(dir, o.name + ".steam"), SaveData.write(roots, SaveData.STEAM_BASE));
     }
 
     // The Steam account saves are exported for: the one of the last Steam save opened here, if its key is known
@@ -301,6 +319,7 @@ final class SaveFiles {
         for (SaveData.Opened o : opened.values()) {
             if (!o.steam) continue;
             keepSteam(data, o);
+            o.drop();
             kept.add(o.name);
         }
         if (kept.isEmpty()) throw new IOException("that's a Switch save; pick one from the Steam account");
@@ -318,7 +337,7 @@ final class SaveFiles {
         StringBuilder notes = new StringBuilder();
         boolean steam = false, foreign = foreign(opened);
         for (SaveData.Opened o : opened.values()) {
-            if (foreign && ss1(o.name)) continue;  // (see foreign())
+            if (foreign && album(o.name)) continue;  // (see foreign())
             if (!o.steam && !o.foreign) {
                 out.put(o.name, in.files.get(o.name));  // (the Switch's file as it is)
                 continue;
@@ -328,6 +347,7 @@ final class SaveFiles {
                 steam = true;
                 keepSteam(data, o);
             }
+            o.drop();  // (one parsed slot at a time)
         }
         String backup = backup(data);
         File dir = saveDir(data);
@@ -337,7 +357,7 @@ final class SaveFiles {
         // hunters when the new one has its own list of them (data00-1.bin): a slot file the list doesn't match, or one
         // from another release, crashes the game or shows another hunter
         boolean list = out.containsKey(SaveData.SYSTEM);
-        File[] old = dir.listFiles((x, n) -> !out.containsKey(n) && (ss1(n) || list && SaveData.slot(n)));
+        File[] old = dir.listFiles((x, n) -> !out.containsKey(n) && (album(n) || list && SaveData.slot(n)));
         if (old != null)
             for (File f : old) f.delete();
         // The game's own copy of the last committed save (fs.cpp) is of the old one now; the next save makes it again
@@ -345,10 +365,10 @@ final class SaveFiles {
         List<String> from = new ArrayList<>();
         int extra = 0;
         for (String n : out.keySet()) {
-            if (ss1(n)) extra++;
+            if (album(n)) extra++;
             else from.add(in.paths.containsKey(n) ? in.paths.get(n) : n);
         }
-        if (extra > 0) from.add(extra + " SS1_* file(s)");
+        if (extra > 0) from.add(extra + " album file(s)");
         return (steam ? "Steam save converted and imported" : foreign ? "Save from another release converted and imported"
                 : "Save imported") + " (" + String.join(", ", from) + ")."
                 + (backup != null ? " The one before is in Saves → Restore a backup (" + backup + ")." : "") + notes;
@@ -388,7 +408,7 @@ final class SaveFiles {
         boolean template = true;
         StringBuilder notes = new StringBuilder();
         List<String> names = new ArrayList<>(Arrays.asList(MAIN));
-        String[] photos = saveDir(data).list((d, n) -> ss1(n) && n.toLowerCase(Locale.ROOT).endsWith(".bin"));
+        String[] photos = saveDir(data).list((d, n) -> album(n) && n.toLowerCase(Locale.ROOT).endsWith(".bin"));
         if (photos != null) {
             Arrays.sort(photos);
             names.addAll(Arrays.asList(photos));
@@ -397,7 +417,7 @@ final class SaveFiles {
             File f = new File(saveDir(data), name);
             if (!f.isFile()) continue;
             SaveData.Opened o = SaveData.open(name, Files.readAllBytes(f.toPath()), new long[0], null, -1);
-            if (!ss1(name)) template &= steamTemplate(data, name) != null;
+            if (!album(name)) template &= steamTemplate(data, name) != null;
             out.put(name, toSteam(c, data, o, encrypted, notes));
         }
         if (out.isEmpty()) throw new IOException("there's no save yet");
@@ -418,14 +438,15 @@ final class SaveFiles {
         boolean[] encrypted = {false};
         boolean template = true;
         for (SaveData.Opened o : opened.values()) {
-            if (foreign && ss1(o.name)) continue;
+            if (foreign && album(o.name)) continue;
             if (steam) {
                 out.put(o.name, o.steam || o.foreign ? toSwitch(data, o, notes) : in.files.get(o.name));
                 if (o.steam) keepSteam(data, o);
             } else {
-                if (!ss1(o.name)) template &= steamTemplate(data, o.name) != null;
+                if (!album(o.name)) template &= steamTemplate(data, o.name) != null;
                 out.put(o.name, toSteam(c, data, o, encrypted, notes));
             }
+            o.drop();
         }
         Zip z = new Zip();
         z.bytes = zip(out, steam ? "" : "win64_save/");
@@ -471,13 +492,14 @@ final class SaveFiles {
     }
 
     // What the menu says about the save that's here
-    static String describe(File data) {
+    static String describe(File data, boolean chinese) {
         File[] files = saveDir(data).listFiles(File::isFile);
-        if (files == null || files.length == 0) return "No save here yet.";
+        if (files == null || files.length == 0) return chinese ? "还没有存档。" : "No save here yet.";
         long newest = 0;
         for (File f : files) newest = Math.max(newest, f.lastModified());
-        return "Save: " + files.length + " file(s), last written "
-                + new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).format(new Date(newest)) + ".";
+        String date = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).format(new Date(newest));
+        return chinese ? "共有 " + files.length + " 个存档文件，上次写入于 " + date + "。"
+                : "Save: " + files.length + " file(s), last written " + date + ".";
     }
 
     // What an import or restore said, for the next start (the game closes right after it, see GameActivity.saveOver)

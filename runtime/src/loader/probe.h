@@ -11,6 +11,6 @@
 namespace probe {
 
 // Antes de tls::patch (el área de parches aún es RW; tls::patch la protege). Sin el fichero no hace nada.
-bool install(Module& mod, std::string& err);
+bool install(Module& mod, std::string& err, size_t player_update = 0);
 
 }  // namespace probe

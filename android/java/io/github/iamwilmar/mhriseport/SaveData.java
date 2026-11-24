@@ -29,6 +29,9 @@ import javax.crypto.spec.SecretKeySpec;
 //   Steam   flags 4 ("Citrus"): the data encrypted with a key made from your Steam ID (below). SS1_* files: flags 2,
 //           your Steam account's number before the data; the game makes those again, so they aren't converted.
 //   Either  flags 0: plain, what a save editor writes once the encryption is taken off.
+//   Microsoft Store (PC Game Pass)  flags 0x10: encrypted with the Store's own scheme, which nothing outside the game
+//           opens. The game writes them plain when its save service is told to (tools/rise_save_plain.lua, an
+//           REFramework script), and those plain files have Steam's layout and fields: they come in like Steam's.
 //
 // The data is a list of classes (a hash of the name, then fields: a hash, a type, a value), and the game aligns each
 // value counting from the start of the FILE, not of the data: on Switch the data starts at 12, on Steam at 16 (24 in the
@@ -38,6 +41,9 @@ import javax.crypto.spec.SecretKeySpec;
 //
 // Format from kvasszn's ree-save-editor (GPL-3.0), checked against real saves from both platforms; the Citrus curves
 // (assets/citrus_curves.bin) are the game's own constants as that project lists them. No code from it here.
+// From jinghaihan's mhrise-save-converter (MIT): which fields belong to the platform and stay the target's when filling,
+// the PC-only data a Steam save gets when there's no Steam save to fill (SteamDefaults), and telling the right Citrus curve
+// by each block's own check instead of by how many zeros it decrypts to.
 final class SaveData {
     private SaveData() {}
 
@@ -50,7 +56,7 @@ final class SaveData {
             if (s.equals(name)) return true;
         return false;
     }
-    static final int FLAG_HAS_ID = 0x2, FLAG_CITRUS = 0x4, FLAG_DEFLATE = 0x8;
+    static final int FLAG_HAS_ID = 0x2, FLAG_CITRUS = 0x4, FLAG_DEFLATE = 0x8, FLAG_MANDARIN = 0x10;
     static final int SWITCH_BASE = 12, STEAM_BASE = 16;
 
     static class Problem extends IOException {
@@ -80,7 +86,16 @@ final class SaveData {
     static final class Arr {
         int memberType, memberSize, kind;  // kind 1: an array of classes
         int[] hashes;                      // kind 1 only, and only if the file had them (after 0xffeeffee)
-        List<Object> items = new ArrayList<>();  // Cls, or byte[] (a value, or a string's UTF-16)
+        List<Object> items = new ArrayList<>();  // Cls, or byte[] (a string's UTF-16)
+        // An array of fixed-size values: all of them in one block (count of memberSize bytes), not an object each. A
+        // save has arrays of hundreds of thousands of bytes and flags; one byte[] apiece was ~30 bytes of heap per
+        // byte of save, and an import (two saves and a template in memory) ran out of the app's 256 MB.
+        byte[] packed;
+        int count;
+
+        int size() {
+            return packed != null ? count : items.size();
+        }
     }
 
     static final class Str {
@@ -170,6 +185,20 @@ final class SaveData {
                 long len = u32() & 0xffffffffL;
                 a.kind = u32();
                 if (len > b.length - p) throw new Problem("an array longer than the file");
+                if (a.kind != 1 && a.memberType != 0xf) {
+                    long size = a.memberSize & 0xffffffffL;
+                    if (len * size > b.length - p) throw new Problem("an array longer than the file");
+                    a.count = (int) len;
+                    a.packed = new byte[(int) (len * size)];
+                    for (int i = 0; i < len; i++) {
+                        al(a.memberSize);
+                        need(size);
+                        System.arraycopy(b, p, a.packed, (int) (i * size), (int) size);
+                        p += (int) size;
+                    }
+                    al(4);
+                    return a;
+                }
                 if (a.kind == 1) {
                     if (p + 4 <= b.length && u32() == 0xffeeffee) {
                         a.hashes = new int[(int) len];
@@ -262,12 +291,17 @@ final class SaveData {
                 al(4);
                 u32(a.memberType);
                 u32(a.memberSize);
-                u32(a.items.size());
+                u32(a.size());
                 u32(a.kind);
                 if (a.kind == 1 && a.hashes != null) {
                     u32(0xffeeffee);
                     for (Object e : a.items) u32(((Cls) e).hash);
                 }
+                if (a.packed != null)
+                    for (int i = 0; i < a.count; i++) {
+                        al(a.memberSize);
+                        o.write(a.packed, i * a.memberSize, a.memberSize);
+                    }
                 for (Object e : a.items) {
                     if (a.kind == 1) {
                         cls((Cls) e);
@@ -365,6 +399,32 @@ final class SaveData {
         return false;
     }
 
+    // Fields that belong to the platform or its account rather than the hunter: the target save's stay (its network and
+    // guild card IDs, the Switch's NSA ID, its own quest state for platform quests, the confirm button, followers...).
+    // Pairs of class hash and field hash, from mhrise-save-converter. Not the hunter's own ID (0x0a960102): the hunter
+    // list in data00-1.bin comes from the save being converted, and the two have to agree.
+    private static final long[] PLATFORM_FIELDS = {
+        pair(0x0918a30e, 0xc85af19a),  // facility: manual random seed
+        pair(0xd41cbf69, 0xea58bbfe), pair(0xd41cbf69, 0x4009b7e0),  // flags: "new" marks of platform lists
+        pair(0x44541321, 0x85ef5b34), pair(0x44541321, 0x9bbca62b), pair(0x44541321, 0xcce8505f),  // guild card IDs
+        pair(0xaf6ea643, 0x07378f29), pair(0xaf6ea643, 0xcce8505f), pair(0xaf6ea643, 0xf29d836b),  // hunter record
+        pair(0xfdb8053d, 0xa291e6f1),  // network: unique ID
+        pair(0x34c5d174, 0x94284f65),  // options: the confirm button
+        pair(0xdc892e15, 0x2a41ba2e),  // quests: platform quest state
+        pair(0x5766f30b, 0xb385b976),  // system: follower list
+    };
+
+    private static long pair(int cls, int field) {
+        return (long) cls << 32 | (field & 0xffffffffL);
+    }
+
+    private static boolean platformField(int cls, int field) {
+        long k = pair(cls, field);
+        for (long p : PLATFORM_FIELDS)
+            if (p == k) return true;
+        return false;
+    }
+
     private static Cls fillClass(Cls into, Cls from, Counts n) {
         if (from == null || from.hash != into.hash) return into;
         Map<Integer, Field> fields = new HashMap<>();
@@ -373,7 +433,10 @@ final class SaveData {
         out.hash = into.hash;
         for (Field f : into.fields) {
             Field s = fields.remove(f.hash);
-            if (s != null && s.type == f.type) {
+            if (s != null && platformField(into.hash, f.hash)) {
+                n.kept++;
+                out.fields.add(f);
+            } else if (s != null && s.type == f.type) {
                 out.fields.add(new Field(f.hash, f.type, fillValue(f.value, s.value, n)));
             } else {
                 n.kept++;
@@ -441,6 +504,21 @@ final class SaveData {
         int curve = -1;    // Citrus: the curve the Steam ID's key is on (needed to encrypt again)
         long steamId;      // Citrus: the ID that opened it
         boolean foreign;   // neither Switch's nor Steam's: plain main files from another release (converted too)
+        // What opened it, to read it again: a parsed hunter slot is ~40 MB of objects, so an import keeps only what it
+        // is working on (see drop, roots), not three slots, the system file and their templates at once
+        private byte[] file;
+        private Citrus citrus;
+
+        // The parsed save, read again if it was dropped (by the ID and curve that opened it the first time)
+        List<Root> roots() throws Problem {
+            if (roots == null) roots = open(name, file, steamId != 0 ? new long[] {steamId} : new long[0], citrus, curve).roots;
+            return roots;
+        }
+
+        void drop() {
+            roots = null;
+            body = null;
+        }
     }
 
     static int murmur3(byte[] d, int len) {
@@ -493,6 +571,8 @@ final class SaveData {
             throw new Problem(name + " isn't an MH Rise save");
         Opened o = new Opened();
         o.name = name;
+        o.file = d;
+        o.citrus = citrus;
         o.flags = le32(d, 8);
         int end = d.length - 4;
         if (o.flags == 0) {
@@ -532,6 +612,9 @@ final class SaveData {
             o.body = c.body;
             o.curve = c.curve;
             o.steam = true;
+        } else if (o.flags == FLAG_MANDARIN) {
+            throw new Problem(name + " is the Microsoft Store version's, still encrypted: have that game write it plain "
+                    + "first (tools/rise_save_plain.lua in the port's repository, an REFramework script), then pick that");
         } else {
             throw new Problem(name + ": a kind of save this doesn't know (flags " + o.flags + ")");
         }
@@ -557,9 +640,9 @@ final class SaveData {
         throw new Problem(name + ": " + last.getMessage());
     }
 
-    // The Switch's file: deflated, except the SS1_* ones
+    // The Switch's file: deflated, except the album's (SS1_*, SS2_*...)
     static byte[] switchFile(String name, byte[] body) {
-        if (name.startsWith("SS1_")) return plainFile(body);
+        if (name.matches("SS[1-9][0-9]*_.*")) return plainFile(body);
         Deflater def = new Deflater(6, true);
         def.setInput(body);
         def.finish();
@@ -698,12 +781,18 @@ final class SaveData {
             BigInteger p = c[0], a = c[1];
             BigInteger[] c1 = {leInt(k, at, 32), leInt(k, at + 32, 32)};
             BigInteger[] c2 = {leInt(k, at + 64, 32), leInt(k, at + 96, 32)};
-            if (c1[0].compareTo(p) >= 0 || c2[0].compareTo(p) >= 0) return null;
+            if (c1[0].compareTo(p) >= 0 || c2[0].compareTo(p) >= 0 || !onCurve(c1, c) || !onCurve(c2, c)) return null;
             BigInteger[] s = mul(d, c1, a, p);
             if (s == null) return null;
             BigInteger[] m = add(c2, new BigInteger[] {s[0], s[1].negate().mod(p)}, a, p);
             if (m == null) return null;
-            return m[0].divide(BigInteger.valueOf(100)).longValue();
+            BigInteger v = m[0].divide(BigInteger.valueOf(100));
+            return v.bitLength() > 64 ? null : v.longValue();
+        }
+
+        private static boolean onCurve(BigInteger[] P, BigInteger[] c) {
+            BigInteger p = c[0];
+            return P[1].compareTo(p) < 0 && P[1].multiply(P[1]).subtract(P[0].pow(3).add(c[1].multiply(P[0])).add(c[2])).mod(p).signum() == 0;
         }
 
         private static byte[] realKeys(byte[] keys, BigInteger d, BigInteger[] c) {
@@ -747,21 +836,32 @@ final class SaveData {
             if (size < 0 || size > (long) blocks * DATA) throw new Problem("the encrypted file's size is wrong");
             BigInteger d = privateKey(steamId);
             byte[] keys = aes(false, file, 0x10 + 0x20, KEYS, file, 0x10);
-            int curve = -1;
-            byte[] first = null;
+            // The right curve is the one whose key gives a block that passes its own check (the SHA3 at its end). Until
+            // one does, the first that decrypts to mostly zeros, as the game's data mostly is, is kept in case
+            int curve = -1, zeroCurve = -1;
+            byte[] first = null, zeroFirst = null;
             for (int n = -1; n < 128 && curve < 0; n++) {
                 int i = n < 0 ? curveHint : n;
                 if (i < 0 || i >= 128 || (n >= 0 && i == curveHint)) continue;
                 byte[] real = realKeys(keys, d, curves[i]);
                 if (real == null) continue;
-                // The right key gives the game's data, which is mostly zeros; a wrong one gives noise
                 byte[] t = aes(false, file, 0x10 + 0x20 + KEYS, DATA, real, 0);
+                if (blockOk(file, 0x10, keys, t)) {
+                    curve = i;
+                    first = t;
+                    break;
+                }
+                if (zeroCurve >= 0) continue;
                 int zeros = 0;
                 for (byte b : t) zeros += b == 0 ? 1 : 0;
                 if (zeros > DATA / 2) {
-                    curve = i;
-                    first = t;
+                    zeroCurve = i;
+                    zeroFirst = t;
                 }
+            }
+            if (curve < 0) {
+                curve = zeroCurve;
+                first = zeroFirst;
             }
             if (curve < 0) return null;
             byte[] body = new byte[(int) size];
@@ -824,6 +924,19 @@ final class SaveData {
         }
 
         private static final BigInteger MASK64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
+
+        // A block's check: SHA3-256 of its outer key, its key blob and its data but the last 0x20 bytes, after the data
+        private static boolean blockOk(byte[] file, int at, byte[] keys, byte[] plain) {
+            if (at + BLOCK > file.length) return false;
+            Sha3 sha = new Sha3();
+            sha.update(file, at, 32);
+            sha.update(keys, 0, KEYS);
+            sha.update(plain, 0, DATA - 0x20);
+            byte[] want = sha.digest();
+            for (int i = 0; i < 32; i++)
+                if (file[at + 0x20 + KEYS + DATA + i] != want[i]) return false;
+            return true;
+        }
 
         // A point whose x is value * 100 + j for the first j that's on the curve (decrypting divides by 100)
         private static BigInteger[] point(BigInteger x100, BigInteger a, BigInteger b, BigInteger p) throws Problem {

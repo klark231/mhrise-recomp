@@ -159,7 +159,14 @@ uint64_t now_ns() {
 void protect_runs(const std::vector<std::pair<uintptr_t, size_t>>& runs) {
     if (runs.empty()) return;
     const uint64_t t0 = now_ns();
-    for (auto [a, len] : runs) mprotect(reinterpret_cast<void*>(a), len, PROT_READ);
+    for (auto [a, len] : runs) {
+        if (mprotect(reinterpret_cast<void*>(a), len, PROT_READ) == 0) continue;
+        // A writable alias can change the contents without a fault. Retry protection
+        // and advance the physical page's version on its next collection.
+        for (size_t offset = 0; offset < len; offset += kPage)
+            if (const int64_t h = heap_page(a + offset); h >= 0)
+                g_state[h].fetch_or(kOpen, std::memory_order_relaxed);
+    }
     g_protect_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     g_protects.fetch_add(runs.size(), std::memory_order_relaxed);
 }

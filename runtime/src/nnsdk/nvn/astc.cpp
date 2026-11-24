@@ -19,6 +19,7 @@
 
 #include "astcenc.h"
 #include "nnsdk/ini.h"
+#include "nnsdk/nvn/bcn.h"
 #include "nnsdk/nvn/flags.h"
 #include "nnsdk/nvn/vk.h"
 
@@ -262,13 +263,16 @@ void rgb565(unsigned c, int out[3]) {
     out[0] = r << 3 | r >> 2, out[1] = g << 2 | g >> 4, out[2] = bl << 3 | bl >> 2;
 }
 
-void bc1_block(const uint8_t* in, uint8_t* out) {
+// alpha: -1 for a BC1 block; 0-255 for the colour half of a BC2 or BC3 block whose alpha is that one value. That half
+// always takes the four-colour line (no transparent texel, whatever the endpoints' order), and the alpha goes in as a
+// pair of equal endpoints: CEM 12 with the same 2-bit weights, its 8 values still 8 bits each.
+void bc1_block(const uint8_t* in, uint8_t* out, int alpha = -1) {
     const unsigned c0 = in[0] | in[1] << 8, c1 = in[2] | in[3] << 8;
     const uint32_t idx = static_cast<uint32_t>(in[4] | in[5] << 8 | in[6] << 16) | static_cast<uint32_t>(in[7]) << 24;
     int e[2][3];
     rgb565(c0, e[0]);
     rgb565(c1, e[1]);
-    const bool four = c0 > c1;
+    const bool four = alpha >= 0 || c0 > c1;
     bool transparent = false;
     for (int i = 0; i < 16 && !four; i++) transparent = transparent || (idx >> (2 * i) & 3) == 3;
     // With transparent texels the endpoints go in 7 bits, which the decoder widens back as x << 1 | x >> 6
@@ -294,8 +298,9 @@ void bc1_block(const uint8_t* in, uint8_t* out) {
     Block b;
     if (four) {
         b.put(0, 11, 0x042);  // 4x4 weights, 4 levels, one plane
-        b.put(13, 4, 8);      // CEM 8: RGB, direct
+        b.put(13, 4, alpha >= 0 ? 12 : 8);  // CEM 12: RGBA, direct; 8: RGB, direct
         for (int k = 0; k < 3; k++) b.put(17 + 16 * k, 8, lo[k]), b.put(25 + 16 * k, 8, hi[k]);
+        if (alpha >= 0) b.put(65, 8, alpha), b.put(73, 8, alpha);
         put_bit_weights(b, wt, 16, 2);
     } else if (!transparent) {
         b.put(0, 11, 0x051);  // 4x4 weights, 3 levels, one plane
@@ -321,6 +326,19 @@ void bc1_block(const uint8_t* in, uint8_t* out) {
 
 void from_bc1(const uint8_t* bc1, uint8_t* out, size_t count) {
     for (size_t i = 0; i < count; i++) bc1_block(bc1 + 8 * i, out + 16 * i);
+}
+
+bool from_bc2_bc3(bool bc3, const uint8_t* blocks, uint8_t* out, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t* in = blocks + 16 * i;
+        // The block's 16 alpha values as bcn.cpp decodes them (so this path and the encoder's agree on them)
+        uint8_t texels[16 * 4];
+        bcn::decode(bc3 ? bcn::kBC3 : bcn::kBC2, in, 1, 1, texels, 16, 4, 4);
+        for (int t = 1; t < 16; t++)
+            if (texels[4 * t + 3] != texels[3]) return false;
+        bc1_block(in + 8, out + 16 * i, texels[3]);
+    }
+    return true;
 }
 
 bool load(uint64_t key, size_t size, uint8_t* out) {

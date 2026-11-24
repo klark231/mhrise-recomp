@@ -12,6 +12,15 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   add_link_options(-Wl,--gc-sections -Wl,--icf=safe -s)
 endif()
 
+option(MHRISE_LUA_DEBUG "Build the read-only Lua/TDB startup debugger" OFF)
+option(MHRISE_LOADER_ONLY "Build the loader with a matching prebuilt renderer" OFF)
+set(EXTERNAL ${CMAKE_CURRENT_LIST_DIR}/external)
+if(NOT CMAKE_ANDROID_ARCH_ABI)
+  set(CMAKE_ANDROID_ARCH_ABI ${ANDROID_ABI})
+endif()
+add_subdirectory(${EXTERNAL}/libadrenotools adrenotools)
+
+if(NOT MHRISE_LOADER_ONLY)
 # libnnsdk.so: nuestra reimplementación del SDK de Nintendo. Todo símbolo que
 # define se enlaza al juego con prioridad sobre bionic y sobre los stubs.
 add_library(nnsdk SHARED
@@ -92,16 +101,12 @@ add_library(nnsdk SHARED
 target_include_directories(nnsdk PRIVATE src)
 # Recompilador de shaders de Eden (GPL-3): libnnsdk.so queda bajo GPL-3.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-add_subdirectory(recompiler)
-target_link_libraries(nnsdk PRIVATE eden_shader)
+include(shader_translator.cmake)
+target_include_directories(nnsdk PRIVATE recompiler)
+target_link_libraries(nnsdk PRIVATE rise_shader_translator)
 # Vulkan por punteros (volk, desde nvn/vk.h): sin enlazar libvulkan.so, para que el driver pueda ser el
 # del sistema o uno del usuario cargado con libadrenotools (nvn/driver.cpp). Las librerías de hooks de libadrenotools
 # (libhook_impl.so, libmain_hook.so, libfile_redirect_hook.so, libgsl_alloc_hook.so) van en la APK junto a libnnsdk.so.
-set(EXTERNAL ${CMAKE_CURRENT_LIST_DIR}/external)
-if(NOT CMAKE_ANDROID_ARCH_ABI)  # (libadrenotools lo exige; el toolchain antiguo del NDK solo pone ANDROID_ABI)
-  set(CMAKE_ANDROID_ARCH_ABI ${ANDROID_ABI})
-endif()
-add_subdirectory(${EXTERNAL}/libadrenotools adrenotools)
 target_sources(nnsdk PRIVATE ${EXTERNAL}/volk/volk.c)
 # ARM's ASTC encoder (Apache-2.0, unmodified): BC textures re-encoded as ASTC on Mali (nvn/astc.cpp). NEON only.
 file(GLOB ASTCENC_SOURCES ${EXTERNAL}/astcenc/*.cpp)
@@ -127,6 +132,7 @@ else()
 endif()
 # Su libc++ estática no se exporta: el juego debe usar una sola copia de libc++abi (la del loader).
 target_link_options(nnsdk PRIVATE -Wl,--exclude-libs,ALL)
+endif()
 
 # Núcleo del loader: carga main, lo reloca contra libnnsdk/bionic/stubs y lo arranca.
 add_library(loader_core OBJECT
@@ -143,6 +149,43 @@ add_library(loader_core OBJECT
 )
 target_include_directories(loader_core PUBLIC src)
 set_target_properties(loader_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MHRISE_LUA_DEBUG)
+  include(FetchContent)
+  FetchContent_Declare(lua54 URL https://www.lua.org/ftp/lua-5.4.9.tar.gz
+    URL_HASH SHA256=2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6)
+  FetchContent_MakeAvailable(lua54)
+  FetchContent_Declare(rise_imgui URL https://codeload.github.com/ocornut/imgui/tar.gz/f5befd2d29e66809cd1110a152e375a7f1981f06
+    URL_HASH SHA256=85f4ce357df05bcc331b587f01976f47fb55f19fadf477a7907289686bc3f4c8)
+  FetchContent_MakeAvailable(rise_imgui)
+  # Android's variable Noto CJK collections use CFF2 outlines.
+  foreach(lib ZLIB BZIP2 PNG HARFBUZZ BROTLI)
+    set(FT_DISABLE_${lib} ON CACHE BOOL "" FORCE)
+  endforeach()
+  FetchContent_Declare(freetype URL https://codeload.github.com/freetype/freetype/tar.gz/refs/tags/VER-2-13-3
+    URL_HASH SHA256=bc5c898e4756d373e0d991bab053036c5eb2aa7c0d5c67e8662ddc6da40c4103)
+  FetchContent_MakeAvailable(freetype)
+  set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+  set(JSON_Install OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(rise_json URL https://codeload.github.com/nlohmann/json/tar.gz/refs/tags/v3.11.3
+    URL_HASH SHA256=0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406)
+  FetchContent_MakeAvailable(rise_json)
+  add_library(rise_imgui_ui STATIC ${rise_imgui_SOURCE_DIR}/imgui.cpp ${rise_imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${rise_imgui_SOURCE_DIR}/imgui_draw.cpp ${rise_imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${rise_imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp ${rise_imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp)
+  target_include_directories(rise_imgui_ui PUBLIC ${rise_imgui_SOURCE_DIR})
+  target_compile_definitions(rise_imgui_ui PRIVATE IMGUI_IMPL_OPENGL_ES3 IMGUI_ENABLE_FREETYPE)
+  target_link_libraries(rise_imgui_ui PUBLIC GLESv3 freetype)
+  file(GLOB lua_sources "${lua54_SOURCE_DIR}/src/*.c")
+  list(REMOVE_ITEM lua_sources "${lua54_SOURCE_DIR}/src/lua.c" "${lua54_SOURCE_DIR}/src/luac.c")
+  add_library(rise_lua STATIC ${lua_sources})
+  set_target_properties(rise_lua PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(rise_lua PUBLIC "${lua54_SOURCE_DIR}/src")
+  target_compile_definitions(loader_core PUBLIC MHRISE_LUA_DEBUG)
+  target_sources(loader_core PRIVATE src/loader/tdb_lua.cpp src/loader/lua_mod_hooks.cpp src/loader/live_read.cpp
+    src/loader/application_lua.cpp src/loader/lua_frame_gc.cpp src/loader/lua_values.cpp src/loader/mod_ui.cpp src/loader/lua_data.cpp
+    src/loader/lua_native_hooks.cpp src/loader/lua_explorer.cpp src/loader/native_hook.cpp src/loader/native_hook.S)
+  target_link_libraries(loader_core PUBLIC rise_lua rise_imgui_ui nlohmann_json::nlohmann_json log jnigraphics)  # (jnigraphics: d2d images)
+endif()
 
 # nier_loader: desde la terminal de la Flip, sin ventana.
 add_executable(nier_loader src/loader/main.cpp)
