@@ -149,11 +149,6 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     @Override
     protected void onCreate(Bundle state) {
         noteLastExit();  // (before the game starts and opens its log)
-        // First-run lighter settings for small Mali GPUs (MediaTek); once, never over the user's own choices
-        try {
-            DeviceProfile.applyOnce(SettingsMenu.gameFolder(this));
-        } catch (RuntimeException ignored) {
-        }
         super.onCreate(state);
         // Expand into the cutout (Settings → Display): the game's window over the strip beside the camera too
         File cutoutFolder = SettingsMenu.gameFolder(this);

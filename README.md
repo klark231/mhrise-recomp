@@ -39,14 +39,9 @@ resolution drops for a moment instead of the frame rate, and FSR 1 scales the pi
 
 The log (`log.txt` in the data folder) says what the port picked for your phone.
 
-## Fork note: Infinix GT 30 5G / small Mali (this build)
+## Fork note
 
-On the first start on a MediaTek phone, `android/java/io/github/iamwilmar/mhriseport/DeviceProfile.java` writes lighter
-defaults into `mhr.ini` (768x432 base with wide dynamic resolution and FSR, half-size shadows, mesh LOD x0.75, draw
-distance 75 %, one mip level less, no anisotropic filtering). It runs once (`device_profile.txt` in the data folder is the
-marker), never overrides a choice you already made, and every item is a normal menu setting you can raise. Delete the
-marker to apply it again, or use *Restore default settings* for the port's stock values. Build your own APK from your
-fork with Actions → `personal-apk` → Run workflow.
+This fork only adds `.github/workflows/personal-apk.yml` (Actions → personal-apk → Run workflow builds an optimized APK and an AnTuTu-package one). The game code is the stock port.
 
 ## What's in it
 
