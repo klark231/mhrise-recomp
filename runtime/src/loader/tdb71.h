@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 #include "loader/nso.h"
 #include <algorithm>
 #include <cstring>
@@ -220,6 +221,18 @@ struct Tdb {
     }
     resolved_methods.emplace(std::move(key), found);
     return found;
+  }
+  // Every overload of a name with that many parameters, nearest type first and in declaration order (for picking
+  // one by the arguments when lookup_method finds several)
+  std::vector<uint32_t> overloads(uint32_t type, std::string_view short_name, int arity) const {
+    std::vector<uint32_t> out;
+    for (uint32_t id = type; id && out.empty(); id = parent(id)) {
+      auto [first, count] = method_range(id);
+      for (uint32_t k = first; k < first + count; ++k)
+        if (method(k, id) == short_name && read<uint16_t>(byte_pool, signature_offset(k)) == arity)
+          out.push_back(k);
+    }
+    return out;
   }
   uint32_t parameter_row(size_t signature, unsigned slot) const {
     return read<uint32_t>(byte_pool, signature + 4 + 4 * slot);

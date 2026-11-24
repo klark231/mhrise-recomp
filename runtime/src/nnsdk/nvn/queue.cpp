@@ -7,7 +7,6 @@
 #include <mutex>
 
 #include "nnsdk/nvn/commands.h"
-#include "nnsdk/activity.h"
 #include "nnsdk/nvn/flags.h"
 #include "nnsdk/nvn/nvn.h"
 
@@ -23,11 +22,10 @@ struct QueueBuilder {
 struct Queue {};
 struct Sync {
     uint64_t submit = 0;  // envío que lo señala (0: señalado desde el principio)
-    bool failed = false;
 };
 
 // NVNsyncWaitResult.
-constexpr int kSyncAlreadySignaled = 0, kSyncConditionSatisfied = 1, kSyncTimeoutExpired = 2, kSyncFailed = 3;
+constexpr int kSyncAlreadySignaled = 0, kSyncConditionSatisfied = 1, kSyncTimeoutExpired = 2;
 constexpr int kWindowAcquireSuccess = 0;
 
 nvn::Objects<Queue> g_queues;
@@ -62,15 +60,11 @@ void nvnQueueSubmitCommands(void* queue, int count, const uint64_t* handles) {
 }
 void nvnQueueFlush(void*) {}
 void nvnQueueFinish(void*) { nvn::wait_idle(); }
-void nvnQueueFenceSync(void*, void* sync, int, int flags) {
-    if (flags) nvn::queue_cpu_fence(sync);
-    else nvn::sync_signal_at(sync, nvn::last_submit());
-}
+void nvnQueueFenceSync(void*, void* sync, int, int) { nvn::sync_signal_at(sync, nvn::last_submit()); }
 // Espera de la GPU a un sync: con una sola cola el orden de envío ya lo garantiza.
 nvn::Boolean nvnQueueWaitSync(void*, const void*) { return 1; }
 
 void nvnQueuePresentTexture(void*, void* window, int index) {
-    nnsdk::activity_state().checkpoint();
     // El hilo principal del juego lo crea el loader, no nn::os, y no tiene nombre del juego: se le reconoce por
     // ser el que presenta (y envía los comandos). Es crítico como MainDraw y NvnSubmit.
     thread_local bool pinned = false;
@@ -109,21 +103,13 @@ void count_wait(int64_t ns, bool timed_out, uint64_t timeout_ns) {
     window_start = now, waited = 0, waits = timeouts = 0;
 }
 int nvnSyncWait(const void* sync, uint64_t timeout_ns) {
-    Sync s;
-    g_syncs.visit(sync, [&](const Sync& value) { s = value; });
-    if (s.failed) return kSyncFailed;
-    if (!s.submit) return kSyncAlreadySignaled;
-    auto result = [&](int status) {
-        g_syncs.visit(sync, [&](const Sync& value) {
-            if (value.submit == s.submit && value.failed) status = kSyncFailed;
-        });
-        return status;
-    };
-    if (nvn::wait_submit(s.submit, 0)) return result(kSyncAlreadySignaled);
+    Sync* s = g_syncs.get(sync);
+    if (!s || !s->submit) return kSyncAlreadySignaled;
+    if (nvn::wait_submit(s->submit, 0)) return kSyncAlreadySignaled;
     const auto start = std::chrono::steady_clock::now();
-    const bool ok = nvn::wait_submit(s.submit, timeout_ns);
+    const bool ok = nvn::wait_submit(s->submit, timeout_ns);
     count_wait((std::chrono::steady_clock::now() - start).count(), !ok, timeout_ns);
-    return result(ok ? kSyncConditionSatisfied : kSyncTimeoutExpired);
+    return ok ? kSyncConditionSatisfied : kSyncTimeoutExpired;
 }
 
 int nvnWindowAcquireTexture(void* window, void*, int* index) {
@@ -142,13 +128,9 @@ void nvnSyncSetDebugLabel(void*, const char*) {}
 }  // extern "C"
 
 void nvn::sync_signal_at(void* sync, uint64_t submit) {
-    if (!g_syncs.visit(sync, [&](Sync& s) { s = {submit, false}; })) {
-        g_syncs.create(sync);
-        g_syncs.visit(sync, [&](Sync& s) { s = {submit, false}; });
-    }
-}
-void nvn::sync_fail_at(void* sync, uint64_t submit) {
-    g_syncs.visit(sync, [&](Sync& s) { if (s.submit == submit) s.failed = true; });
+    Sync* s = g_syncs.get(sync);
+    if (!s) s = &g_syncs.create(sync);
+    s->submit = submit;
 }
 
 NVN_PROC(nvnQueueBuilderSetDefaults);

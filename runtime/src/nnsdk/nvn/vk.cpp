@@ -123,25 +123,11 @@ bool create(VkContext& c, bool system_driver) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "MH Rise port";
     app.apiVersion = VK_API_VERSION_1_1;
-    std::vector<const char*> instance_ext = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
-    uint32_t available_count = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &available_count, nullptr);
-    std::vector<VkExtensionProperties> available(available_count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &available_count, available.data());
-    auto supports = [](const auto& extensions, const char* name) {
-        for (const auto& e : extensions) if (strcmp(e.extensionName, name) == 0) return true;
-        return false;
-    };
-    const bool surface_maintenance = supports(available, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
-                                     supports(available, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-    if (surface_maintenance) {
-        instance_ext.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-        instance_ext.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-    }
+    const char* instance_ext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = static_cast<uint32_t>(instance_ext.size());
-    ici.ppEnabledExtensionNames = instance_ext.data();
+    ici.enabledExtensionCount = 2;
+    ici.ppEnabledExtensionNames = instance_ext;
     if (VkResult r = vkCreateInstance(&ici, nullptr, &c.instance); r != VK_SUCCESS) {
         NVN_LOG("vkCreateInstance: %s\n", vk_result_name(r));
         return false;
@@ -205,12 +191,9 @@ bool create(VkContext& c, bool system_driver) {
     bool draw_indirect_count = false;
     // Opcionales: STORE_OP_NONE (Qualcomm) para no guardar los adjuntos que un pase no escribe (ver el ejecutor).
     for (const VkExtensionProperties& e : exts)
-        if (strcmp(e.extensionName, VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME) == 0 ||
-            strcmp(e.extensionName, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME) == 0 ||
-            strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0) {
-            device_ext.push_back(e.extensionName);
+        if (strcmp(e.extensionName, VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME) == 0) {
+            device_ext.push_back(VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME);
             c.store_op_none = true;
-            if (strcmp(e.extensionName, VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME) != 0) c.load_op_none = true;
         } else if (strcmp(e.extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0) {
             device_ext.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
             c.display_timing = true;
@@ -285,18 +268,6 @@ bool create(VkContext& c, bool system_driver) {
         float16.shaderInt8 = VK_FALSE;
         dci.pNext = &float16;
         device_ext.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
-    }
-    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
-    if (surface_maintenance && supports(exts, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
-        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        f2.pNext = &maintenance;
-        vkGetPhysicalDeviceFeatures2(c.gpu, &f2);
-        if (maintenance.swapchainMaintenance1) {
-            maintenance.pNext = const_cast<void*>(dci.pNext);
-            dci.pNext = &maintenance;
-            device_ext.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
-            c.present_fences = true;
-        }
     }
     // Con <datos>/robusto, también robustBufferAccess2 (VK_EXT_robustness2): los índices leídos fuera del buffer de
     // índices (robustBufferAccess no los cubre) dan 0 en vez de un fallo de página.
@@ -431,8 +402,7 @@ bool create(VkContext& c, bool system_driver) {
     VkResult r = vkCreateDevice(c.gpu, &dci, nullptr, &c.device);
     if (r != VK_SUCCESS && device_ext.size() > 1) {  // sin las opcionales, antes que no arrancar
         NVN_LOG("vkCreateDevice con extensiones opcionales: %s; sin ellas\n", vk_result_name(r));
-        c.store_op_none = c.load_op_none = c.display_timing = c.push_descriptor = c.present_fences = false;
-        c.vertex_input_dynamic_state = c.extended_dynamic_state = false;
+        c.store_op_none = c.display_timing = c.push_descriptor = false;
         c.nonuniform_sampled = c.custom_border_color = c.filter_minmax = false;
         float16.shaderFloat16 = VK_FALSE;
         draw_indirect_count = false;

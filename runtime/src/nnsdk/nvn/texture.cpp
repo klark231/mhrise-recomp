@@ -7,14 +7,12 @@
 #include <vector>
 #include <memory>
 #include <mutex>
-#include <utility>
 
 #include "nnsdk/nvn/commands.h"
 #include "nnsdk/nvn/flags.h"
 #include "nnsdk/nvn/formats.h"
 #include "nnsdk/nvn/nvn.h"
 #include "nnsdk/nvn/objects.h"
-#include "nnsdk/nvn/texture_region.h"
 
 using nvn::SamplerDesc;
 using nvn::TextureDesc;
@@ -24,8 +22,7 @@ namespace {
 
 constexpr size_t kStorageAlignment = 512;
 
-nvn::ResourceRegistry<nvn::Sampler> g_samplers;
-nvn::ResourceSlots<nvn::Sampler> g_builder_sampler_slots; // serialized by the executor
+nvn::Objects<nvn::Sampler> g_samplers;
 
 nvn::TextureLayout layout_of(const TextureDesc& d) {
     const nvn::FormatInfo* f = nvn::format_info(d.format);
@@ -52,17 +49,18 @@ nvn::TextureLayout layout_of(const TextureDesc& d) {
                                d.stride, is_3d, packaged ? d.packaged_layout[0] : -1, packaged ? d.packaged_layout[1] : 0);
 }
 
-int storage_class_of(const TextureDesc& d, bool raw = false) {
-    using namespace nvn;
-    if (d.flags & kTextureFlagLinear) return kStorageClassPitch;
-    if (raw || !(d.flags & kTextureFlagCompressible) || d.samples > 1 || d.target == kTargetBuffer) return kStorageClassBlockLinear;
-    const auto* fmt = format_info(d.format);
-    return fmt && fmt->block == 1 && fmt->bytes ? kStorageClassNativeImage : kStorageClassBlockLinear;
+// NVNstorageClass: el "kind" de Maxwell de las páginas que pide la textura. MH Rise solo lo pasa a su asignador de
+// memoria de texturas (main+0x77055e8, main+0x7711088) y de ahí a nvnMemoryPoolMapVirtual, que aquí no lo usa: basta
+// con que sea estable. Los de Maxwell: pitch (lineal) y block-linear genérico (GENERIC_16BX2). Sin compresión, el "raw"
+// (sin el bit de compresión) es el mismo.
+constexpr int kStorageClassPitch = 0x00, kStorageClassBlockLinear = 0xfe;
+int storage_class_of(const TextureDesc& d) {
+    return (d.flags & nvn::kTextureFlagLinear) ? kStorageClassPitch : kStorageClassBlockLinear;
 }
 
 // Nivel y capa que nombra una vista (lo que no fija, el primero).
-int view_level(const TextureViewDesc* v) { return v ? nvn::transfer_level(*v) : 0; }
-int view_layer(const TextureViewDesc* v) { return v ? nvn::transfer_base_layer(*v) : 0; }
+int view_level(const TextureViewDesc* v) { return v && (v->flags & nvn::kViewLevels) ? v->base_level : 0; }
+int view_layer(const TextureViewDesc* v) { return v && (v->flags & nvn::kViewLayers) ? v->base_layer : 0; }
 
 // Lo que tocan WriteTexels/ReadTexels: un nivel, unas capas y una caja en bloques dentro del nivel. La región va en
 // texels; en los arrays su z (y en los 1D array su y) elige las capas, como en las copias de NVN. false si no cabe.
@@ -75,20 +73,28 @@ struct TexelRegion {
 bool texel_region(const nvn::Texture& t, const TextureViewDesc* view, const nvn::CopyRegion* r, int64_t row_stride,
                   int64_t image_stride, TexelRegion& out) {
     const nvn::TextureLayout& L = t.layout;
-    nvn::TextureRegion region;
-    if (!r || !t.storage || !nvn::resolve_texture_region(t.desc.target, view ? *view : TextureViewDesc{}, *r,
-                                                          L.levels.size(), L.layers, region)) return false;
-    const nvn::LevelLayout& lv = L.levels[region.level];
+    const int level = view_level(view);
+    if (!r || !t.storage || level < 0 || level >= static_cast<int>(L.levels.size()) || r->width <= 0 || r->height <= 0)
+        return false;
+    const int target = t.desc.target;
+    const bool array1d = target == nvn::kTarget1DArray;
+    const bool layered = target == nvn::kTarget2DArray || target == nvn::kTarget2DMultisampleArray ||
+                         target == nvn::kTargetCube || target == nvn::kTargetCubeArray;
+    const nvn::LevelLayout& lv = L.levels[level];
     out.level = &lv;
-    out.level_index = region.level;
+    out.level_index = level;
     out.bpb = L.bytes_per_block;
-    auto [x,y,z,w,h,d] = region.box;
+    int first = 0, count = 1;
+    int x = r->x, y = r->y, z = r->z, w = r->width, h = r->height, d = std::max(r->depth, 1);
+    if (array1d) first = y, count = h, y = 0, h = 1;
+    if (layered) first = z, count = d, z = 0, d = 1;
+    first += view_layer(view);
+    if (x < 0 || y < 0 || z < 0 || first < 0 || first + count > static_cast<int>(L.layers)) return false;
     // Recortada al nivel: el juego no debería pasarse, y escribir fuera pisaría el siguiente nivel.
     w = std::min<int>(w, static_cast<int>(lv.width) - x), h = std::min<int>(h, static_cast<int>(lv.height) - y);
     d = std::min<int>(d, static_cast<int>(std::max(lv.depth, 1u)) - z);
     if (w <= 0 || h <= 0 || d <= 0) return false;
-    out.layer = region.layer;
-    out.layers = region.layers;
+    out.layer = static_cast<uint32_t>(first), out.layers = static_cast<uint32_t>(count);
     const uint32_t bw = L.block_w, bh = L.block_h;
     out.box = {x / bw, y / bh, static_cast<uint32_t>(z), (x % bw + w + bw - 1) / bw, (y % bh + h + bh - 1) / bh,
                static_cast<uint32_t>(d)};
@@ -105,16 +111,6 @@ uint8_t* level_storage(const nvn::Texture& t, const TexelRegion& r, uint32_t lay
 }
 
 // Lineal con stride: filas tal cual. Block-linear: la caja (ver layout.h).
-void mark_texel_write(nvn::Texture& t, const TexelRegion& r) {
-    std::lock_guard lock(nvn::texel_writes_mutex());
-    if (!t.texel_writes.empty()) {
-        const auto& last = t.texel_writes.back();
-        if (last.level == r.level_index && last.layer == r.layer && last.layers == r.layers && last.box == r.box) return;
-    }
-    t.texel_writes.push_back({r.level_index, r.layer, r.layers, r.box});
-    nvn::g_texel_writes++;
-}
-
 void write_texels(nvn::Texture& t, const TextureViewDesc* view, const nvn::CopyRegion* region, const void* data,
                   int64_t row_stride, int64_t image_stride) {
     TexelRegion r;
@@ -139,7 +135,9 @@ void write_texels(nvn::Texture& t, const TextureViewDesc* view, const nvn::CopyR
         }
     }
     // La imagen se rehace desde la memoria al usarla (solo esta caja si la GPU ya escribió el resto).
-    mark_texel_write(t, r);
+    std::lock_guard lock(nvn::texel_writes_mutex());
+    t.texel_writes.push_back({r.level_index, r.layer, r.layers, r.box});
+    nvn::g_texel_writes++;
 }
 
 // Las escrituras pendientes de una textura que se reinicia o se finaliza: fuera, y fuera de la cuenta (con ella a 0 el
@@ -150,11 +148,15 @@ void drop_texel_writes(nvn::Texture& t) {
     t.texel_writes.clear();
 }
 
-void read_texels(nvn::Texture& t, const TextureViewDesc* view, const nvn::CopyRegion* region, void* data,
+void read_texels(const nvn::Texture& t, const TextureViewDesc* view, const nvn::CopyRegion* region, void* data,
                  int64_t row_stride, int64_t image_stride) {
     TexelRegion r;
     if (!data || !texel_region(t, view, region, row_stride, image_stride, r)) return;
-    if (!nvn::sync_texture_storage(t, {r.level_index, r.layer, r.layers, r.box})) return;
+    // Lo que escribió la GPU vive en la imagen de Vulkan, no en la memoria: se lee lo de la CPU.
+    static int logged = 0;
+    if (t.gpu_written && logged++ < 4)
+        NVN_LOG("ReadTexels de una textura %dx%d escrita por la GPU: se lee su memoria (sin lo de la GPU)\n", t.desc.width,
+                t.desc.height);
     auto* dst = static_cast<uint8_t*>(data);
     for (uint32_t k = 0; k < r.layers; k++) {
         const uint8_t* level = level_storage(t, r, r.layer + k);
@@ -191,14 +193,10 @@ template <typename T>
 void border_int(const SamplerDesc& d, T* color) {
     for (int k = 0; k < 4; k++) color[k] = static_cast<T>(d.border[k]);
 }
-SamplerDesc sampler_desc(const void* sampler) {
-    auto s = g_samplers.acquire(sampler);
-    return s ? s->desc : SamplerDesc{};
-}
-
-void release_sampler(nvn::Sampler& s) {
-    for (auto* vk : {&s.vk, &s.vk_af, &s.vk_lit})
-        if (*vk) nvn::retire_sampler(std::exchange(*vk, VK_NULL_HANDLE));
+const SamplerDesc& sampler_desc(const void* sampler) {
+    static const SamplerDesc none{};
+    nvn::Sampler* s = g_samplers.get(sampler);
+    return s ? s->desc : none;
 }
 
 }  // namespace
@@ -208,134 +206,8 @@ void nvn::write_texels_to(Texture& t, const TextureViewDesc* view, const CopyReg
     write_texels(t, view, region, data, row_stride, image_stride);
 }
 
-nvn::TextureRegistry nvn::g_textures;
-
-void nvn::Texture::note_mapping_change(size_t first, size_t last) {
-    auto it = std::lower_bound(remapped_ranges.begin(), remapped_ranges.end(), first,
-        [](const MappingRange& r, size_t start) { return r.second < start; });
-    if (it == remapped_ranges.end() || it->first > last) {
-        remapped_ranges.emplace(it, first, last);
-    } else {
-        it->first = std::min(it->first, first);
-        it->second = std::max(it->second, last);
-        auto next = it + 1;
-        while (next != remapped_ranges.end() && next->first <= it->second) {
-            it->second = std::max(it->second, next->second);
-            ++next;
-        }
-        remapped_ranges.erase(it + 1, next);
-    }
-    __atomic_store_n(&mapping_changed, true, __ATOMIC_RELEASE);
-    g_mapping_serial.fetch_add(1, std::memory_order_release);
-}
-
-void nvn::TextureRegistry::restore_mapping_changes(Texture& t, const std::vector<Texture::MappingRange>& ranges) {
-    std::lock_guard lock(mutex_);
-    for (auto [first, last] : ranges) t.note_mapping_change(first, last);
-}
-
-std::vector<nvn::Texture::MappingRange> nvn::TextureRegistry::take_mapping_changes(Texture& t) {
-    std::lock_guard lock(mutex_);
-    __atomic_store_n(&t.mapping_changed, false, __ATOMIC_RELEASE);
-    std::vector<Texture::MappingRange> ranges;
-    ranges.swap(t.remapped_ranges);
-    return ranges;
-}
-
-nvn::Texture* nvn::TextureRegistry::get(const void* key) {
-    return reference(key).get();
-}
-
-nvn::ResourceRef<nvn::Texture> nvn::TextureRegistry::reference(const void* key) {
-    std::lock_guard lock(mutex_);
-    auto it = handles_.find(key);
-    return it == handles_.end() ? ResourceRef<Texture>{} : it->second.texture->ref;
-}
-
-std::shared_ptr<nvn::Texture> nvn::TextureRegistry::acquire(const void* key) {
-    std::lock_guard lock(mutex_);
-    auto it = handles_.find(key);
-    return it == handles_.end() ? nullptr : it->second.texture;
-}
-
-uint64_t nvn::TextureRegistry::debug_id(const void* key) {
-    std::lock_guard lock(mutex_);
-    auto it = handles_.find(key);
-    return it == handles_.end() ? 0 : it->second.id;
-}
-
-// Caller holds the registry lock and, for a live key, the executor lock.
-std::shared_ptr<nvn::Texture> nvn::TextureRegistry::detach(const void* key) {
-    auto it = handles_.find(key);
-    if (it == handles_.end()) return {};
-    auto old = std::move(it->second.texture);
-    handles_.erase(it);
-    if (--old->handle_count) return {};
-    auto [first, last] = storage_.equal_range(old->storage);
-    for (auto s = first; s != last; ++s) {
-        if (s->second.lock() == old) {
-            storage_.erase(s);
-            break;
-        }
-    }
-    release_texture_gpu(*old);
-    drop_texel_writes(*old);
-    old->storage = nullptr;
-    old->vk_failed = true;
-    old->serial = next_texture_serial();
-    return old;
-}
-
-bool nvn::TextureRegistry::bind(const void* key, Texture texture) {
-    std::lock_guard lock(mutex_);
-    auto reusable = detach(key);
-    auto [first, last] = storage_.equal_range(texture.storage);
-    if (texture.storage) {
-        for (auto s = first; s != last; ++s) {
-            auto shared = s->second.lock();
-            if (shared->desc == texture.desc) {
-                ++shared->handle_count;
-                handles_.emplace(key, Handle{std::move(shared), texture.serial});
-                if (reusable) slots_.erase(reusable->ref);
-                return false;
-            }
-        }
-    }
-    // Reinitialization without Finalize keeps the address held by recorded commands
-    // when this handle exclusively owns the old state.
-    if (texture.virtual_storage && texture.storage) {
-        const auto start = reinterpret_cast<uintptr_t>(texture.storage);
-        const size_t size = texture.layout.total_size();
-        auto it = storage_.lower_bound(reinterpret_cast<const uint8_t*>(start - std::min<size_t>(start, max_virtual_size_)));
-        for (; it != storage_.end() && reinterpret_cast<uintptr_t>(it->first) < start + size; ++it) {
-            auto other = it->second.lock();
-            if (other->desc.pool != texture.desc.pool ||
-                reinterpret_cast<uintptr_t>(it->first) + other->layout.total_size() <= start) continue;
-            texture.raw_alias = true;
-            __atomic_store_n(&other->raw_alias, true, __ATOMIC_RELEASE);
-        }
-        max_virtual_size_ = std::max(max_virtual_size_, size);
-    }
-    const bool aliases = texture.raw_alias;
-    if (!reusable) {
-        reusable = std::make_shared<Texture>();
-        texture.ref = slots_.insert(reusable.get());
-    } else {
-        texture.ref = reusable->ref; // reinitializing a live handle keeps its bindings
-    }
-    texture.handle_count = 1;
-    *reusable = std::move(texture);
-    storage_.emplace(reusable->storage, reusable);
-    handles_.emplace(key, Handle{reusable, reusable->serial});
-    return aliases;
-}
-
-void nvn::TextureRegistry::unbind(const void* key) {
-    std::lock_guard lock(mutex_);
-    if (auto last = detach(key)) slots_.erase(last->ref);
-}
+nvn::Objects<nvn::Texture> nvn::g_textures;
 std::atomic<uint32_t> nvn::g_texel_writes{0};
-std::atomic<uint64_t> nvn::g_mapping_serial{0};
 
 std::mutex& nvn::texel_writes_mutex() {
     static std::mutex m;
@@ -350,51 +222,9 @@ uint64_t nvn::next_texture_serial() {
 
 // Destruirla ya podía pillar a la GPU leyéndola en un envío pendiente: la retira el ejecutor.
 void nvn::release_texture_gpu(Texture& t) { nvn::retire_texture_gpu(t); }
-nvn::ResourceRegistry<nvn::DescriptorPool> nvn::g_texture_pools, nvn::g_sampler_pools;
+nvn::Objects<nvn::DescriptorPool> nvn::g_texture_pools, nvn::g_sampler_pools;
 
 nvn::Sampler* nvn::find_sampler(const void* sampler) { return g_samplers.get(sampler); }
-
-void nvn::DescriptorPool::register_sampler(uint32_t id, ResourceRef<Sampler> sampler) {
-    decltype(builder_samplers)::node_type previous;
-    {
-        std::lock_guard lock(entries_mutex);
-        samplers[id] = sampler;
-        sampler_snapshot_.reset();
-        previous = builder_samplers.extract(id);
-    }
-    if (previous) {
-        std::lock_guard lock(executor_mutex());
-        auto& builder = previous.mapped();
-        g_builder_sampler_slots.erase(builder.ref);
-        release_sampler(builder.value);
-    }
-}
-
-// The caller holds the executor lock while replacing a builder-owned VkSampler.
-void nvn::DescriptorPool::register_sampler_builder(uint32_t id, const SamplerDesc& desc) {
-    std::lock_guard lock(entries_mutex);
-    auto [it, inserted] = builder_samplers.try_emplace(id);
-    auto& builder = it->second;
-    if (!inserted) {
-        g_builder_sampler_slots.erase(builder.ref);
-        release_sampler(builder.value);
-    }
-    builder.value.desc = desc;
-    builder.ref = g_builder_sampler_slots.insert(&builder.value);
-    samplers[id] = builder.ref;
-    sampler_snapshot_.reset();
-}
-
-void nvn::DescriptorPool::retire_sampler_builders() {
-    std::lock_guard lock(entries_mutex);
-    for (auto& [id, builder] : builder_samplers) {
-        samplers[id] = nullptr;
-        g_builder_sampler_slots.erase(builder.ref);
-        release_sampler(builder.value);
-    }
-    builder_samplers.clear();
-    sampler_snapshot_.reset();
-}
 
 extern "C" {
 
@@ -444,7 +274,7 @@ void nvnTextureBuilderSetSwizzle(TextureDesc* b, int r, int g, int bl, int a) {
     b->swizzle[0] = r, b->swizzle[1] = g, b->swizzle[2] = bl, b->swizzle[3] = a;
 }
 int nvnTextureBuilderGetStorageClass(const TextureDesc* b) { return storage_class_of(*b); }
-int nvnTextureBuilderGetRawStorageClass(const TextureDesc* b) { return storage_class_of(*b, true); }
+int nvnTextureBuilderGetRawStorageClass(const TextureDesc* b) { return storage_class_of(*b); }
 // Sin ZCull (la GPU lo hace a su manera): nada que reservar.
 size_t nvnTextureBuilderGetZCullStorageSize(const TextureDesc*) { return 0; }
 void* nvnTextureBuilderGetDevice(const TextureDesc* b) { return b->device; }
@@ -473,15 +303,16 @@ nvn::Boolean nvnTextureInitialize(void* texture, const TextureDesc* b) {
     // Reinicializar sin Finalize: el mismo objeto (los comandos grabados y los pools de texturas guardan su
     // dirección), sin la imagen anterior.
     std::unique_lock<std::recursive_mutex> lock(nvn::executor_mutex(), std::defer_lock);
-    auto existing = nvn::g_textures.acquire(texture);
+    nvn::Texture* existing = nvn::g_textures.get(texture);
     if (existing) {
-        nvn::lock_executor(lock);
-        if (existing->virtual_storage && !nvn::publish_virtual_pool(existing->desc.pool, existing.get())) return 0;
+        nvn::lock_executor(lock);  // el ejecutor puede estar leyendo este objeto
+        nvn::release_texture_gpu(*existing);
+        drop_texel_writes(*existing);
+        *existing = nvn::Texture{};
     }
-    nvn::Texture t;
+    nvn::Texture& t = existing ? *existing : nvn::g_textures.create(texture);
     t.serial = nvn::next_texture_serial();
     t.desc = *b;
-    if (!t.desc.has_packaged_layout) memset(t.desc.packaged_layout, 0, sizeof t.desc.packaged_layout);
     if (!nvn::format_info(b->format) || !nvn::format_info(b->format)->bytes)
         NVN_LOG("textura con formato 0x%x sin mapear: %dx%dx%d target %d niveles %d flags 0x%x\n", b->format, b->width,
                 b->height, b->depth, b->target, b->levels, b->flags);
@@ -506,32 +337,34 @@ nvn::Boolean nvnTextureInitialize(void* texture, const TextureDesc* b) {
                     t.layout.linear ? "lineal" : "block-linear");
         }
     }
-    if (nvn::MemoryPool* pool = nvn::g_memory_pools.get(b->pool); pool && pool->storage) {
-        t.storage = pool->storage + b->offset;
-        t.virtual_storage = pool->reserved;
-        t.gpu_only_virtual = pool->reserved && (pool->flags & nvn::kPoolFlagCpuNoAccess) && !t.layout.linear;
-    }
+    if (nvn::MemoryPool* pool = nvn::g_memory_pools.get(b->pool)) t.storage = pool->storage + b->offset;
     if ((b->width == 1600 && b->height == 904) || (b->width == 800 && b->height == 452))  // DEPURACIÓN: vídeo
         NVN_LOG("textura de vídeo %p: %dx%d formato 0x%x flags 0x%x stride %d pool %p +0x%llx -> %p\n", texture, b->width,
                 b->height, b->format, b->flags, b->stride, b->pool, static_cast<unsigned long long>(b->offset),
                 static_cast<void*>(t.storage));
-    if (nvn::g_textures.bind(texture, std::move(t)) && !nvn::publish_virtual_pool(b->pool)) {
-        if (!lock.owns_lock()) nvn::lock_executor(lock);
-        nvn::g_textures.unbind(texture);
-        return 0;
-    }
     return 1;
 }
 void nvnTextureFinalize(void* texture) {
+    // La imagen se libera, pero el objeto queda vivo (sin imagen: se muestrea la de relleno) por si algún pool
+    // de texturas o lista de comandos aún lo nombra.
     std::unique_lock<std::recursive_mutex> executor_lock(nvn::executor_mutex(), std::defer_lock);
     nvn::lock_executor(executor_lock);
-    if (auto* t = nvn::g_textures.get(texture); t && t->virtual_storage && !nvn::publish_virtual_pool(t->desc.pool, t)) return;
-    nvn::g_textures.unbind(texture);
+    if (std::unique_ptr<nvn::Texture> t = nvn::g_textures.take(texture)) {
+        nvn::release_texture_gpu(*t);
+        drop_texel_writes(*t);
+        t->serial = nvn::next_texture_serial();
+        t->storage = nullptr;
+        t->vk_failed = true;
+        static std::mutex m;
+        static std::vector<std::unique_ptr<nvn::Texture>> finalized;
+        std::lock_guard lock(m);
+        finalized.push_back(std::move(t));
+    }
 }
 
 #define TEXTURE_GETTER(name, field)                          \
     int nvnTextureGet##name(const void* t) {                \
-        auto tex = nvn::g_textures.acquire(t);         \
+        nvn::Texture* tex = nvn::g_textures.get(t);         \
         return tex ? tex->desc.field : 0;                   \
     }
 TEXTURE_GETTER(Width, width)
@@ -545,33 +378,26 @@ TEXTURE_GETTER(Samples, samples)
 TEXTURE_GETTER(DepthStencilMode, depth_stencil_mode)
 #undef TEXTURE_GETTER
 int nvnTextureGetStorageClass(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
-    return tex ? storage_class_of(tex->desc) : nvn::kStorageClassBlockLinear;
+    nvn::Texture* tex = nvn::g_textures.get(t);
+    return tex ? storage_class_of(tex->desc) : kStorageClassBlockLinear;
 }
-int nvnTextureGetRawStorageClass(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
-    return tex ? storage_class_of(tex->desc, true) : nvn::kStorageClassBlockLinear;
-}
+int nvnTextureGetRawStorageClass(const void* t) { return nvnTextureGetStorageClass(t); }
 size_t nvnTextureGetZCullStorageSize(const void*) { return 0; }
 void* nvnTextureGetMemoryPool(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
+    nvn::Texture* tex = nvn::g_textures.get(t);
     return tex ? tex->desc.pool : nullptr;
 }
 int64_t nvnTextureGetMemoryOffset(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
+    nvn::Texture* tex = nvn::g_textures.get(t);
     return tex ? tex->desc.offset : 0;
 }
 // Dirección de GPU = de CPU: la de sus texels.
 uint64_t nvnTextureGetTextureAddress(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
-    if (tex && tex->gpu_only_virtual) {
-        __atomic_store_n(&tex->raw_alias, true, __ATOMIC_RELEASE);
-        if (!nvn::publish_virtual_pool(tex->desc.pool, tex.get())) return 0;
-    }
+    nvn::Texture* tex = nvn::g_textures.get(t);
     return tex ? reinterpret_cast<uint64_t>(tex->storage) : 0;
 }
 void nvnTextureGetSwizzle(const void* t, int* r, int* g, int* b, int* a) {
-    auto tex = nvn::g_textures.acquire(t);
+    nvn::Texture* tex = nvn::g_textures.get(t);
     const uint8_t identity[4] = {2, 3, 4, 5};
     const uint8_t* s = tex ? tex->desc.swizzle : identity;
     if (r) *r = s[0];
@@ -580,7 +406,8 @@ void nvnTextureGetSwizzle(const void* t, int* r, int* g, int* b, int* a) {
     if (a) *a = s[3];
 }
 int nvnTextureGetDebugID(const void* t) {
-    return static_cast<int>(nvn::g_textures.debug_id(t));
+    nvn::Texture* tex = nvn::g_textures.get(t);
+    return tex ? static_cast<int>(tex->serial) : 0;
 }
 void nvnTextureSetDebugLabel(void*, const char*) {}
 // Dónde empieza en la memoria de la textura el primer nivel y la primera capa de la vista: capa · tamaño de capa +
@@ -589,7 +416,7 @@ void nvnTextureSetDebugLabel(void*, const char*) {}
 // último, hasta GetStorageSize): con 0 copiaba la textura entera en cada nivel y se salía del staging
 // (main+0x771da34 -> main+0x7723388).
 int64_t nvnTextureGetViewOffset(const void* t, const TextureViewDesc* view) {
-    auto tex = nvn::g_textures.acquire(t);
+    nvn::Texture* tex = nvn::g_textures.get(t);
     if (!tex || tex->layout.levels.empty()) return 0;
     const nvn::TextureLayout& L = tex->layout;
     const size_t level = std::min<size_t>(std::max(view_level(view), 0), L.levels.size() - 1);
@@ -601,36 +428,29 @@ int64_t nvnTextureGetViewOffset(const void* t, const TextureViewDesc* view) {
 // --- Texels desde la CPU: en la Switch van directos a la memoria de la textura (swizzleados si es block-linear) ---
 
 void nvnTextureWriteTexels(const void* t, const TextureViewDesc* view, const nvn::CopyRegion* region, const void* data) {
-    if (auto tex = nvn::g_textures.acquire(t)) write_texels(*tex, view, region, data, 0, 0);
+    if (nvn::Texture* tex = nvn::g_textures.get(t)) write_texels(*tex, view, region, data, 0, 0);
 }
 void nvnTextureWriteTexelsStrided(const void* t, const TextureViewDesc* view, const nvn::CopyRegion* region,
                                   const void* data, int64_t row_stride, int64_t image_stride) {
-    if (auto tex = nvn::g_textures.acquire(t)) write_texels(*tex, view, region, data, row_stride, image_stride);
+    if (nvn::Texture* tex = nvn::g_textures.get(t)) write_texels(*tex, view, region, data, row_stride, image_stride);
 }
 void nvnTextureReadTexels(const void* t, const TextureViewDesc* view, const nvn::CopyRegion* region, void* data) {
-    if (auto tex = nvn::g_textures.acquire(t)) read_texels(*tex, view, region, data, 0, 0);
+    if (nvn::Texture* tex = nvn::g_textures.get(t)) read_texels(*tex, view, region, data, 0, 0);
 }
 void nvnTextureReadTexelsStrided(const void* t, const TextureViewDesc* view, const nvn::CopyRegion* region, void* data,
                                  int64_t row_stride, int64_t image_stride) {
-    if (auto tex = nvn::g_textures.acquire(t)) read_texels(*tex, view, region, data, row_stride, image_stride);
+    if (nvn::Texture* tex = nvn::g_textures.get(t)) read_texels(*tex, view, region, data, row_stride, image_stride);
 }
-void nvnTextureFlushTexels(const void* t, const TextureViewDesc* view, const nvn::CopyRegion* region) {
-    TexelRegion r;
-    if (auto tex = nvn::g_textures.acquire(t); tex && texel_region(*tex, view, region, 0, 0, r))
-        mark_texel_write(*tex, r);
-}
-void nvnTextureInvalidateTexels(const void* t, const TextureViewDesc* view, const nvn::CopyRegion* region) {
-    TexelRegion r;
-    if (auto tex = nvn::g_textures.acquire(t); tex && texel_region(*tex, view, region, 0, 0, r))
-        nvn::sync_texture_storage(*tex, {r.level_index, r.layer, r.layers, r.box});
-}
+// Cachés de la CPU: la memoria del juego es la que se lee y se escribe.
+void nvnTextureFlushTexels(const void*, const TextureViewDesc*, const nvn::CopyRegion*) {}
+void nvnTextureInvalidateTexels(const void*, const TextureViewDesc*, const nvn::CopyRegion*) {}
 // El juego escribe por CPU en texturas lineales (los frames de vídeo) con este stride.
 int64_t nvnTextureGetStride(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
+    nvn::Texture* tex = nvn::g_textures.get(t);
     return tex && tex->layout.linear ? tex->layout.stride : 0;
 }
 size_t nvnTextureGetStorageSize(const void* t) {
-    auto tex = nvn::g_textures.acquire(t);
+    nvn::Texture* tex = nvn::g_textures.get(t);
     return tex ? tex->layout.total_size() : 0;
 }
 
@@ -712,7 +532,6 @@ nvn::Boolean nvnTextureViewGetSwizzle(const TextureViewDesc* v, int* r, int* g, 
 // --- Pools de descriptores ---
 
 nvn::Boolean nvnTexturePoolInitialize(void* pool, void* memory_pool, int64_t offset, int count) {
-    std::lock_guard lock(nvn::executor_mutex());
     nvn::DescriptorPool& p = nvn::g_texture_pools.create(pool);
     p.memory_pool = memory_pool;
     p.offset = offset;
@@ -720,41 +539,30 @@ nvn::Boolean nvnTexturePoolInitialize(void* pool, void* memory_pool, int64_t off
     p.textures.resize(count);
     return 1;
 }
-void nvnTexturePoolFinalize(void* pool) {
-    std::lock_guard lock(nvn::executor_mutex());
-    nvn::g_texture_pools.take(pool);
-}
+void nvnTexturePoolFinalize(void* pool) { nvn::g_texture_pools.destroy(pool); }
 void nvnTexturePoolRegisterTexture(void* pool, int id, const void* texture, const TextureViewDesc* view) {
-    auto p = nvn::g_texture_pools.acquire(pool);
+    nvn::DescriptorPool* p = nvn::g_texture_pools.get(pool);
     if (!p || id < 0 || id >= p->count) return;
-    const auto owner = nvn::g_textures.acquire(texture);
-    const auto entry = nvn::TexturePoolEntry{owner ? owner->ref : nvn::ResourceRef<nvn::Texture>{}, view ? *view : TextureViewDesc{}};
-    p->register_texture(id, entry);
+    p->textures[id] = {nvn::g_textures.get(texture), view ? *view : TextureViewDesc{}};
     {  // DEPURACIÓN: ¿limita el juego los niveles al registrar (streaming)?
-        static std::atomic<unsigned> with_levels{}, total{};
-        const unsigned registered = total.fetch_add(1, std::memory_order_relaxed) + 1;
-        const nvn::Texture* t = owner.get();
+        static int logged = 0, with_levels = 0, total = 0;
+        total++;
+        const nvn::Texture* t = nvn::g_textures.get(texture);
         if (view && (view->flags & nvn::kViewLevels) && t && t->desc.levels > 1) {
-            if (with_levels.fetch_add(1, std::memory_order_relaxed) < 30)
+            with_levels++;
+            if (logged++ < 30)
                 NVN_LOG("registro con niveles: textura %llu %dx%d formato 0x%x niveles %d -> vista base %d cuenta %d (id %d)\n",
                         static_cast<unsigned long long>(t->serial), t->desc.width, t->desc.height, t->desc.format, t->desc.levels,
                         view->base_level, view->levels, id);
         }
-        if (registered % 5000 == 0) NVN_LOG("registros de texturas: %u, con niveles %u\n", registered,
-                                            with_levels.load(std::memory_order_relaxed));
+        if (total % 5000 == 0) NVN_LOG("registros de texturas: %d, con niveles %d\n", total, with_levels);
     }
 }
 void nvnTexturePoolRegisterImage(void* pool, int id, const void* texture, const TextureViewDesc* view) {
     nvnTexturePoolRegisterTexture(pool, id, texture, view);
 }
 
-void nvnSamplerPoolFinalize(void* pool) {
-    std::lock_guard lock(nvn::executor_mutex());
-    if (auto old = nvn::g_sampler_pools.take(pool)) old->retire_sampler_builders();
-}
 nvn::Boolean nvnSamplerPoolInitialize(void* pool, void* memory_pool, int64_t offset, int count) {
-    std::lock_guard lock(nvn::executor_mutex());
-    nvnSamplerPoolFinalize(pool);
     nvn::DescriptorPool& p = nvn::g_sampler_pools.create(pool);
     p.memory_pool = memory_pool;
     p.offset = offset;
@@ -762,16 +570,21 @@ nvn::Boolean nvnSamplerPoolInitialize(void* pool, void* memory_pool, int64_t off
     p.samplers.resize(count);
     return 1;
 }
+void nvnSamplerPoolFinalize(void* pool) { nvn::g_sampler_pools.destroy(pool); }
 void nvnSamplerPoolRegisterSampler(void* pool, int id, const void* sampler) {
-    auto p = nvn::g_sampler_pools.acquire(pool);
+    nvn::DescriptorPool* p = nvn::g_sampler_pools.get(pool);
     if (!p || id < 0 || id >= p->count) return;
-    p->register_sampler(id, g_samplers.reference(sampler));
+    p->samplers[id] = g_samplers.get(sampler);
 }
+nvn::Boolean nvnSamplerInitialize(void* sampler, const SamplerDesc* b);
+// Un sampler sin objeto del juego (solo el builder): uno nuestro por ranura, con la ranura del pool como clave (memoria
+// nuestra, no choca con objetos del juego). Reinicializarlo retira su VkSampler como nvnSamplerInitialize.
 void nvnSamplerPoolRegisterSamplerBuilder(void* pool, int id, const SamplerDesc* b) {
-    std::lock_guard lock(nvn::executor_mutex());
     nvn::DescriptorPool* p = nvn::g_sampler_pools.get(pool);
     if (!p || !b || id < 0 || id >= p->count) return;
-    p->register_sampler_builder(id, *b);
+    void* key = &p->samplers[id];
+    nvnSamplerInitialize(key, b);
+    p->samplers[id] = g_samplers.get(key);
 }
 void* nvnTexturePoolGetMemoryPool(const void* pool) {
     nvn::DescriptorPool* p = nvn::g_texture_pools.get(pool);
@@ -867,19 +680,29 @@ float nvnSamplerGetMaxAnisotropy(const void* s) { return sampler_desc(s).max_ani
 int nvnSamplerGetReductionFilter(const void* s) { return sampler_desc(s).reduction; }
 void nvnSamplerSetDebugLabel(void*, const char*) {}
 
+// Como las texturas, el objeto no se borra nunca: los pools de samplers guardan su dirección (borrarlo
+// dejaba al ejecutor escribiendo en memoria liberada). Su VkSampler se retira hasta que la GPU acaba.
 nvn::Boolean nvnSamplerInitialize(void* sampler, const SamplerDesc* b) {
     std::unique_lock<std::recursive_mutex> lock(nvn::executor_mutex(), std::defer_lock);
     nvn::lock_executor(lock);
     nvn::Sampler* s = g_samplers.get(sampler);
     if (!s) s = &g_samplers.create(sampler);
-    release_sampler(*s);
+    if (s->vk) nvn::retire_sampler(s->vk);
+    if (s->vk_af) nvn::retire_sampler(s->vk_af);
+    if (s->vk_lit) nvn::retire_sampler(s->vk_lit);
+    *s = nvn::Sampler{};
     s->desc = *b;
     return 1;
 }
 void nvnSamplerFinalize(void* sampler) {
     std::unique_lock<std::recursive_mutex> lock(nvn::executor_mutex(), std::defer_lock);
     nvn::lock_executor(lock);
-    if (auto s = g_samplers.take(sampler)) release_sampler(*s);
+    if (nvn::Sampler* s = g_samplers.get(sampler)) {
+        if (s->vk) nvn::retire_sampler(s->vk);
+        if (s->vk_af) nvn::retire_sampler(s->vk_af);
+        if (s->vk_lit) nvn::retire_sampler(s->vk_lit);
+        s->vk = s->vk_af = s->vk_lit = VK_NULL_HANDLE;
+    }
 }
 
 }  // extern "C"

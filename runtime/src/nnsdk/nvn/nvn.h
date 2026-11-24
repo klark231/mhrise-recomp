@@ -33,14 +33,6 @@ public:
         auto it = map_.find(key);
         return it == map_.end() ? nullptr : it->second.get();
     }
-    template <typename Fn>
-    bool visit(const void* key, Fn fn) {
-        std::lock_guard lock(m_);
-        auto it = map_.find(key);
-        if (it == map_.end()) return false;
-        fn(*it->second);
-        return true;
-    }
     T& create(const void* key) {
         std::lock_guard lock(m_);
         auto& slot = map_[key];

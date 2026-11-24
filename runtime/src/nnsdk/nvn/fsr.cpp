@@ -6,7 +6,6 @@
 #include <cstring>
 
 #include "nnsdk/nvn/flags.h"
-#include "nnsdk/nvn/commands.h"
 #include "nnsdk/nvn/nvn.h"
 #include "nnsdk/nvn/shaders/spirv.h"
 
@@ -28,17 +27,6 @@ uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags props) {
 
 class Fsr {
 public:
-    void release_if_resized(VkExtent2D out) {
-        if (!mid_.image || (extent_.width == out.width && extent_.height == out.height)) return;
-        // Called between pictures, before either producer records. Retire the shared working
-        // images only when the actual output rectangle changes.
-        VkContext* c = vk();
-        std::lock_guard lock(vk_queue_mutex());
-        if (vkQueueWaitIdle(c->queue) != VK_SUCCESS) { fail("vkQueueWaitIdle"); return; }
-        release(mid_);
-        release(out_);
-        extent_ = {};
-    }
     bool record(VkCommandBuffer cmd, VkImageView src, VkExtent2D in, VkExtent2D viewport, VkImage dst, VkFormat format,
                 VkExtent2D out, VkOffset2D at) {
         if (failed_ || !src || format != VK_FORMAT_R8G8B8A8_UNORM || NVN_FLAG("no_fsr")) return false;
@@ -88,13 +76,6 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
     };
-    static void release(Image& img) {
-        const auto device = vk()->device;
-        vkDestroyImageView(device, img.view, nullptr);
-        vkDestroyImage(device, img.image, nullptr);
-        vkFreeMemory(device, img.memory, nullptr);
-        img = {};
-    }
     struct Pass {
         VkPipeline pipeline = VK_NULL_HANDLE;
     };
@@ -190,15 +171,13 @@ private:
         return vkCreateImageView(c->device, &vi, nullptr, &img.view) == VK_SUCCESS;
     }
 
+    // Las dos imágenes intermedias, del tamaño de la pantalla (se crean una vez: el swapchain no cambia de tamaño).
     bool images(VkExtent2D out) {
         if (mid_.image && extent_.width == out.width && extent_.height == out.height) return true;
-        if (mid_.image) return false;
+        if (mid_.image) return fail("el swapchain cambió de tamaño");
         if (!image(mid_, out, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) ||
-            !image(out_, out, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
-            release(mid_);
-            release(out_);
+            !image(out_, out, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return fail("no se crearon sus imágenes");
-        }
         extent_ = out;
         pending_layout_ = true;
         return true;
@@ -210,7 +189,7 @@ private:
             pending_layout_ = false;
             VkImageMemoryBarrier b[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
             for (int k = 0; k < 2; k++) {
-                b[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                b[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
                 b[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
                 b[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
                 b[k].srcQueueFamilyIndex = b[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -249,8 +228,6 @@ private:
 Fsr g_fsr;
 
 }  // namespace
-
-void release_if_resized(VkExtent2D output) { g_fsr.release_if_resized(output); }
 
 bool record(VkCommandBuffer cmd, VkImageView src, VkExtent2D src_extent, VkExtent2D viewport, VkImage dst,
             VkFormat dst_format, VkExtent2D dst_extent, VkOffset2D dst_offset) {

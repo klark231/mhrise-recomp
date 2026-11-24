@@ -159,47 +159,6 @@ void copy_box(const LevelLayout& level, uint32_t bpb, const BlockBox& box, uint8
 
 }  // namespace
 
-bool mapped_boxes(const TextureLayout& layout, const LevelLayout& level, size_t first, size_t last,
-                  std::vector<BlockBox>& boxes) {
-    const uint32_t bpb = layout.bytes_per_block;
-    const uint32_t width = level.width_blocks * bpb;
-    const Swizzle swizzle(level, bpb);
-    for (uint32_t z = 0; z < level.depth; ++z) {
-        for (uint32_t y = 0; y < level.height_blocks; ++y) {
-            // Addresses increase from left to right even when consecutive sectors are separated by other rows.
-            const size_t row = layout.linear ? size_t{y} * layout.stride : swizzle.row(y, z);
-            auto offset = [&](uint32_t x) {
-                return row + (layout.linear ? x : swizzle.column(x & ~15u) + x % 16);
-            };
-            if (row >= last || offset(width - 1) < first) continue;
-            auto boundary = [&](size_t address) {
-                if (address <= row) return 0u;
-                if (address > offset(width - 1)) return width;
-                uint32_t lo = 0, hi = width;
-                while (lo < hi) {
-                    const uint32_t mid = lo + (hi - lo) / 2;
-                    if (offset(mid) < address) lo = mid + 1;
-                    else hi = mid;
-                }
-                return lo;
-            };
-            const uint32_t x0 = boundary(first), x1 = boundary(last);
-            if (x0 == x1) continue;
-            if (x0 % bpb || x1 % bpb) return false;
-            const uint32_t x = x0 / bpb, n = (x1 - x0) / bpb;
-            if (!boxes.empty()) {
-                auto& prev = boxes.back();
-                if (prev.x == x && prev.width == n && prev.z == z && prev.y + prev.height == y) {
-                    ++prev.height;
-                    continue;
-                }
-            }
-            boxes.push_back({x, y, z, n, 1, 1});
-        }
-    }
-    return true;
-}
-
 namespace {
 // 16 bytes con dos cargas de 8 (ldp/stp, sin llamar a memcpy); true si eran todo ceros.
 inline bool copy16(uint8_t* dst, const uint8_t* src) {
@@ -274,34 +233,6 @@ void deswizzle_level_v1(const LevelLayout& level, uint32_t bpb, const uint8_t* s
 
 void swizzle_region(const LevelLayout& level, uint32_t bpb, const BlockBox& box, const uint8_t* src, size_t row_pitch,
                     size_t slice_pitch, uint8_t* tiled) {
-    const uint32_t left = box.x * bpb, width = box.width * bpb;
-    if (left % kGobWidth == 0 && width % kGobWidth == 0 &&
-        box.y % kGobHeight == 0 && box.height % kGobHeight == 0) {
-        const Swizzle s(level, bpb);
-        for (uint32_t z = 0; z < box.depth; ++z) {
-            for (uint32_t y = 0; y < box.height; y += kGobHeight) {
-                const uint8_t* rows = src + z * slice_pitch + y * row_pitch;
-                uint8_t* gob = tiled + s.row(box.y + y, box.z + z) + s.column(left);
-                for (uint32_t x = 0; x < width; x += kGobWidth, gob += s.block_size) {
-                    // Fill a complete 512-byte GOB while its destination cache lines are hot.
-                    for (uint32_t pair = 0; pair < kGobHeight / 2; ++pair) {
-                        const uint8_t* a = rows + x + (2 * pair) * row_pitch;
-                        const uint8_t* b = a + row_pitch;
-                        uint8_t* out = gob + pair * 64;
-                        std::memcpy(out,       a,      16);
-                        std::memcpy(out + 16,  b,      16);
-                        std::memcpy(out + 32,  a + 16, 16);
-                        std::memcpy(out + 48,  b + 16, 16);
-                        std::memcpy(out + 256, a + 32, 16);
-                        std::memcpy(out + 272, b + 32, 16);
-                        std::memcpy(out + 288, a + 48, 16);
-                        std::memcpy(out + 304, b + 48, 16);
-                    }
-                }
-            }
-        }
-        return;
-    }
     copy_box<true>(level, bpb, box, tiled, const_cast<uint8_t*>(src), row_pitch, slice_pitch);
 }
 

@@ -13,7 +13,6 @@
 namespace nvn {
 
 struct Texture;
-template<class T> class ResourceRef;
 struct Window;
 
 namespace lsfg {
@@ -33,7 +32,7 @@ int64_t reserved_ns();
 int64_t spacing_ns();
 // Devuelve cuándo presentó el generado (steady_clock en ns, CLOCK_MONOTONIC), o 0 si no hubo; en *id, su presentID
 // de VK_GOOGLE_display_timing (impar).
-int64_t present_generated(Window& w, ResourceRef<Texture> t, uint32_t* id = nullptr);
+int64_t present_generated(Window& w, Texture* t, uint32_t* id = nullptr);
 
 }  // namespace lsfg
 }  // namespace nvn

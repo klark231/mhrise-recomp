@@ -1,8 +1,10 @@
 #include "nnsdk/nvn/formats.h"
 
-#include "nnsdk/nvn/nvn.h"
-
 #include <atomic>
+#include <string_view>
+
+#include "nnsdk/nvn/nvn.h"
+#include "nnsdk/nvn/vk.h"
 
 namespace nvn {
 
@@ -12,52 +14,52 @@ constexpr FormatInfo kFormats[] = {
     /* 0x00 */ {VK_FORMAT_UNDEFINED, 0, 1, "NONE"},
     /* 0x01 */ {VK_FORMAT_R8_UNORM, 1, 1, "R8"},
     /* 0x02 */ {VK_FORMAT_R8_SNORM, 1, 1, "R8SN"},
-    /* 0x03 */ {VK_FORMAT_R8_UINT, 1, 1, "R8UI", 0, VertexFetch::Unsigned},
-    /* 0x04 */ {VK_FORMAT_R8_SINT, 1, 1, "R8I", 0, VertexFetch::Signed},
+    /* 0x03 */ {VK_FORMAT_R8_UINT, 1, 1, "R8UI"},
+    /* 0x04 */ {VK_FORMAT_R8_SINT, 1, 1, "R8I"},
     /* 0x05 */ {VK_FORMAT_R16_SFLOAT, 2, 1, "R16F"},
     /* 0x06 */ {VK_FORMAT_R16_UNORM, 2, 1, "R16"},
     /* 0x07 */ {VK_FORMAT_R16_SNORM, 2, 1, "R16SN"},
-    /* 0x08 */ {VK_FORMAT_R16_UINT, 2, 1, "R16UI", 0, VertexFetch::Unsigned},
-    /* 0x09 */ {VK_FORMAT_R16_SINT, 2, 1, "R16I", 0, VertexFetch::Signed},
+    /* 0x08 */ {VK_FORMAT_R16_UINT, 2, 1, "R16UI"},
+    /* 0x09 */ {VK_FORMAT_R16_SINT, 2, 1, "R16I"},
     /* 0x0a */ {VK_FORMAT_R32_SFLOAT, 4, 1, "R32F"},
-    /* 0x0b */ {VK_FORMAT_R32_UINT, 4, 1, "R32UI", 0, VertexFetch::Unsigned},
-    /* 0x0c */ {VK_FORMAT_R32_SINT, 4, 1, "R32I", 0, VertexFetch::Signed},
+    /* 0x0b */ {VK_FORMAT_R32_UINT, 4, 1, "R32UI"},
+    /* 0x0c */ {VK_FORMAT_R32_SINT, 4, 1, "R32I"},
     /* 0x0d */ {VK_FORMAT_R8G8_UNORM, 2, 1, "RG8"},
     /* 0x0e */ {VK_FORMAT_R8G8_SNORM, 2, 1, "RG8SN"},
-    /* 0x0f */ {VK_FORMAT_R8G8_UINT, 2, 1, "RG8UI", 0, VertexFetch::Unsigned},
-    /* 0x10 */ {VK_FORMAT_R8G8_SINT, 2, 1, "RG8I", 0, VertexFetch::Signed},
+    /* 0x0f */ {VK_FORMAT_R8G8_UINT, 2, 1, "RG8UI"},
+    /* 0x10 */ {VK_FORMAT_R8G8_SINT, 2, 1, "RG8I"},
     /* 0x11 */ {VK_FORMAT_R16G16_SFLOAT, 4, 1, "RG16F"},
     /* 0x12 */ {VK_FORMAT_R16G16_UNORM, 4, 1, "RG16"},
     /* 0x13 */ {VK_FORMAT_R16G16_SNORM, 4, 1, "RG16SN"},
-    /* 0x14 */ {VK_FORMAT_R16G16_UINT, 4, 1, "RG16UI", 0, VertexFetch::Unsigned},
-    /* 0x15 */ {VK_FORMAT_R16G16_SINT, 4, 1, "RG16I", 0, VertexFetch::Signed},
+    /* 0x14 */ {VK_FORMAT_R16G16_UINT, 4, 1, "RG16UI"},
+    /* 0x15 */ {VK_FORMAT_R16G16_SINT, 4, 1, "RG16I"},
     /* 0x16 */ {VK_FORMAT_R32G32_SFLOAT, 8, 1, "RG32F"},
-    /* 0x17 */ {VK_FORMAT_R32G32_UINT, 8, 1, "RG32UI", 0, VertexFetch::Unsigned},
-    /* 0x18 */ {VK_FORMAT_R32G32_SINT, 8, 1, "RG32I", 0, VertexFetch::Signed},
+    /* 0x17 */ {VK_FORMAT_R32G32_UINT, 8, 1, "RG32UI"},
+    /* 0x18 */ {VK_FORMAT_R32G32_SINT, 8, 1, "RG32I"},
     /* 0x19 */ {VK_FORMAT_R8G8B8_UNORM, 3, 1, "RGB8"},
     /* 0x1a */ {VK_FORMAT_R8G8B8_SNORM, 3, 1, "RGB8SN"},
-    /* 0x1b */ {VK_FORMAT_R8G8B8_UINT, 3, 1, "RGB8UI", 0, VertexFetch::Unsigned},
-    /* 0x1c */ {VK_FORMAT_R8G8B8_SINT, 3, 1, "RGB8I", 0, VertexFetch::Signed},
+    /* 0x1b */ {VK_FORMAT_R8G8B8_UINT, 3, 1, "RGB8UI"},
+    /* 0x1c */ {VK_FORMAT_R8G8B8_SINT, 3, 1, "RGB8I"},
     /* 0x1d */ {VK_FORMAT_R16G16B16_SFLOAT, 6, 1, "RGB16F"},
     /* 0x1e */ {VK_FORMAT_R16G16B16_UNORM, 6, 1, "RGB16"},
     /* 0x1f */ {VK_FORMAT_R16G16B16_SNORM, 6, 1, "RGB16SN"},
-    /* 0x20 */ {VK_FORMAT_R16G16B16_UINT, 6, 1, "RGB16UI", 0, VertexFetch::Unsigned},
-    /* 0x21 */ {VK_FORMAT_R16G16B16_SINT, 6, 1, "RGB16I", 0, VertexFetch::Signed},
+    /* 0x20 */ {VK_FORMAT_R16G16B16_UINT, 6, 1, "RGB16UI"},
+    /* 0x21 */ {VK_FORMAT_R16G16B16_SINT, 6, 1, "RGB16I"},
     /* 0x22 */ {VK_FORMAT_R32G32B32_SFLOAT, 12, 1, "RGB32F"},
-    /* 0x23 */ {VK_FORMAT_R32G32B32_UINT, 12, 1, "RGB32UI", 0, VertexFetch::Unsigned},
-    /* 0x24 */ {VK_FORMAT_R32G32B32_SINT, 12, 1, "RGB32I", 0, VertexFetch::Signed},
+    /* 0x23 */ {VK_FORMAT_R32G32B32_UINT, 12, 1, "RGB32UI"},
+    /* 0x24 */ {VK_FORMAT_R32G32B32_SINT, 12, 1, "RGB32I"},
     /* 0x25 */ {VK_FORMAT_R8G8B8A8_UNORM, 4, 1, "RGBA8"},
     /* 0x26 */ {VK_FORMAT_R8G8B8A8_SNORM, 4, 1, "RGBA8SN"},
-    /* 0x27 */ {VK_FORMAT_R8G8B8A8_UINT, 4, 1, "RGBA8UI", 0, VertexFetch::Unsigned},
-    /* 0x28 */ {VK_FORMAT_R8G8B8A8_SINT, 4, 1, "RGBA8I", 0, VertexFetch::Signed},
+    /* 0x27 */ {VK_FORMAT_R8G8B8A8_UINT, 4, 1, "RGBA8UI"},
+    /* 0x28 */ {VK_FORMAT_R8G8B8A8_SINT, 4, 1, "RGBA8I"},
     /* 0x29 */ {VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, "RGBA16F"},
     /* 0x2a */ {VK_FORMAT_R16G16B16A16_UNORM, 8, 1, "RGBA16"},
     /* 0x2b */ {VK_FORMAT_R16G16B16A16_SNORM, 8, 1, "RGBA16SN"},
-    /* 0x2c */ {VK_FORMAT_R16G16B16A16_UINT, 8, 1, "RGBA16UI", 0, VertexFetch::Unsigned},
-    /* 0x2d */ {VK_FORMAT_R16G16B16A16_SINT, 8, 1, "RGBA16I", 0, VertexFetch::Signed},
+    /* 0x2c */ {VK_FORMAT_R16G16B16A16_UINT, 8, 1, "RGBA16UI"},
+    /* 0x2d */ {VK_FORMAT_R16G16B16A16_SINT, 8, 1, "RGBA16I"},
     /* 0x2e */ {VK_FORMAT_R32G32B32A32_SFLOAT, 16, 1, "RGBA32F"},
-    /* 0x2f */ {VK_FORMAT_R32G32B32A32_UINT, 16, 1, "RGBA32UI", 0, VertexFetch::Unsigned},
-    /* 0x30 */ {VK_FORMAT_R32G32B32A32_SINT, 16, 1, "RGBA32I", 0, VertexFetch::Signed},
+    /* 0x2f */ {VK_FORMAT_R32G32B32A32_UINT, 16, 1, "RGBA32UI"},
+    /* 0x30 */ {VK_FORMAT_R32G32B32A32_SINT, 16, 1, "RGBA32I"},
     /* 0x31 */ {VK_FORMAT_S8_UINT, 1, 1, "STENCIL8"},
     /* 0x32 */ {VK_FORMAT_D16_UNORM, 2, 1, "DEPTH16"},
     /* 0x33 */ {VK_FORMAT_X8_D24_UNORM_PACK32, 4, 1, "DEPTH24"},
@@ -71,7 +73,7 @@ constexpr FormatInfo kFormats[] = {
     /* 0x3b */ {VK_FORMAT_R5G5B5A1_UNORM_PACK16, 2, 1, "RGB5A1"},
     /* 0x3c */ {VK_FORMAT_R5G6B5_UNORM_PACK16, 2, 1, "RGB565"},
     /* 0x3d */ {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, 1, "RGB10A2"},
-    /* 0x3e */ {VK_FORMAT_A2B10G10R10_UINT_PACK32, 4, 1, "RGB10A2UI", 0, VertexFetch::Unsigned},
+    /* 0x3e */ {VK_FORMAT_A2B10G10R10_UINT_PACK32, 4, 1, "RGB10A2UI"},
     /* 0x3f */ {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 1, "R11G11B10F"},
     /* 0x40 */ {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 4, 1, "RGB9E5F"},
     /* 0x41 */ {VK_FORMAT_BC1_RGB_UNORM_BLOCK, 8, 4, "RGB_DXT1"},
@@ -97,42 +99,42 @@ constexpr FormatInfo kFormats[] = {
     /* 0x52 */ {VK_FORMAT_R8_SSCALED, 1, 1, "R8_I2F"},
     /* 0x53 */ {VK_FORMAT_R16_USCALED, 2, 1, "R16_UI2F"},
     /* 0x54 */ {VK_FORMAT_R16_SSCALED, 2, 1, "R16_I2F"},
-    /* 0x55 */ {VK_FORMAT_R32_UINT, 4, 1, "R32_UI2F", 0, VertexFetch::UnsignedScaled},
-    /* 0x56 */ {VK_FORMAT_R32_SINT, 4, 1, "R32_I2F", 0, VertexFetch::SignedScaled},
+    /* 0x55 */ {VK_FORMAT_R32_UINT, 4, 1, "R32_UI2F"},
+    /* 0x56 */ {VK_FORMAT_R32_SINT, 4, 1, "R32_I2F"},
     /* 0x57 */ {VK_FORMAT_R8G8_USCALED, 2, 1, "RG8_UI2F"},
     /* 0x58 */ {VK_FORMAT_R8G8_SSCALED, 2, 1, "RG8_I2F"},
     /* 0x59 */ {VK_FORMAT_R16G16_USCALED, 4, 1, "RG16_UI2F"},
     /* 0x5a */ {VK_FORMAT_R16G16_SSCALED, 4, 1, "RG16_I2F"},
-    /* 0x5b */ {VK_FORMAT_R32G32_UINT, 8, 1, "RG32_UI2F", 0, VertexFetch::UnsignedScaled},
-    /* 0x5c */ {VK_FORMAT_R32G32_SINT, 8, 1, "RG32_I2F", 0, VertexFetch::SignedScaled},
+    /* 0x5b */ {VK_FORMAT_R32G32_UINT, 8, 1, "RG32_UI2F"},
+    /* 0x5c */ {VK_FORMAT_R32G32_SINT, 8, 1, "RG32_I2F"},
     /* 0x5d */ {VK_FORMAT_R8G8B8_USCALED, 3, 1, "RGB8_UI2F"},
     /* 0x5e */ {VK_FORMAT_R8G8B8_SSCALED, 3, 1, "RGB8_I2F"},
     /* 0x5f */ {VK_FORMAT_R16G16B16_USCALED, 6, 1, "RGB16_UI2F"},
     /* 0x60 */ {VK_FORMAT_R16G16B16_SSCALED, 6, 1, "RGB16_I2F"},
-    /* 0x61 */ {VK_FORMAT_R32G32B32_UINT, 12, 1, "RGB32_UI2F", 0, VertexFetch::UnsignedScaled},
-    /* 0x62 */ {VK_FORMAT_R32G32B32_SINT, 12, 1, "RGB32_I2F", 0, VertexFetch::SignedScaled},
+    /* 0x61 */ {VK_FORMAT_R32G32B32_UINT, 12, 1, "RGB32_UI2F"},
+    /* 0x62 */ {VK_FORMAT_R32G32B32_SINT, 12, 1, "RGB32_I2F"},
     /* 0x63 */ {VK_FORMAT_R8G8B8A8_USCALED, 4, 1, "RGBA8_UI2F"},
     /* 0x64 */ {VK_FORMAT_R8G8B8A8_SSCALED, 4, 1, "RGBA8_I2F"},
     /* 0x65 */ {VK_FORMAT_R16G16B16A16_USCALED, 8, 1, "RGBA16_UI2F"},
     /* 0x66 */ {VK_FORMAT_R16G16B16A16_SSCALED, 8, 1, "RGBA16_I2F"},
-    /* 0x67 */ {VK_FORMAT_R32G32B32A32_UINT, 16, 1, "RGBA32_UI2F", 0, VertexFetch::UnsignedScaled},
-    /* 0x68 */ {VK_FORMAT_R32G32B32A32_SINT, 16, 1, "RGBA32_I2F", 0, VertexFetch::SignedScaled},
+    /* 0x67 */ {VK_FORMAT_R32G32B32A32_UINT, 16, 1, "RGBA32_UI2F"},
+    /* 0x68 */ {VK_FORMAT_R32G32B32A32_SINT, 16, 1, "RGBA32_I2F"},
     /* 0x69 */ {VK_FORMAT_A2B10G10R10_SNORM_PACK32, 4, 1, "RGB10A2SN"},
-    /* 0x6a */ {VK_FORMAT_A2B10G10R10_SINT_PACK32, 4, 1, "RGB10A2I", 0, VertexFetch::Signed},
+    /* 0x6a */ {VK_FORMAT_A2B10G10R10_SINT_PACK32, 4, 1, "RGB10A2I"},
     /* 0x6b */ {VK_FORMAT_A2B10G10R10_USCALED_PACK32, 4, 1, "RGB10A2_UI2F"},
     /* 0x6c */ {VK_FORMAT_A2B10G10R10_SSCALED_PACK32, 4, 1, "RGB10A2_I2F"},
     /* 0x6d */ {VK_FORMAT_R8G8B8A8_UNORM, 4, 1, "RGBX8"},
     /* 0x6e */ {VK_FORMAT_R8G8B8A8_SNORM, 4, 1, "RGBX8SN"},
-    /* 0x6f */ {VK_FORMAT_R8G8B8A8_UINT, 4, 1, "RGBX8UI", 0, VertexFetch::Unsigned},
-    /* 0x70 */ {VK_FORMAT_R8G8B8A8_SINT, 4, 1, "RGBX8I", 0, VertexFetch::Signed},
+    /* 0x6f */ {VK_FORMAT_R8G8B8A8_UINT, 4, 1, "RGBX8UI"},
+    /* 0x70 */ {VK_FORMAT_R8G8B8A8_SINT, 4, 1, "RGBX8I"},
     /* 0x71 */ {VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, "RGBX16F"},
     /* 0x72 */ {VK_FORMAT_R16G16B16A16_UNORM, 8, 1, "RGBX16"},
     /* 0x73 */ {VK_FORMAT_R16G16B16A16_SNORM, 8, 1, "RGBX16SN"},
-    /* 0x74 */ {VK_FORMAT_R16G16B16A16_UINT, 8, 1, "RGBX16UI", 0, VertexFetch::Unsigned},
-    /* 0x75 */ {VK_FORMAT_R16G16B16A16_SINT, 8, 1, "RGBX16I", 0, VertexFetch::Signed},
+    /* 0x74 */ {VK_FORMAT_R16G16B16A16_UINT, 8, 1, "RGBX16UI"},
+    /* 0x75 */ {VK_FORMAT_R16G16B16A16_SINT, 8, 1, "RGBX16I"},
     /* 0x76 */ {VK_FORMAT_R32G32B32A32_SFLOAT, 16, 1, "RGBX32F"},
-    /* 0x77 */ {VK_FORMAT_R32G32B32A32_UINT, 16, 1, "RGBX32UI", 0, VertexFetch::Unsigned},
-    /* 0x78 */ {VK_FORMAT_R32G32B32A32_SINT, 16, 1, "RGBX32I", 0, VertexFetch::Signed},
+    /* 0x77 */ {VK_FORMAT_R32G32B32A32_UINT, 16, 1, "RGBX32UI"},
+    /* 0x78 */ {VK_FORMAT_R32G32B32A32_SINT, 16, 1, "RGBX32I"},
     /* 0x79 */ {VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 16, 4, "RGBA_ASTC_4x4"},
     /* 0x7a */ {VK_FORMAT_ASTC_5x4_UNORM_BLOCK, 16, 5, "RGBA_ASTC_5x4", 4},
     /* 0x7b */ {VK_FORMAT_ASTC_5x5_UNORM_BLOCK, 16, 5, "RGBA_ASTC_5x5"},
@@ -188,6 +190,21 @@ bool vertex_buffer_format(VkFormat f) {
     return p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
 }
 
+// How the vertex shader takes the format as it is: integers as integers, the 32-bit "_UI2F" / "_I2F" (Vulkan has no
+// scaled format for them, they go as UINT / SINT) as integers it converts to float, the rest float.
+uint8_t natural_fetch(const FormatInfo& f) {
+    if (!f.name) return 0;
+    const std::string_view name = f.name;
+    const bool vk_uint = f.vk == VK_FORMAT_R32_UINT || f.vk == VK_FORMAT_R32G32_UINT || f.vk == VK_FORMAT_R32G32B32_UINT ||
+                         f.vk == VK_FORMAT_R32G32B32A32_UINT;
+    const bool vk_sint = f.vk == VK_FORMAT_R32_SINT || f.vk == VK_FORMAT_R32G32_SINT || f.vk == VK_FORMAT_R32G32B32_SINT ||
+                         f.vk == VK_FORMAT_R32G32B32A32_SINT;
+    if (name.find("_UI2F") != name.npos) return vk_uint ? 4 : 0;
+    if (name.find("_I2F") != name.npos) return vk_sint ? 3 : 0;
+    if (name.size() > 2 && name.substr(name.size() - 2) == "UI") return 2;
+    return name.back() == 'I' ? 1 : 0;
+}
+
 // The same layout with a fourth component (Vulkan's order: R8G8B8 UNORM..SRGB, then R8G8B8A8 UNORM..SRGB; R16G16B16
 // UNORM..SFLOAT, then R16G16B16A16).
 VkFormat with_alpha(VkFormat f) {
@@ -204,12 +221,12 @@ VkFormat as_integers(VkFormat f, uint8_t& fetch) {
         case VK_FORMAT_R8_USCALED: case VK_FORMAT_R8G8_USCALED: case VK_FORMAT_R8G8B8_USCALED:
         case VK_FORMAT_R8G8B8A8_USCALED: case VK_FORMAT_A2B10G10R10_USCALED_PACK32: case VK_FORMAT_R16_USCALED:
         case VK_FORMAT_R16G16_USCALED: case VK_FORMAT_R16G16B16_USCALED: case VK_FORMAT_R16G16B16A16_USCALED:
-            fetch = uint8_t(VertexFetch::UnsignedScaled);
+            fetch = 4;
             return VkFormat(f + 2);
         case VK_FORMAT_R8_SSCALED: case VK_FORMAT_R8G8_SSCALED: case VK_FORMAT_R8G8B8_SSCALED:
         case VK_FORMAT_R8G8B8A8_SSCALED: case VK_FORMAT_A2B10G10R10_SSCALED_PACK32: case VK_FORMAT_R16_SSCALED:
         case VK_FORMAT_R16G16_SSCALED: case VK_FORMAT_R16G16B16_SSCALED: case VK_FORMAT_R16G16B16A16_SSCALED:
-            fetch = uint8_t(VertexFetch::SignedScaled);
+            fetch = 3;
             return VkFormat(f + 2);
         default: return VK_FORMAT_UNDEFINED;
     }
@@ -219,16 +236,18 @@ static_assert(VK_FORMAT_R16G16B16A16_UINT == VK_FORMAT_R16G16B16A16_USCALED + 2 
 
 VertexInput choose_vertex_input(uint8_t nvn_format) {
     const FormatInfo* info = format_info(nvn_format);
-    if (!info || info->vk == VK_FORMAT_UNDEFINED) return {VK_FORMAT_R32G32B32A32_SFLOAT, uint8_t(VertexFetch::Float)};
-    const VertexInput wanted{info->vk, uint8_t(info->fetch)};
+    if (!info || info->vk == VK_FORMAT_UNDEFINED) return {VK_FORMAT_R32G32B32A32_SFLOAT, 0, false};
+    const VertexInput wanted{info->vk, natural_fetch(*info), false};
     if (vertex_buffer_format(wanted.format)) return wanted;
     // Not every driver reads every format from a vertex buffer (the three-component 8- and 16-bit ones and the
     // scaled ones are optional in Vulkan), and one that doesn't can't be trusted to reject it: ARM's G57 driver
     // crashed compiling such a pipeline. Each fallback reads the same bytes.
     VertexInput integers = wanted;
     integers.format = as_integers(wanted.format, integers.fetch);
-    VertexInput tried[4] = {integers, {with_alpha(wanted.format), uint8_t(wanted.fetch | kFetchWIsOne)}};
-    tried[2] = {integers.format ? with_alpha(integers.format) : VK_FORMAT_UNDEFINED, uint8_t(integers.fetch | kFetchWIsOne)};
+    VertexInput tried[3] = {integers, {with_alpha(wanted.format), uint8_t(wanted.fetch | kFetchWIsOne), true},
+                            {integers.format ? with_alpha(integers.format) : VK_FORMAT_UNDEFINED,
+                             uint8_t(integers.fetch | kFetchWIsOne), true}};
+    tried[0].replaced = true;
     for (const VertexInput& v : tried) {
         if (v.format == VK_FORMAT_UNDEFINED || !vertex_buffer_format(v.format)) continue;
         NVN_LOG("vertex format %s: the driver doesn't read Vulkan format %d from vertex buffers, read as %d%s%s\n",
@@ -248,11 +267,10 @@ VertexInput vertex_input(uint8_t nvn_format) {
     uint32_t packed = known[nvn_format].load(std::memory_order_acquire);
     if (!packed) {
         const VertexInput v = choose_vertex_input(nvn_format);
-        packed = 1u << 31 | uint32_t(v.fetch) << 24 | uint32_t(v.format);
+        packed = 1u << 31 | uint32_t(v.replaced) << 30 | uint32_t(v.fetch) << 24 | uint32_t(v.format);
         known[nvn_format].store(packed, std::memory_order_release);
     }
-    return {VkFormat(packed & 0xffffff), uint8_t(packed >> 24 & 0x7f)};
+    return {VkFormat(packed & 0xffffff), uint8_t(packed >> 24 & 0x3f), bool(packed >> 30 & 1)};
 }
 
-VkFormat vertex_format(uint8_t nvn_format) { return vertex_input(nvn_format).format; }
 }  // namespace nvn

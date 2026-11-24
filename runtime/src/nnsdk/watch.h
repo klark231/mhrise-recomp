@@ -31,6 +31,10 @@ bool watchable(uintptr_t address, size_t size);
 // address, para copiarlas justo después.
 void collect(uintptr_t address, size_t size, std::vector<uint64_t>& keys, std::vector<std::pair<size_t, size_t>>* runs);
 
+// ¿Tiene memoria detrás todo [address, address + size)? Falso si alguna página es un hueco de un pool virtual (lo que
+// MapVirtual dejó sin mapear: se lee como ceros). Lo que no es de un pool virtual, siempre.
+bool fully_mapped(uintptr_t address, size_t size);
+
 // Perfil: escrituras vigiladas que saltaron, tramos cerrados (llamadas a mprotect) y el tiempo en ellas.
 uint64_t faults();
 uint64_t protects();

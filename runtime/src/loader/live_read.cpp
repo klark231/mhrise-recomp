@@ -321,6 +321,35 @@ void read_box(lua_State *L, ReadFrame &f, uintptr_t value, uint32_t expected) {
   }
   read_scalar(L, kind, boxed_payload(f, value, actual));
 }
+// Of the overloads named so with as many parameters as there are arguments, the one the arguments fit best: a
+// string for System.String, a number for the numeric types, a boolean for System.Boolean, nil for anything that can
+// be null; the first declared on a tie
+uint32_t pick_overload(lua_State *L, ReadFrame &f, uint32_t type, std::string_view name, int arg) {
+  const int count = lua_gettop(L) - arg + 1;
+  uint32_t best = 0;
+  int best_score = -1;
+  for (uint32_t k : f.db.overloads(type, name, count)) {
+    auto sig = f.db.signature_offset(k);
+    int score = 0;
+    for (int i = 0; i < count; ++i) {
+      const std::string p = f.db.full_name(f.db.parameter_type(sig, i + 1));
+      const bool numeric = p == "System.Int32" || p == "System.UInt32" || p == "System.Int64" || p == "System.UInt64" ||
+                           p == "System.Int16" || p == "System.UInt16" || p == "System.Byte" || p == "System.SByte" ||
+                           p == "System.Single" || p == "System.Double";
+      switch (lua_type(L, arg + i)) {
+        case LUA_TSTRING: score += p == "System.String" ? 2 : 0; break;
+        case LUA_TNUMBER: score += numeric ? 2 : p == "System.String" ? -4 : 0; break;
+        case LUA_TBOOLEAN: score += p == "System.Boolean" ? 2 : 0; break;
+        case LUA_TNIL: score += numeric || p == "System.Boolean" ? -1 : 1; break;
+        default: break;
+      }
+    }
+    if (score > best_score) best = k, best_score = score;
+  }
+  if (!best) throw std::runtime_error("Unknown method: " + f.db.full_name(type) + "." + std::string(name));
+  return best;
+}
+
 uintptr_t engine_context(ReadFrame &f) {
   auto ctx = f.persistent ? current_vm_context(f.main) : f.context;
   if (!ctx)
@@ -880,8 +909,15 @@ int invoke(lua_State *L) {
       return get_field(L, f, obj, luaL_checkstring(L, arg));
     if (name == "set_field")
       return get_field(L, f, obj, luaL_checkstring(L, arg), arg + 1);
-    auto method = f.db.lookup_method(obj.type, std::string(name),
-                                     lua_gettop(L) - arg + 1);
+    uint32_t method = 0;
+    try {
+      method = f.db.lookup_method(obj.type, std::string(name), lua_gettop(L) - arg + 1);
+    } catch (const std::runtime_error &) {
+      // Several overloads with this many parameters (BehaviorTree.setCurrentNode takes a node's hash or its name):
+      // the one whose parameters fit the arguments, as a PC mod means it; on a tie the first declared, which is
+      // what REFramework's call gets by name
+      method = pick_overload(L, f, obj.type, name, arg);
+    }
     if (method)
       return managed_call(L, f, method, obj.address, arg);
     // PC scripts also access an existing instance field as

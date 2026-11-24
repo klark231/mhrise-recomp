@@ -55,12 +55,7 @@ size_t count_zero_chunks(const uint8_t* p, size_t size);
 // Una caja de un nivel, en bloques del formato (texels si no está comprimido).
 struct BlockBox {
     uint32_t x, y, z, width, height, depth;
-    bool operator==(const BlockBox&) const = default;
 };
-// Blocks backed by a level-relative guest byte interval. Padding has no image coordinates.
-// Returns false if a mapping boundary splits a format block.
-bool mapped_boxes(const TextureLayout& layout, const LevelLayout& level, size_t first, size_t last,
-                  std::vector<BlockBox>& boxes);
 // nvnTextureWriteTexels / ReadTexels: la caja entre memoria lineal (filas de row_pitch bytes, cortes de slice_pitch) y
 // el nivel en block-linear (tiled apunta al inicio del nivel). Una es la inversa exacta de la otra y usan las mismas
 // direcciones que deswizzle_level.

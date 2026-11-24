@@ -10,9 +10,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cstring>
-#include <vector>
 
 #include "nnsdk/watch.h"
 #include "nnsdk/nvn/commands.h"
@@ -66,48 +64,6 @@ bool map_zeros(void* p, size_t size) {
 
 nvn::Objects<nvn::MemoryPool> nvn::g_memory_pools;
 
-bool nvn::MemoryPool::covers(size_t offset, size_t bytes) const {
-    if (offset > size || bytes > size - offset) return false;
-    if (!reserved || !bytes) return true;
-    const size_t first = offset / page_size(), stop = (offset + bytes - 1) / page_size() + 1;
-    std::lock_guard lock(mapping_mutex);
-    return std::find(backed_pages.begin() + first, backed_pages.begin() + stop, false) == backed_pages.begin() + stop;
-}
-
-bool nvn::MemoryPool::has_cpu_backing(size_t offset, size_t bytes) const {
-    if (!bytes || offset >= size) return false;
-    const size_t end = offset + std::min(bytes, size - offset);
-    std::lock_guard lock(mapping_mutex);
-    const auto stop = cpu_readable_pages.begin() + (end - 1) / page_size() + 1;
-    return std::find(cpu_readable_pages.begin() + offset / page_size(), stop, true) != stop;
-}
-
-void nvn::MemoryPool::register_buffer(size_t offset, size_t length) {
-    std::lock_guard lock(mapping_mutex);
-    buffer_ranges.emplace(offset, length);
-    max_buffer_size = std::max(max_buffer_size, length);
-    buffer_epoch.fetch_add(1, std::memory_order_release);
-}
-
-void nvn::MemoryPool::unregister_buffer(size_t offset, size_t length) {
-    std::lock_guard lock(mapping_mutex);
-    auto [first, last] = buffer_ranges.equal_range(offset);
-    for (; first != last; ++first) {
-        if (first->second != length) continue;
-        buffer_ranges.erase(first);
-        buffer_epoch.fetch_add(1, std::memory_order_release);
-        break;
-    }
-}
-
-bool nvn::MemoryPool::overlaps_buffer(size_t offset, size_t length) const {
-    std::lock_guard lock(mapping_mutex);
-    auto it = buffer_ranges.lower_bound(offset - std::min(offset, max_buffer_size));
-    for (; it != buffer_ranges.end() && it->first < offset + length; ++it)
-        if (it->first + it->second > offset) return true;
-    return false;
-}
-
 extern "C" {
 
 void nvnMemoryPoolBuilderSetDefaults(MemoryPoolBuilder* b) { memset(b, 0, sizeof *b); }
@@ -148,18 +104,12 @@ nvn::Boolean nvnMemoryPoolInitialize(void* pool, const MemoryPoolBuilder* b) {
     p.size = b->size;
     p.flags = b->flags;
     p.reserved = reserved;
-    if (reserved) {
-        p.backed_pages.resize((p.size - 1) / page_size() + 1);
-        p.cpu_readable_pages.resize(p.backed_pages.size());
-    }
     return 1;
 }
 void nvnMemoryPoolFinalize(void* pool) {
-    if (auto* current = nvn::g_memory_pools.get(pool); current && current->reserved) {
-        nvn::wait_idle();
-        if (!nvn::publish_virtual_pool(pool)) return;
-    }
     if (std::unique_ptr<nvn::MemoryPool> p = nvn::g_memory_pools.take(pool); p && p->reserved) {
+        // Lo que ya está grabado puede seguir leyendo de sus direcciones (subidas de texturas): primero que acabe.
+        nvn::wait_idle();
         munmap(p->storage, (p->size + page_size() - 1) & ~(page_size() - 1));
     }
 }
@@ -175,16 +125,6 @@ nvn::Boolean nvnMemoryPoolMapVirtual(void* pool, int count, const MappingRequest
     }
     static int logged = 0, failed = 0;
     bool ok = true;
-    std::vector<std::pair<size_t, size_t>> changed;
-    // A new virtual address can import a physical page last written through a different pool.
-    if (count && !nvn::publish_virtual_pool(nullptr)) return 0;
-    // Publish the new pages and their notifications together with respect to GPU-to-guest readback.
-    std::unique_lock mapping(v->mapping_mutex);
-    while (v->gpu_dirty) {
-        mapping.unlock();
-        if (!nvn::publish_virtual_pool(pool)) return 0;
-        mapping.lock();
-    }
     for (int k = 0; k < count; k++) {
         const MappingRequest& r = requests[k];
         if (r.virtual_offset < 0 || r.size > v->size || static_cast<uint64_t>(r.virtual_offset) > v->size - r.size) {
@@ -202,25 +142,13 @@ nvn::Boolean nvnMemoryPoolMapVirtual(void* pool, int count, const MappingRequest
                    static_cast<uint64_t>(r.physical_offset) <= phys->size - r.size) {
             mapped = nnsdk::alias_heap_pages(dst, phys->storage + r.physical_offset, r.size);
         }
-        bool replaced = mapped;
         if (!mapped) {
-            replaced = map_zeros(dst, r.size);
+            map_zeros(dst, r.size);
             if (r.physical_pool && failed++ < 16)
                 NVN_LOG("MapVirtual: no se puede ver %p+0x%llx (pool %s) en +0x%llx (%llu KB): se queda a cero\n",
                         phys ? static_cast<void*>(phys->storage) : nullptr, static_cast<unsigned long long>(r.physical_offset),
                         phys ? "fuera del heap o sin alinear" : "desconocido", static_cast<unsigned long long>(r.virtual_offset),
                         static_cast<unsigned long long>(r.size >> 10));
-        }
-        if (replaced && r.size) {
-            const size_t begin = r.virtual_offset, end = begin + r.size;
-            std::fill(v->backed_pages.begin() + begin / page_size(), v->backed_pages.begin() + (end - 1) / page_size() + 1,
-                      mapped && r.physical_pool);
-            std::fill(v->cpu_readable_pages.begin() + begin / page_size(), v->cpu_readable_pages.begin() + (end - 1) / page_size() + 1,
-                      mapped && phys && !(phys->flags & nvn::kPoolFlagCpuNoAccess) && r.storage_class != nvn::kStorageClassNativeImage);
-            if (!changed.empty() && changed.back().second == begin)
-                changed.back().second = end;
-            else
-                changed.emplace_back(begin, end);
         }
         if (logged < 24) {  // DEPURACIÓN: las primeras (las del arranque: 6, 8 y 1 peticiones)
             logged++;
@@ -230,19 +158,6 @@ nvn::Boolean nvnMemoryPoolMapVirtual(void* pool, int count, const MappingRequest
                     r.storage_class, mapped ? "" : " FALLO");
         }
     }
-    if (!changed.empty()) {
-        nvn::g_textures.for_each([&](nvn::Texture& t) {
-            if (t.desc.pool != pool || t.desc.offset < 0) return;
-            const size_t start = t.desc.offset;
-            if (start >= v->size) return;
-            const size_t end = start + std::min(t.layout.total_size(), v->size - start);
-            if (start == end) return;
-            for (auto [first, last] : changed) {
-                if (first >= end || start >= last) continue;
-                t.note_mapping_change(std::max(first, start) - start, std::min(last, end) - start);
-            }
-        });
-    }
     return ok ? 1 : 0;
 }
 
@@ -250,14 +165,9 @@ void nvnMemoryPoolSetDebugLabel(void*, const char*) {}
 
 void* nvnMemoryPoolMap(const void* pool) {
     nvn::MemoryPool* p = nvn::g_memory_pools.get(pool);
-    if (p && p->reserved) __atomic_store_n(&p->mapped_by_cpu, true, __ATOMIC_RELEASE);
-    if (p && (p->reserved || (p->flags & nvn::kPoolFlagPhysical)) && !nvn::publish_virtual_pool(nullptr)) return nullptr;
     return p ? p->storage : nullptr;
 }
-uint64_t nvnMemoryPoolGetBufferAddress(const void* pool) {
-    const auto* p = nvn::g_memory_pools.get(pool);
-    return p ? reinterpret_cast<uintptr_t>(p->storage) : 0;
-}
+uint64_t nvnMemoryPoolGetBufferAddress(const void* pool) { return reinterpret_cast<uint64_t>(nvnMemoryPoolMap(pool)); }
 size_t nvnMemoryPoolGetSize(const void* pool) {
     nvn::MemoryPool* p = nvn::g_memory_pools.get(pool);
     return p ? p->size : 0;
@@ -268,10 +178,7 @@ int nvnMemoryPoolGetFlags(const void* pool) {
 }
 // La GPU lee la memoria del juego al ejecutar los comandos: no hay cachés que sincronizar.
 void nvnMemoryPoolFlushMappedRange(const void*, int64_t, size_t) {}
-void nvnMemoryPoolInvalidateMappedRange(const void* pool, int64_t, size_t size) {
-    const auto* p = nvn::g_memory_pools.get(pool);
-    if (size && p && (p->reserved || (p->flags & nvn::kPoolFlagPhysical))) nvn::publish_virtual_pool(nullptr);
-}
+void nvnMemoryPoolInvalidateMappedRange(const void*, int64_t, size_t) {}
 
 }  // extern "C"
 

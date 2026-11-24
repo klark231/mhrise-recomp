@@ -28,11 +28,13 @@ constexpr uint32_t kDelta[10] = {280, 286, 287, 288, 289, 281, 294, 295, 296, 29
 constexpr uint32_t kOffsetFp16 = 49, kOffsetFp32 = 98;
 }  // namespace shader
 
-enum class DllStatus { Ok, NotFound, Unreadable, NotPortableExecutable, MissingShaders };
+// DirectXOnly: Lossless Scaling's usual Lossless.dll, with its shaders only as Direct3D bytecode (DXBC, ids 101..302).
+// The Vulkan ones (SPIR-V, the same ids + 49 for FP16 and + 98 for FP32) come in the DLL of its "lsfg-vk" beta branch.
+enum class DllStatus { Ok, NotFound, Unreadable, NotPortableExecutable, MissingShaders, DirectXOnly };
 const char* dll_status_name(DllStatus s);
 
 // Where the DLL is: the app's own copy (<interno>/Lossless.dll, imported from the GPU driver screen), then
-// <NIER_DATA>/lsfg/Lossless.dll, then /storage/emulated/0/Download/Lossless.dll; "" if none can be read.
+// <NIER_DATA>/lsfg/Lossless.dll, then Lossless.dll or lsfg-vk.dll in /storage/emulated/0/Download; "" if none can be read.
 std::string find_dll();
 
 // id de rendimiento (255, 256, 280..302) -> SPIR-V con los bindings renumerados 0..N-1 en orden (set, binding),

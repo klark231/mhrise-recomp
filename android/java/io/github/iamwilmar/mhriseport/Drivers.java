@@ -161,10 +161,13 @@ final class Drivers {
     }
 
     // The picked file as files/Lossless.dll, after checking it's a Windows DLL (starts with "MZ"). Frame generation is
-    // turned on with it. Returns its size, for the message.
+    // turned on with it. Returns its size for the message, with a warning when it has no Vulkan shaders.
     static String importDll(Context c, Uri uri, File gameFolder) throws IOException {
         File tmp = new File(c.getFilesDir(), "Lossless.dll.new");
         long total = 0;
+        // The Vulkan shaders (SPIR-V, which starts 03 02 23 07) are only in the DLL of Lossless Scaling's lsfg-vk beta
+        // branch; the usual one has them as Direct3D bytecode alone, and the game falls back to the built-in generator
+        int spirv = 0, last = 0;
         try (InputStream in = c.getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(tmp)) {
             if (in == null) throw new IOException("couldn't open the file");
             byte[] buf = new byte[1 << 16];
@@ -172,6 +175,10 @@ final class Drivers {
             for (int n; (n = in.read(buf)) > 0; ) {
                 if (first && (n < 2 || buf[0] != 'M' || buf[1] != 'Z')) throw new IOException("that's not a .dll");
                 first = false;
+                for (int i = 0; i < n; i++) {
+                    last = last >>> 8 | (buf[i] & 0xff) << 24;
+                    if (last == 0x07230203) spirv++;
+                }
                 out.write(buf, 0, n);
                 total += n;
             }
@@ -187,7 +194,10 @@ final class Drivers {
         dll.delete();
         if (!tmp.renameTo(dll)) throw new IOException("couldn't save it");
         if (gameFolder != null) new Ini(gameFolder).set("lsfg", "1");  // (on by default once it's there)
-        return String.format(java.util.Locale.ROOT, "%.1f MB", total / 1048576.0);
+        String size = String.format(java.util.Locale.ROOT, "%.1f MB", total / 1048576.0);
+        return spirv > 0 ? size
+                         : size + ", but it only has Direct3D shaders, so the built-in generator is used. For Lossless "
+                                 + "Scaling's own, take Lossless.dll from its lsfg-vk beta branch (Steam: Properties, Betas)";
     }
 
     // ---- files ----------------------------------------------------------------------------------------------------------

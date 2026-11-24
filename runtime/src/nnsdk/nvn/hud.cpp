@@ -28,18 +28,6 @@
 #include "nnsdk/ini.h"
 
 namespace nvn::hud {
-struct Buffer {
-    VkDevice device;
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    void* data = nullptr;
-    VkDeviceSize size;
-    ~Buffer() {
-        if (data) vkUnmapMemory(device, memory);
-        if (buffer) vkDestroyBuffer(device, buffer, nullptr);
-        if (memory) vkFreeMemory(device, memory, nullptr);
-    }
-};
 namespace {
 
 uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags props) {
@@ -51,6 +39,7 @@ uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags props) {
 
 constexpr uint32_t kW = 44, kH = 26;       // en píxeles del swapchain (1920x1080): solo el número, que no estorbe
 constexpr int32_t kX = 8, kY = 8;          // esquina superior izquierda
+constexpr uint32_t kRing = 12;             // buffers: más que presentaciones en vuelo (3 reales + 3 de LSFG)
 // The overlay with its other lines: a box at most this big (scale-2 text, 12 x 20 pixels a character and a line)
 constexpr uint32_t kStatsW = 360, kStatsH = 170;
 constexpr int kStatsLine = 20, kStatsPad = 8, kStatsLines = 8;
@@ -141,8 +130,7 @@ public:
         generated_.push_back(last_real_);
         trim(generated_, last_real_);
     }
-    void record(Uploads& uploads, VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format) {
-        uploads.panel.reset();
+    void record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format) {
         // The counter goes off with no_fps in mhr.ini (live, as always) or from the panel, which writes that same line:
         // the choice also holds the next time the game opens.
         if (const bool file = NVN_FLAG("no_fps"); !flag_seen_ || file != flag_) flag_seen_ = true, flag_ = hidden_ = file;
@@ -156,9 +144,10 @@ public:
                            !NVN_FLAG("no_hud_heat") || !NVN_FLAG("no_hud_shaders");
         if (!hidden_ && stats) {
             if (extent.width >= kX + kStatsW && extent.height >= kY + kStatsH &&
-                reserve(uploads.counter, kStatsW, kStatsH)) {
+                (!stats_buffers_.empty() || create(stats_buffers_, kStatsW, kStatsH))) {
                 sample(now);
-                Buffer& b = *uploads.counter;
+                Buffer& b = stats_buffers_[stats_next_];
+                stats_next_ = (stats_next_ + 1) % kRing;
                 uint32_t bw = 0, bh = 0;
                 draw_stats(reinterpret_cast<Rgba*>(b.data), bgra, &bw, &bh);
                 VkBufferImageCopy region{};
@@ -167,25 +156,27 @@ public:
                 region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 region.imageOffset = {kX, kY, 0};
                 region.imageExtent = {bw, bh, 1};
-                overlay_copy(cmd, b, image, region);
+                vkCmdCopyBufferToImage(cmd, b.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             }
-        } else if (!hidden_ && extent.width >= kX + kW && extent.height >= kY + kH && reserve(uploads.counter, kW, kH)) {
-            Buffer& b = *uploads.counter;
+        } else if (!hidden_ && extent.width >= kX + kW && extent.height >= kY + kH && (!buffers_.empty() || create(buffers_, kW, kH))) {
+            Buffer& b = buffers_[next_];
+            next_ = (next_ + 1) % kRing;
             draw(reinterpret_cast<Rgba*>(b.data), bgra);
             VkBufferImageCopy region{};
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageOffset = {kX, kY, 0};
             region.imageExtent = {kW, kH, 1};
-            overlay_copy(cmd, b, image, region);
+            vkCmdCopyBufferToImage(cmd, b.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
-        record_panel(uploads, cmd, image, extent, bgra, now);
+        record_panel(cmd, image, extent, bgra, now);
     }
 
 private:
-    static void overlay_copy(VkCommandBuffer cmd, const Buffer& b, VkImage image, const VkBufferImageCopy& region) {
-        order_present_writes(cmd, image);
-        vkCmdCopyBufferToImage(cmd, b.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    }
+    struct Buffer {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* data = nullptr;
+    };
     static void trim(std::deque<int64_t>& q, int64_t now) {
         while (!q.empty() && now - q.front() > 1000000000) q.pop_front();
     }
@@ -330,23 +321,23 @@ private:
         nnsdk::ini::set("tv_mode", on ? "1" : "0");
         NVN_LOG("hud: modo TV al abrir la app: %s\n", on ? "sí" : "no");
     }
-    void record_panel(Uploads& uploads, VkCommandBuffer cmd, VkImage image, VkExtent2D extent, bool bgra, int64_t now) {
+    void record_panel(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, bool bgra, int64_t now) {
         const uint32_t w = extent.width / 3, h = extent.height;
         if (w < 360 || h < static_cast<uint32_t>(kPanelHeader + kPanelRow)) return;
         const uint32_t visible = static_cast<uint32_t>(panel_shown(now) * w + 0.5f);
         if (!visible) return;
-        if (panel_w_ != w || panel_h_ != h || panel_bgra_ != bgra) panel_dirty_ = true;
+        // Dos buffers del tamaño del panel: se redibuja en el otro solo cuando cambia lo que enseña, así las copias que
+        // la GPU aún tenga pendientes siguen leyendo uno que nadie toca (entre dos cambios pasa al menos un toque).
+        if (panel_buffers_.empty() || panel_w_ != w || panel_h_ != h) {
+            if (!panel_buffers_.empty() || !create(panel_buffers_, w, h, 2)) return;  // otro tamaño: no pasa (el swapchain no cambia)
+            panel_w_ = w, panel_h_ = h, panel_dirty_ = true;
+        }
         if (hidden_ != panel_drawn_hidden_) panel_dirty_ = true;  // lo apagaron con el fichero, desde fuera
         if (panel_dirty_) {
-            // A submitted copy retains its immutable pixels until its own fence signals.
-            if (panel_.use_count() > 1) panel_.reset();
-            if (!reserve(panel_, w, h)) return;
-            panel_w_ = w;
-            panel_h_ = h;
-            panel_bgra_ = bgra;
             panel_dirty_ = false;
             panel_drawn_hidden_ = hidden_;
-            draw_panel(reinterpret_cast<Rgba*>(panel_->data), bgra);
+            panel_next_ ^= 1;
+            draw_panel(reinterpret_cast<Rgba*>(panel_buffers_[panel_next_].data), bgra);
         }
         // Asoma por el borde derecho: las `visible` primeras columnas del panel, pegadas al borde.
         VkBufferImageCopy region{};
@@ -355,8 +346,7 @@ private:
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageOffset = {static_cast<int32_t>(extent.width - visible), 0, 0};
         region.imageExtent = {visible, h, 1};
-        uploads.panel = panel_;
-        overlay_copy(cmd, *panel_, image, region);
+        vkCmdCopyBufferToImage(cmd, panel_buffers_[panel_next_].buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     }
     // La cabecera y una fila por ajuste: su nombre y un interruptor (verde con el pomo a la derecha, encendido; gris con el
     // pomo a la izquierda, apagado).
@@ -427,28 +417,26 @@ private:
         // Al pie, cómo se cierra.
         text(margin, h - 70, 3, es ? "TOCA FUERA PARA CERRAR" : "TAP OUTSIDE TO CLOSE", kDim);
     }
-    bool reserve(std::shared_ptr<Buffer>& buffer, uint32_t width, uint32_t height) {
-        const VkDeviceSize size = VkDeviceSize{width} * height * 4;
-        if (buffer && buffer->size >= size) return true;
+    bool create(std::vector<Buffer>& buffers, uint32_t width, uint32_t height, uint32_t count = kRing) {
         VkContext* c = vk();
-        auto next = std::make_shared<Buffer>();
-        next->device = c->device;
-        next->size = size;
-        Buffer& b = *next;
-        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bi.size = size;
-        bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        VkMemoryRequirements req;
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        if (vkCreateBuffer(c->device, &bi, nullptr, &b.buffer) != VK_SUCCESS) return fail();
-        vkGetBufferMemoryRequirements(c->device, b.buffer, &req);
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(c->device, &ai, nullptr, &b.memory) != VK_SUCCESS ||
-            vkBindBufferMemory(c->device, b.buffer, b.memory, 0) != VK_SUCCESS ||
-            vkMapMemory(c->device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.data) != VK_SUCCESS)
-            return fail();
-        buffer = std::move(next);
+        for (uint32_t k = 0; k < count; k++) {
+            Buffer b;
+            VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = VkDeviceSize{width} * height * 4;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VkMemoryRequirements req;
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            if (vkCreateBuffer(c->device, &bi, nullptr, &b.buffer) != VK_SUCCESS) return fail();
+            vkGetBufferMemoryRequirements(c->device, b.buffer, &req);
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex =
+                find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(c->device, &ai, nullptr, &b.memory) != VK_SUCCESS ||
+                vkBindBufferMemory(c->device, b.buffer, b.memory, 0) != VK_SUCCESS ||
+                vkMapMemory(c->device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.data) != VK_SUCCESS)
+                return fail();
+            buffers.push_back(b);
+        }
         return true;
     }
     bool fail() {
@@ -659,8 +647,8 @@ private:
         text((static_cast<int>(kW) - width) / 2, 3, 3, line, color);
     }
 
-    std::shared_ptr<Buffer> panel_;
-    bool panel_bgra_ = false;
+    std::vector<Buffer> buffers_, panel_buffers_, stats_buffers_;
+    uint32_t next_ = 0, panel_next_ = 0, stats_next_ = 0;
     // What the overlay's lines show, read twice a second (sample)
     int64_t sampled_at_ = 0;
     uint64_t cpu_ticks_ = 0;  // the process's user + system time, in clock ticks, at sampled_at_
@@ -694,8 +682,8 @@ void real_frame(int64_t now_ns) { g_hud.real_frame(now_ns); }
 void shader_queued() { g_building.fetch_add(1, std::memory_order_relaxed); }
 void shader_done() { g_building.fetch_sub(1, std::memory_order_relaxed); }
 void generated_frame() { g_hud.generated_frame(); }
-void record(Uploads& uploads, VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format) {
-    g_hud.record(uploads, cmd, image, extent, format);
+void record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format) {
+    g_hud.record(cmd, image, extent, format);
 }
 
 }  // namespace nvn::hud

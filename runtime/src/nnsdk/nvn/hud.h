@@ -19,7 +19,6 @@
 // estar en la base (más resolución, mando Pro) desde la próxima vez que se abra.
 
 #include <cstdint>
-#include <memory>
 
 #include "nnsdk/nvn/vk.h"
 
@@ -35,11 +34,6 @@ void shader_queued();
 void shader_done();
 // Copia el HUD sobre la imagen del swapchain, que está en TRANSFER_DST_OPTIMAL (entre el blit y la barrera a
 // PRESENT_SRC). format es el del swapchain: solo se dibuja si es RGBA8 o BGRA8.
-struct Buffer;
-// Held by the submission slot until its fence completes.
-struct Uploads {
-    std::shared_ptr<Buffer> counter, panel;
-};
-void record(Uploads& uploads, VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format);
+void record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format);
 
 }  // namespace nvn::hud

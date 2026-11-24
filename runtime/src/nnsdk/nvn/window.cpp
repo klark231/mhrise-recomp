@@ -20,10 +20,8 @@
 #include "nnsdk/nvn/commands.h"
 #include "nnsdk/nvn/driver.h"
 #include "nnsdk/nvn/flags.h"
-#include "nnsdk/nvn/fsr.h"
 #include "nnsdk/nvn/hud.h"
 #include "nnsdk/nvn/lsfg/framegen.h"
-#include "nnsdk/nvn/present_probe.h"
 #include "nnsdk/nvn/nvn.h"
 #include "nnsdk/nvn/objects.h"
 #include "nnsdk/runtime.h"
@@ -43,12 +41,9 @@ struct WindowBuilder {
 // acabara el N-1 (CPU y GPU por turnos: la GPU al 66 % y 22 fps en la fábrica).
 constexpr int kPresentSlots = 3;
 struct PresentSlot {
-    nvn::hud::Uploads hud;
-    nvn::PresentProbe probe;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE, rendered = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
-    bool usable = true;
 };
 struct Presenter {
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -61,42 +56,9 @@ Presenter g_presenter;
 // kPresentSlots frames o a una imagen del swapchain no para a los hilos del juego ni a una reproducción.
 std::mutex g_present_mutex;
 
-bool init_presenter(nvn::VkContext& c) {
-    if (g_presenter.pool) return true;
-    Presenter next;
-    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = c.queue_family;
-    VkResult r = vkCreateCommandPool(c.device, &pci, nullptr, &next.pool);
-    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = next.pool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    for (auto& slot : next.slots) {
-        if (r != VK_SUCCESS) break;
-        r = vkAllocateCommandBuffers(c.device, &ai, &slot.cmd);
-        if (r == VK_SUCCESS) r = vkCreateSemaphore(c.device, &si, nullptr, &slot.acquired);
-        if (r == VK_SUCCESS) r = vkCreateFence(c.device, &fi, nullptr, &slot.done);
-    }
-    if (r == VK_SUCCESS) {
-        g_presenter = std::move(next);
-        return true;
-    }
-    NVN_LOG("present slots: %s\n", nvn::vk_result_name(r));
-    for (auto& slot : next.slots) {
-        vkDestroyFence(c.device, slot.done, nullptr);
-        vkDestroySemaphore(c.device, slot.acquired, nullptr);
-    }
-    vkDestroyCommandPool(c.device, next.pool, nullptr);
-    return false;
-}
-
-bool build_swapchain(nvn::Window& w) {
+bool create_swapchain(nvn::Window& w) {
     nvn::VkContext* c = nvn::vk();
-    if (!c || !init_presenter(*c)) return false;
+    if (!c) return false;
     VkAndroidSurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
     sci.window = static_cast<ANativeWindow*>(w.native_window);
     if (VkResult r = vkCreateAndroidSurfaceKHR(c->instance, &sci, nullptr, &w.surface); r != VK_SUCCESS) {
@@ -104,11 +66,11 @@ bool build_swapchain(nvn::Window& w) {
         return false;
     }
     VkSurfaceCapabilitiesKHR caps;
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->gpu, w.surface, &caps) != VK_SUCCESS) return false;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->gpu, w.surface, &caps);
     uint32_t count = 0;
-    if (vkGetPhysicalDeviceSurfaceFormatsKHR(c->gpu, w.surface, &count, nullptr) != VK_SUCCESS || !count) return false;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(c->gpu, w.surface, &count, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(count);
-    if (vkGetPhysicalDeviceSurfaceFormatsKHR(c->gpu, w.surface, &count, formats.data()) != VK_SUCCESS) return false;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(c->gpu, w.surface, &count, formats.data());
     VkSurfaceFormatKHR format = formats[0];
     for (const VkSurfaceFormatKHR& f : formats)
         if (f.format == VK_FORMAT_R8G8B8A8_UNORM) format = f;
@@ -130,10 +92,6 @@ bool build_swapchain(nvn::Window& w) {
     info.imageExtent = w.extent;
     info.imageArrayLayers = 1;
     info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    const bool capture_layers = NVN_FLAG("capture_layers");
-    w.capture_layers = capture_layers && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    if (w.capture_layers) info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    else if (capture_layers) NVN_LOG("capture_layers: surface does not allow swapchain readback\n");
     info.preTransform = transform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & info.compositeAlpha)) info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -143,86 +101,191 @@ bool build_swapchain(nvn::Window& w) {
         NVN_LOG("vkCreateSwapchainKHR: %s\n", nvn::vk_result_name(r));
         return false;
     }
-    if (vkGetSwapchainImagesKHR(c->device, w.swapchain, &count, nullptr) != VK_SUCCESS || !count) return false;
-    std::vector<VkImage> handles(count);
-    if (vkGetSwapchainImagesKHR(c->device, w.swapchain, &count, handles.data()) != VK_SUCCESS) return false;
+    vkGetSwapchainImagesKHR(c->device, w.swapchain, &count, nullptr);
     w.images.resize(count);
-    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    for (uint32_t i = 0; i < count; ++i) {
-        w.images[i].image = handles[i];
-        if (VkResult r = vkCreateSemaphore(c->device, &si, nullptr, &w.images[i].ready); r != VK_SUCCESS) {
-            NVN_LOG("present semaphore: %s\n", nvn::vk_result_name(r));
-            return false;
-        }
-        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if (c->present_fences && vkCreateFence(c->device, &fi, nullptr, &w.images[i].released) != VK_SUCCESS) return false;
-    }
+    vkGetSwapchainImagesKHR(c->device, w.swapchain, &count, w.images.data());
 
-    NVN_LOG("swapchain %ux%u, %u imágenes, formato %d, present fences %d\n",
-            w.extent.width, w.extent.height, count, format.format, c->present_fences);
+    if (!g_presenter.pool) {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = c->queue_family;
+        vkCreateCommandPool(c->device, &pci, nullptr, &g_presenter.pool);
+        for (PresentSlot& slot : g_presenter.slots) {
+            VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            ai.commandPool = g_presenter.pool;
+            ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ai.commandBufferCount = 1;
+            vkAllocateCommandBuffers(c->device, &ai, &slot.cmd);
+            VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            vkCreateSemaphore(c->device, &si, nullptr, &slot.acquired);
+            vkCreateSemaphore(c->device, &si, nullptr, &slot.rendered);
+            VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            vkCreateFence(c->device, &fi, nullptr, &slot.done);
+        }
+    }
+    NVN_LOG("swapchain %ux%u, %u imágenes, formato %d\n", w.extent.width, w.extent.height, count, format.format);
     return true;
 }
 
-void destroy_swapchain(nvn::Window& w) {
-    auto* c = nvn::vk();
-    if (!c) return;
-    for (auto& image : w.images) {
-        if (image.pending) vkWaitForFences(c->device, 1, &image.released, VK_TRUE, UINT64_MAX);
-        vkDestroyFence(c->device, image.released, nullptr);
-        vkDestroySemaphore(c->device, image.ready, nullptr);
+// --- Detector de destellos (DEPURACIÓN) ---
+// <datos>/capture_flash (en vivo): el fuego del Aknosom salía como un disco amarillo plano que tapaba media pantalla
+// durante ~0,5 s (5-11), demasiado poco para pedir la traza a mano. Cada frame se copian 16x9 texels de la textura de la
+// ventana (dentro de su recorte) a un buffer de la CPU; al volver a ese juego de present (kPresentSlots frames después, con
+// su fence ya esperado) se miran: con un sexto o más de amarillo saturado se pide la traza completa del frame siguiente
+// (request_trace). Como mucho una cada 20 s y 4 por partida.
+constexpr int kProbeW = 16, kProbeH = 9;
+struct FlashProbe {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    const uint8_t* mapped = nullptr;
+    bool pending = false;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+};
+FlashProbe g_probes[kPresentSlots];
+
+uint32_t texel_bytes(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return 4;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+        default: return 0;
     }
-    w.images.clear();
-    if (w.swapchain) vkDestroySwapchainKHR(c->device, w.swapchain, nullptr);
-    if (w.surface) vkDestroySurfaceKHR(c->instance, w.surface, nullptr);
-    w.swapchain = VK_NULL_HANDLE;
-    w.surface = VK_NULL_HANDLE;
 }
 
-bool create_swapchain(nvn::Window& w) {
-    if (build_swapchain(w)) return true;
-    destroy_swapchain(w);
-    return false;
+float half_to_float(uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+    if (exp == 0) return (sign ? -1.0f : 1.0f) * man / 16777216.0f;
+    if (exp == 31) return 65504.0f;
+    return (sign ? -1.0f : 1.0f) * std::ldexp(1.0f + man / 1024.0f, static_cast<int>(exp) - 15);
 }
 
+bool make_probe(FlashProbe& p) {
+    nvn::VkContext* c = nvn::vk();
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = kProbeW * kProbeH * 8;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(c->device, &bi, nullptr, &p.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(c->device, p.buffer, &req);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t k = 0; k < c->memory.memoryTypeCount && type == UINT32_MAX; k++)
+        if ((req.memoryTypeBits >> k & 1) && (c->memory.memoryTypes[k].propertyFlags & want) == want) type = k;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = type;
+    void* mapped = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(c->device, &ai, nullptr, &p.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(c->device, p.buffer, p.memory, 0) != VK_SUCCESS ||
+        vkMapMemory(c->device, p.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+        if (p.memory) vkFreeMemory(c->device, p.memory, nullptr);
+        vkDestroyBuffer(c->device, p.buffer, nullptr);
+        p = {};
+        return false;
+    }
+    p.mapped = static_cast<const uint8_t*>(mapped);
+    return true;
+}
+
+// Tras esperar el fence del juego de present: lo que copió hace kPresentSlots frames.
+void check_probe(FlashProbe& p) {
+    if (!p.pending) return;
+    p.pending = false;
+    const uint32_t bytes = texel_bytes(p.format);
+    // Umbrales (en vivo, <datos>/destello_umbral: "R G Bmáx R-B sextos"): un destello cálido y muy claro. Los primeros
+    // (230 190 200 40 y un sexto) no saltaron con uno casi blanco del 5-11; por defecto ahora 220 180 235 20.
+    struct Thresholds {
+        float r = 220, g = 180, b = 235, rb = 20;
+        int sixths = 1;
+    };
+    static Thresholds t;
+    static auto read_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    if (std::chrono::steady_clock::now() - read_at > std::chrono::seconds(5)) {
+        read_at = std::chrono::steady_clock::now();
+        const char* data = getenv("NIER_DATA");
+        if (FILE* f = fopen((std::string(data ? data : ".") + "/destello_umbral").c_str(), "r")) {
+            Thresholds n;
+            if (fscanf(f, "%f %f %f %f %d", &n.r, &n.g, &n.b, &n.rb, &n.sixths) == 5) t = n;
+            fclose(f);
+        }
+    }
+    int yellow = 0;
+    for (int k = 0; k < kProbeW * kProbeH; k++) {
+        const uint8_t* q = p.mapped + k * bytes;
+        float r = 0, g = 0, b = 0;
+        switch (p.format) {
+            case VK_FORMAT_B8G8R8A8_UNORM:
+            case VK_FORMAT_B8G8R8A8_SRGB: r = q[2], g = q[1], b = q[0]; break;
+            case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+                uint32_t v;
+                memcpy(&v, q, 4);
+                r = (v & 0x3ff) / 4.0f, g = (v >> 10 & 0x3ff) / 4.0f, b = (v >> 20 & 0x3ff) / 4.0f;
+                break;
+            }
+            case VK_FORMAT_R16G16B16A16_SFLOAT: {
+                uint16_t h[3];
+                memcpy(h, q, 6);
+                r = std::min(half_to_float(h[0]), 1.0f) * 255, g = std::min(half_to_float(h[1]), 1.0f) * 255,
+                b = std::min(half_to_float(h[2]), 1.0f) * 255;
+                break;
+            }
+            default: r = q[0], g = q[1], b = q[2]; break;
+        }
+        yellow += r >= t.r && g >= t.g && b <= t.b && r - b >= t.rb;
+    }
+    static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    static int taken = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (yellow * 6 >= kProbeW * kProbeH * t.sixths && taken < 4 && now - last >= std::chrono::seconds(20)) {
+        last = now;
+        taken++;
+        NVN_LOG("detector de destellos: %d de %d muestras en amarillo saturado: traza completa del frame siguiente\n", yellow,
+                kProbeW * kProbeH);
+        nvn::request_trace(true);
+    }
+}
+
+// Graba la copia de las muestras de la textura de la ventana (en GENERAL, como la lee el blit).
+void record_probe(FlashProbe& p, VkCommandBuffer cmd, const nvn::Texture& t, const VkRect2D& crop) {
+    const uint32_t bytes = texel_bytes(t.vk_format);
+    if (!bytes || !t.image || (!p.buffer && !make_probe(p))) return;
+    const uint32_t w = crop.extent.width ? crop.extent.width : t.desc.width;
+    const uint32_t h = crop.extent.height ? crop.extent.height : t.desc.height;
+    VkBufferImageCopy regions[kProbeW * kProbeH] = {};
+    for (int y = 0; y < kProbeH; y++)
+        for (int x = 0; x < kProbeW; x++) {
+            VkBufferImageCopy& r = regions[y * kProbeW + x];
+            r.bufferOffset = static_cast<VkDeviceSize>(y * kProbeW + x) * bytes;
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r.imageOffset = {crop.offset.x + static_cast<int32_t>((2 * x + 1) * w / (2 * kProbeW)),
+                             crop.offset.y + static_cast<int32_t>((2 * y + 1) * h / (2 * kProbeH)), 0};
+            r.imageExtent = {1, 1, 1};
+        }
+    vkCmdCopyImageToBuffer(cmd, t.image, VK_IMAGE_LAYOUT_GENERAL, p.buffer, kProbeW * kProbeH, regions);
+    p.pending = true;
+    p.format = t.vk_format;
+}
+
+void barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &b);
+}
 
 }  // namespace
 
 nvn::Objects<nvn::Window> nvn::g_windows;
-
-VkResult nvn::Window::queue_image(uint32_t index, const VkPresentTimeGOOGLE* when) {
-    auto* c = vk();
-    auto& image = images[index];
-    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &image.ready;
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &swapchain;
-    pi.pImageIndices = &index;
-    VkPresentTimesInfoGOOGLE timing{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
-    if (when && c->display_timing) {
-        timing.swapchainCount = 1;
-        timing.pTimes = when;
-        pi.pNext = &timing;
-    }
-    VkSwapchainPresentFenceInfoEXT fences{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
-    if (image.released) {
-        if (image.pending) {
-            VkResult r = vkWaitForFences(c->device, 1, &image.released, VK_TRUE, UINT64_MAX);
-            if (r != VK_SUCCESS) return r;
-            if ((r = vkResetFences(c->device, 1, &image.released)) != VK_SUCCESS) return r;
-            image.pending = false;
-        }
-        fences.swapchainCount = 1;
-        fences.pFences = &image.released;
-        fences.pNext = pi.pNext;
-        pi.pNext = &fences;
-    }
-    const VkResult result = vkQueuePresentKHR(c->queue, &pi);
-    image.pending = image.released && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR ||
-                                       result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR);
-    if (result < 0) rebuild = true;
-    return result;
-}
 
 namespace {
 // DEPURACIÓN: <datos>/lsfg_margen con unos milisegundos (p. ej. "4"): margen fijo entre el generado y el real, en vez
@@ -353,8 +416,13 @@ constexpr size_t kRateSetter = 0x78a0ea0;  // set_ImageQualityRate: adrp/ldr del
 constexpr uint32_t kRateSetterCode[3] = {0x90058588, 0xF9429D08, 0xBD1A7900};
 constexpr size_t kRateLoad = 0x7936e20;  // ldr s1, [x8, #0x1a78] en la actualización de RenderOutput
 constexpr uint32_t kRateLoadCode = 0xBD5A7901;
-constexpr float kRates[] = {1.0f, 0.93334f, 0.86667f, 0.80001f, 0.73334f};  // un poco por encima: floor no pierde un píxel
-constexpr int kLevels = static_cast<int>(std::size(kRates));
+constexpr float kRates[] = {1.0f, 0.93334f, 0.86667f, 0.80001f, 0.73334f,  // un poco por encima: floor no pierde un píxel
+                            0.66668f, 0.60001f, 0.53335f, 0.50001f};
+// Standard: the first five steps (down to 73 %), from the top. Wide (<data>/dynres_wide, Settings → Resolution →
+// Dynamic resolution): all nine, down to half, and from the bottom after every load, climbing while the GPU has room
+// (for phones that sit at the floor of the standard range; from a fork by Yamiel78).
+int dynres_levels() { return NVN_FLAG("dynres_wide") ? static_cast<int>(std::size(kRates)) : 5; }
+int dynres_start() { return NVN_FLAG("dynres_wide") ? dynres_levels() - 1 : 0; }
 
 // La base elegida: el ratio sobre 960x540 y las líneas, para el log
 struct BaseResolution {
@@ -409,7 +477,7 @@ void dynamic_resolution(int64_t period_ns) {
     if (!rate) return;
     const float now = *rate;
     if (now < 0.2f) {  // cargando (0,1): es del juego; al acabar pone 1,0 y se vuelve a empezar desde arriba
-        d.level = 0;
+        d.level = dynres_start();
         d.count = d.next = 0;
         d.since_change = 1000;
         return;
@@ -427,6 +495,8 @@ void dynamic_resolution(int64_t period_ns) {
         d.written = base.rate != 1.0f;
         return;
     }
+    const int kLevels = dynres_levels();
+    if (d.level >= kLevels) d.level = kLevels - 1;  // (switched back to standard)
     int64_t gpu = 0;
     const bool fresh = nvn::game_gpu_frame(d.serial, gpu);
     if (fresh && gpu > 0) {
@@ -491,7 +561,6 @@ void log_pace(const nvn::Window& w) {
     const uint64_t run = take(d.run_ns), run_max = take(d.run_max_ns), wait = take(d.wait_ns);
     const uint64_t live = take(d.pipelines_live), live_ns = take(d.pipelines_live_ns);
     const uint64_t async = take(d.pipelines_async), skipped = take(d.draws_skipped);
-    const uint64_t pipeline_wait = take(d.pipeline_wait_ns);
     const uint64_t known = take(d.pipelines_known), known_ns = take(d.pipelines_known_ns);
     const uint64_t translated = take(d.translated_live), translated_ns = take(d.translated_live_ns);
     const uint64_t prefetched = take(d.prefetched), prefetch_ns = take(d.prefetch_ns);
@@ -508,13 +577,13 @@ void log_pace(const nvn::Window& w) {
         NVN_LOG("ritmo: %.1f fps, %llu frames de más de 40 ms (el peor %.0f ms), intervalo %d, resolución x%.3f (%llu cambios); "
                 "GPU del juego %.1f ms (peor "
                 "%.1f); ejecutor %.1f ms/frame (peor %.1f, %.1f esperando a la GPU); pipelines en NvnSubmit %llu (%.0f ms), "
-                "en segundo plano %llu (%.1f ms esperando pipelines), %llu draws omitidos por traducción, registradas %llu (%.0f ms); traducciones en NvnSubmit %llu (%.0f ms), precargadas %llu "
+                "en segundo plano %llu (%llu draws esperándolas), recorded ones made without waiting %llu (%.0f ms); traducciones en NvnSubmit %llu (%.0f ms), precargadas %llu "
                 "(%.0f ms)\n",
                 frames / secs, static_cast<unsigned long long>(slow), worst_ns / 1e6, w.present_interval, kRates[g_dynres.level],
                 static_cast<unsigned long long>(std::exchange(g_dynres.changes, 0)),
                 gpu_frames ? gpu_sum / 1e6 / gpu_frames : 0.0, gpu_max / 1e6, run / 1e6 / std::max<uint64_t>(frames, 1),
                 run_max / 1e6, wait / 1e6 / std::max<uint64_t>(frames, 1), static_cast<unsigned long long>(live), live_ns / 1e6,
-                static_cast<unsigned long long>(async), pipeline_wait / 1e6, static_cast<unsigned long long>(skipped),
+                static_cast<unsigned long long>(async), static_cast<unsigned long long>(skipped),
                 static_cast<unsigned long long>(known), known_ns / 1e6, static_cast<unsigned long long>(translated), translated_ns / 1e6, static_cast<unsigned long long>(prefetched),
                 prefetch_ns / 1e6);
         if (slowest_ns) NVN_LOG("ritmo: el envío más lento, %.0f ms: %s\n", slowest_ns / 1e6, slowest.c_str());
@@ -570,27 +639,30 @@ float game_max_fps(int cap) {
 // en negro (se seguía presentando en la ventana destruida).
 void follow_native_window(nvn::Window& w) {
     NnsdkWindow* state = nnsdk::host().window_state;
-    const uint32_t serial = state ? state->serial.load(std::memory_order_acquire) : 0;
-    if (!w.rebuild && (!state || serial == state->done.load(std::memory_order_relaxed))) return;
-    void* now = state ? state->window.load(std::memory_order_acquire) : w.native_window;
+    if (!state) return;
+    const uint32_t serial = state->serial.load(std::memory_order_acquire);
+    if (serial == state->done.load(std::memory_order_relaxed)) return;
+    void* now = state->window.load(std::memory_order_acquire);
     nvn::VkContext* c = nvn::vk();
-    if (now != w.native_window || !w.swapchain || w.rebuild) {
+    if (now != w.native_window || !w.swapchain) {
         {
             std::lock_guard queue_lock(nvn::vk_queue_mutex());
             vkQueueWaitIdle(c->queue);  // lo presentado en la vieja, terminado antes de soltarla
         }
-        destroy_swapchain(w);
-        w.rebuild = false;
+        if (w.swapchain) vkDestroySwapchainKHR(c->device, w.swapchain, nullptr);
+        if (w.surface) vkDestroySurfaceKHR(c->instance, w.surface, nullptr);
+        w.swapchain = VK_NULL_HANDLE;
+        w.surface = VK_NULL_HANDLE;
+        w.images.clear();
         w.native_window = now;
         if (now) {
             const bool ok = create_swapchain(w);
-            w.rebuild = !ok;
             NVN_LOG("ventana nueva: swapchain %s\n", ok ? "creado" : "sin crear");
         } else {
             NVN_LOG("sin ventana (segundo plano): no se presenta\n");
         }
     }
-    if (state) state->done.store(serial, std::memory_order_release);
+    state->done.store(serial, std::memory_order_release);
 }
 
 namespace {
@@ -602,81 +674,63 @@ int64_t nvn::frame_period_ns() { return g_frame_period_ns.load(std::memory_order
 namespace {
 // The picture on screen: frame generation's pictures, then the real one (blit to a swapchain image and present). On
 // NvnSubmit after the pacing, or with asynchronous presentation on the Presenter thread (see nvn::present).
-void show(nvn::Window& w, nvn::ResourceRef<nvn::Texture> source) {
+void show(nvn::Window& w, nvn::Texture* t) {
     using namespace nvn;
     VkContext* c = vk();
     std::lock_guard present_lock(g_present_mutex);
     if (!w.swapchain) return;
-    fsr::release_if_resized(picture_rect(w.extent).extent);
     hud::real_frame(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     // LSFG 2x encendido: antes del real, el frame intermedio (lsfg/framegen.cpp).
     uint32_t generated_id = 0;
-    const int64_t generated_ns = lsfg::present_generated(w, source, &generated_id);
-    if (w.rebuild) return;
+    const int64_t generated_ns = lsfg::present_generated(w, t, &generated_id);
     if (generated_ns) g_lsfg_pacer.queued_generated(generated_id, generated_ns);
     PresentSlot& slot = g_presenter.slots[g_presenter.next];
     g_presenter.next = (g_presenter.next + 1) % kPresentSlots;
 
-    if (!slot.usable) return;
-    VkResult r = vkWaitForFences(c->device, 1, &slot.done, VK_TRUE, UINT64_MAX);
-    if (r != VK_SUCCESS) {
-        NVN_LOG("present slot fence: %s\n", vk_result_name(r));
-        return;
-    }
+    vkWaitForFences(c->device, 1, &slot.done, VK_TRUE, UINT64_MAX);  // el de hace kPresentSlots frames
+    FlashProbe& probe = g_probes[&slot - g_presenter.slots];
     // Las muestras de cualquier juego de present ya terminado, no solo las de este (el de hace kPresentSlots frames): el
     // del frame anterior suele estarlo ya, y así la traza cae 2 frames después del destello y no 4 (el 5-11 llegó tarde:
     // en el frame trazado el cazador ya estaba en el suelo).
-    for (auto& queued : g_presenter.slots)
-        if (queued.probe.pending && (&queued == &slot || vkGetFenceStatus(c->device, queued.done) == VK_SUCCESS))
-            queued.probe.collect();
+    for (int k = 0; k < kPresentSlots; k++)
+        if (&g_probes[k] == &probe || vkGetFenceStatus(c->device, g_presenter.slots[k].done) == VK_SUCCESS)
+            check_probe(g_probes[k]);
     uint32_t image = 0;
-    r = vkAcquireNextImageKHR(c->device, w.swapchain, UINT64_MAX, slot.acquired, VK_NULL_HANDLE, &image);
+    VkResult r = vkAcquireNextImageKHR(c->device, w.swapchain, UINT64_MAX, slot.acquired, VK_NULL_HANDLE, &image);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) w.rebuild = true;
         NVN_LOG("vkAcquireNextImageKHR: %s\n", vk_result_name(r));
         return;  // el fence sigue señalado (se reinicia después): este contexto no se queda esperando para siempre
     }
-    // On a failed recording or submit, drain the acquisition before using this slot again.
-    auto abandon = [&](VkResult error) {
-        NVN_LOG("present submission: %s\n", vk_result_name(error));
-        w.rebuild = true;
-        slot.probe.pending = false;
-        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkSubmitInfo wait{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        wait.waitSemaphoreCount = 1;
-        wait.pWaitSemaphores = &slot.acquired;
-        wait.pWaitDstStageMask = &stage;
-        std::lock_guard lock(vk_queue_mutex());
-        slot.usable = vkResetFences(c->device, 1, &slot.done) == VK_SUCCESS &&
-                      vkQueueSubmit(c->queue, 1, &wait, slot.done) == VK_SUCCESS;
-    };
+    vkResetFences(c->device, 1, &slot.done);
 
     // El blit lee la imagen de la textura: desde grabarlo hasta enviarlo, con el lock del ejecutor. Así, si el
     // juego la retira, se libera tras un envío del ejecutor posterior a este (va detrás en la cola).
     std::unique_lock executor_lock(executor_mutex());
-    Texture* t = source.get();
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if ((r = vkResetCommandBuffer(slot.cmd, 0)) != VK_SUCCESS ||
-        (r = vkBeginCommandBuffer(slot.cmd, &bi)) != VK_SUCCESS) return abandon(r);
-    const auto& target = w.images[image];
-    present_image_barrier(slot.cmd, target.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkResetCommandBuffer(slot.cmd, 0);
+    vkBeginCommandBuffer(slot.cmd, &bi);
+    {  // lo que pintaron los envíos anteriores (en vuelo, misma cola), visible para el blit
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(slot.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                             &mb, 0, nullptr, 0, nullptr);
+    }
+    barrier(slot.cmd, w.images[image], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkClearColorValue color{};
     if (t && t->cleared) memcpy(color.float32, t->clear_color, sizeof color.float32);
     // Lo que el juego dibujó en la textura de la ventana, escalado a la pantalla; si aún no hay
     // imagen (no se ha dibujado nada), su último color de borrado.
-    const auto crop = t ? picture_crop({uint32_t(t->desc.width), uint32_t(t->desc.height)}, w.crop) : VkRect2D{};
-    const auto path = t ? blit_to_swapchain(*t, crop, target.image, w.format, w.extent, slot.cmd) : PicturePath::Clear;
-    if (path == PicturePath::Clear) {
+    if (!t || !blit_to_swapchain(*t, w.crop, w.images[image], w.format, w.extent, slot.cmd)) {
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(slot.cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+        vkCmdClearColorImage(slot.cmd, w.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
     }
-    hud::record(slot.hud, slot.cmd, target.image, w.extent, w.format);
-    const auto final_layout = slot.probe.record(slot.cmd, t, crop, w, target.image, path);
-    present_image_barrier(slot.cmd, target.image, final_layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    if ((r = vkEndCommandBuffer(slot.cmd)) != VK_SUCCESS ||
-        (r = vkResetFences(c->device, 1, &slot.done)) != VK_SUCCESS) return abandon(r);
+    if (t && NVN_FLAG("capture_flash")) record_probe(probe, slot.cmd, *t, w.crop);
+    hud::record(slot.cmd, w.images[image], w.extent, w.format);  // FPS y gráfica, encima del frame
+    barrier(slot.cmd, w.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    vkEndCommandBuffer(slot.cmd);
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -686,30 +740,35 @@ void show(nvn::Window& w, nvn::ResourceRef<nvn::Texture> source) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &slot.cmd;
     si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &target.ready;
+    si.pSignalSemaphores = &slot.rendered;
     {
         std::lock_guard queue_lock(vk_queue_mutex());
-        r = vkQueueSubmit(c->queue, 1, &si, slot.done);
+        vkQueueSubmit(c->queue, 1, &si, slot.done);
     }
-    if (r != VK_SUCCESS) return abandon(r);
     executor_lock.unlock();
 
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &slot.rendered;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &w.swapchain;
+    pi.pImageIndices = &image;
     // Con un generado delante, el real no antes de un refresco después: con los dos listos en el mismo refresco,
     // el compositor de Android se queda con el más nuevo y tira el otro (en pantalla seguían saliendo 30).
     // <datos>/lsfg_margen (ms) añade margen en vivo por si el generado aún no está en pantalla a esa hora.
     VkPresentTimeGOOGLE when{};
+    VkPresentTimesInfoGOOGLE times{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
     if (generated_ns && c->display_timing) {
         when.presentID = generated_id + 1;  // par: el real detrás del generado generated_id
         when.desiredPresentTime =
             static_cast<uint64_t>(generated_ns + lsfg::spacing_ns() + g_lsfg_pacer.margin_ns(c->device, w.swapchain));
+        times.swapchainCount = 1;
+        times.pTimes = &when;
+        pi.pNext = &times;
     }
     {
         std::lock_guard queue_lock(vk_queue_mutex());
-        r = w.queue_image(image, generated_ns ? &when : nullptr);
-    }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
-        NVN_LOG("vkQueuePresentKHR: %s\n", vk_result_name(r));
-        return;
+        vkQueuePresentKHR(c->queue, &pi);
     }
     w.presented++;
     if (w.presented == 60) nvn::driver::works();  // (un driver del usuario que ya ha dibujado: se queda elegido)
@@ -723,14 +782,14 @@ struct AsyncPresenter {
     std::mutex m;
     std::condition_variable cv;
     nvn::Window* window = nullptr;
-    nvn::ResourceRef<nvn::Texture> texture;
+    nvn::Texture* texture = nullptr;
     bool busy = false, started = false;
 
     void wait_idle() {
         std::unique_lock lock(m);
         cv.wait(lock, [&] { return !busy; });
     }
-    void post(nvn::Window& w, nvn::ResourceRef<nvn::Texture> t) {
+    void post(nvn::Window& w, nvn::Texture* t) {
         std::lock_guard lock(m);
         if (!started) {
             started = true;
@@ -748,7 +807,7 @@ struct AsyncPresenter {
         for (;;) {
             cv.wait(lock, [&] { return window != nullptr; });
             nvn::Window* w = std::exchange(window, nullptr);
-            const auto t = texture;
+            nvn::Texture* t = texture;
             lock.unlock();
             show(*w, t);
             lock.lock();
@@ -764,11 +823,11 @@ void nvn::present(Window& w, int index) {
     VkContext* c = vk();
     if (!c || index < 0 || index >= static_cast<int>(w.textures.size())) return;
     g_presenter_thread.wait_idle();  // (the last frame's present, with asynchronous presentation: done first)
-    ResourceRef<Texture> t;
+    Texture* t = nullptr;
     {
         std::lock_guard present_lock(g_present_mutex);
         follow_native_window(w);
-        t = w.textures[index];
+        t = g_textures.get(w.textures[index]);
     }
     // Intervalo de presentación de NVN (NieR pide 2: 30 fps, como en la Switch). FIFO solo garantiza
     // uno por vsync, así que el resto lo pone este ritmo. El reloj del juego mide tiempo real (pasos de 1/60 s,
@@ -801,7 +860,6 @@ void nvn::present(Window& w, int index) {
         if (now < next - early) std::this_thread::sleep_until(next - early);
         next = std::max(next + period, clock::now() + period / 2);
     }
-    capture_loading_present(w.swapchain ? t : nullptr, w.crop);
     if (!w.swapchain) {  // sin ventana (en segundo plano): el juego sigue a su ritmo, sin presentar
         std::lock_guard executor_lock(executor_mutex());
         next_frame();
@@ -856,24 +914,10 @@ nvn::Boolean nvnWindowInitialize(void* window, const WindowBuilder* b) {
     w.native_window = b->native_window;
     w.present_interval = b->present_interval;
     NVN_LOG("ventana con intervalo de presentación %d\n", w.present_interval);
-    for (int i = 0; i < b->texture_count; ++i) w.textures.push_back(nvn::g_textures.reference(b->textures[i]));
-    std::lock_guard lock(g_present_mutex);
-    if (create_swapchain(w)) return 1;
-    nvn::g_windows.destroy(window);
-    return 0;
+    w.textures.assign(b->textures, b->textures + b->texture_count);
+    return create_swapchain(w) ? 1 : 0;
 }
-void nvnWindowFinalize(void* window) {
-    auto w = nvn::g_windows.take(window);
-    if (!w) return;
-    nvn::wait_idle();
-    g_presenter_thread.wait_idle();
-    std::lock_guard lock(g_present_mutex);
-    {
-        std::lock_guard queue_lock(nvn::vk_queue_mutex());
-        vkQueueWaitIdle(nvn::vk()->queue);
-    }
-    destroy_swapchain(*w);
-}
+void nvnWindowFinalize(void* window) { nvn::g_windows.destroy(window); }
 int nvnWindowGetPresentInterval(const void* window) {
     nvn::Window* w = nvn::g_windows.get(window);
     return w ? w->present_interval : 1;

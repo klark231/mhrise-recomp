@@ -23,6 +23,8 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "nnsdk/activity.h"
@@ -1133,6 +1135,109 @@ MultiWaitHolderType* TimedWaitAny(MultiWaitType* w, TimeSpan t) {
 
 // --- Hilos ---
 
+// Threads' CPU and yields, for heat reports (Settings → Performance stats, or the detailed log): every 10 s, the
+// busiest threads with how much CPU each took, how often it yielded and how much of its time went to yielding in a
+// tight loop (yields less than 1 ms apart). On the Switch a yield with nothing else to run costs nothing; here a game
+// thread that polls and yields spins a core, so this tells whether MH Rise waits that way (Peanuts Native found such
+// loops in other games and sleeps in them after 2 ms) before anything changes how a yield behaves.
+namespace {
+struct YieldCount {
+    pid_t tid = 0;
+    std::atomic<uint64_t> yields{0}, loop_ns{0};
+    int64_t last_ns = 0;  // (its own thread only)
+};
+std::mutex g_yield_m;
+std::vector<YieldCount*> g_yield_counts;  // never freed: a few dozen threads
+thread_local YieldCount* t_yield = nullptr;
+
+int64_t mono_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return int64_t{ts.tv_sec} * 1'000'000'000 + ts.tv_nsec;
+}
+
+int64_t task_cpu_ns(pid_t tid) {
+    const clockid_t clock = static_cast<clockid_t>((~static_cast<unsigned>(tid) << 3) | 6);  // CPUCLOCK_SCHED per thread
+    timespec ts{};
+    if (clock_gettime(clock, &ts) != 0) return -1;
+    return int64_t{ts.tv_sec} * 1'000'000'000 + ts.tv_nsec;
+}
+
+void thread_report_loop() {
+    pthread_setname_np(pthread_self(), "ThreadReport");
+    std::unordered_map<pid_t, int64_t> last_cpu;
+    std::unordered_map<pid_t, uint64_t> last_yields, last_loop;
+    int64_t last = mono_ns();
+    for (;;) {
+        timespec ts{10, 0};
+        nanosleep(&ts, nullptr);
+        const int64_t now = mono_ns();
+        const double secs = (now - last) / 1e9;
+        last = now;
+        struct Row {
+            pid_t tid;
+            double cpu_ms, yields, loop_ms;
+        };
+        std::vector<Row> rows;
+        double total = 0;
+        if (DIR* dir = opendir("/proc/self/task")) {
+            while (const dirent* e = readdir(dir)) {
+                const pid_t tid = static_cast<pid_t>(atoi(e->d_name));
+                if (tid <= 0) continue;
+                const int64_t cpu = task_cpu_ns(tid);
+                if (cpu < 0) continue;
+                auto it = last_cpu.find(tid);
+                const int64_t d = it == last_cpu.end() ? 0 : cpu - it->second;
+                last_cpu[tid] = cpu;
+                total += d / 1e6 / secs;
+                rows.push_back({tid, d / 1e6 / secs, 0, 0});
+            }
+            closedir(dir);
+        }
+        {
+            std::lock_guard lock(g_yield_m);
+            for (YieldCount* y : g_yield_counts) {
+                const uint64_t n = y->yields.load(std::memory_order_relaxed), l = y->loop_ns.load(std::memory_order_relaxed);
+                for (Row& r : rows)
+                    if (r.tid == y->tid) {
+                        r.yields = (n - last_yields[y->tid]) / secs;
+                        r.loop_ms = (l - last_loop[y->tid]) / 1e6 / secs;
+                    }
+                last_yields[y->tid] = n;
+                last_loop[y->tid] = l;
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.cpu_ms > b.cpu_ms; });
+        std::string line;
+        for (size_t i = 0; i < rows.size() && i < 10; i++) {
+            char name[32] = "?", path[64], buf[160];
+            snprintf(path, sizeof path, "/proc/self/task/%d/comm", rows[i].tid);
+            if (FILE* f = fopen(path, "r")) {
+                if (fgets(name, sizeof name, f)) name[strcspn(name, "\n")] = 0;
+                fclose(f);
+            }
+            snprintf(buf, sizeof buf, " '%s' %.0f ms/s", name, rows[i].cpu_ms);
+            line += buf;
+            if (rows[i].yields >= 1) {
+                snprintf(buf, sizeof buf, " (%.0f yields/s, %.0f ms/s of it yielding in a loop)", rows[i].yields, rows[i].loop_ms);
+                line += buf;
+            }
+            line += ";";
+        }
+        printf("[os] threads, CPU over %.0f s (%.0f ms/s in all):%s\n", secs, total, line.c_str());
+    }
+}
+
+bool thread_report_on() {
+    static const bool on = [] {
+        const bool v = NVN_FLAG("perf_stats") || NVN_FLAG("verbose_log");
+        if (v) std::thread(thread_report_loop).detach();
+        return v;
+    }();
+    return on;
+}
+}  // namespace
+
 Result CreateThread(ThreadType* t, ThreadFunction fn, void* arg, void*, size_t stack_size, int priority) {
     return create_thread(t, fn, arg, stack_size, priority, kIdealCoreUseDefault);
 }
@@ -1143,6 +1248,7 @@ Result CreateThread(ThreadType* t, ThreadFunction fn, void* arg, void*, size_t s
 
 // La pila que da el juego no se usa: bionic reserva la suya del mismo tamaño.
 void StartThread(ThreadType* type) {
+    thread_report_on();  // (starts the report with the game's first thread, when it's on)
     HostThread& t = g_threads.get(type);
     // Ya corre: el vídeo reintenta Configure + StartThread si su Start falla, y un segundo pthread_create
     // sobre el mismo HostThread dejaba el primero sin join (su pila perdida) y dos bucles en un decoder.
@@ -1172,7 +1278,22 @@ void DestroyThread(ThreadType* type) {
 }
 
 ThreadType* GetCurrentThread() { return current_thread(); }
-void YieldThread() { sched_yield(); }
+void YieldThread() {
+    if (thread_report_on()) {
+        YieldCount* y = t_yield;
+        if (!y) {
+            y = t_yield = new YieldCount;
+            y->tid = gettid();
+            std::lock_guard lock(g_yield_m);
+            g_yield_counts.push_back(y);
+        }
+        const int64_t now = mono_ns();
+        y->yields.fetch_add(1, std::memory_order_relaxed);
+        if (y->last_ns && now - y->last_ns < 1'000'000) y->loop_ns.fetch_add(now - y->last_ns, std::memory_order_relaxed);
+        y->last_ns = now;
+    }
+    sched_yield();
+}
 void SleepThread(TimeSpan t) {
     nnsdk::activity_state().checkpoint();
     // DEPURACIÓN (registro): quién duerme 20 ms o más de una vez.

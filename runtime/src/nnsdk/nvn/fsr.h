@@ -7,8 +7,6 @@
 
 namespace nvn::fsr {
 
-void release_if_resized(VkExtent2D output);
-
 // Escala src (vista muestreable, en GENERAL, de tamaño src_extent) a dst, una imagen del swapchain en
 // TRANSFER_DST_OPTIMAL (dst_extent, formato dst_format). false si no puede (formato, recursos, push descriptors): quien
 // llama hace el blit de siempre.

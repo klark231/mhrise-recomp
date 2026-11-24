@@ -483,6 +483,19 @@ void index_entries(uintptr_t encoded_base) {
   destinations.swap(targets);
   entries.swap(ordered);
 }
+// The same registers and stack slots for every argument, whatever their types. Value types go by address, so two
+// overloads that only take different structs (snow.PlayerNetwork's 26 receive(packet, int)) pass them the same way.
+bool same_registers(const Layout &a, const Layout &b) {
+  if (a.args.size() != b.args.size() || a.stack_bytes != b.stack_bytes ||
+      a.result.kind != b.result.kind)
+    return false;
+  for (size_t i = 0; i < a.args.size(); ++i)
+    if (a.args[i].type.kind != b.args[i].type.kind ||
+        a.args[i].location != b.args[i].location ||
+        a.args[i].offset != b.args[i].offset)
+      return false;
+  return true;
+}
 void describe_site(Site &site, uint32_t method, const Layout &layout,
                    uintptr_t address) {
   site.stack_bytes = layout.stack_bytes;
@@ -495,7 +508,7 @@ void describe_site(Site &site, uint32_t method, const Layout &layout,
   bool wrapper = address != module->addr(module->seg_off[0] + dest);
   auto offset = read<int32_t>(db->methods, 12ull * method + 8);
   std::unordered_map<uint32_t, Layout> owners;
-  bool distinguishable = true, compatible = true;
+  bool distinguishable = true, compatible = true, folded = false;
   for (auto it = begin; it != end; ++it) {
     auto k = it->second;
     auto row = 12ull * k;
@@ -509,8 +522,13 @@ void describe_site(Site &site, uint32_t method, const Layout &layout,
     distinguishable &= instance && !derives(owner, db->find("System.ValueType"));
     compatible &= layout == candidate;
     auto [where, fresh] = owners.emplace(owner, candidate);
-    if (!fresh && !(where->second == candidate))
-      throw std::runtime_error("Same receiver has incompatible signatures at shared entry");
+    if (!fresh && !(where->second == candidate)) {
+      // Overloads of one class the compiler made into one function: nothing at run time says which was called, so a
+      // hook on one of them also sees the others' calls (a script can tell them apart by the argument's type).
+      if (!same_registers(where->second, candidate))
+        throw std::runtime_error("Same receiver has incompatible signatures at shared entry");
+      folded = true;
+    }
   }
   if (!distinguishable && !compatible)
     throw std::runtime_error("Shared entry has no receiver to distinguish incompatible signatures");
@@ -518,6 +536,13 @@ void describe_site(Site &site, uint32_t method, const Layout &layout,
     for (auto &[owner, candidate] : owners)
       site.owners.push_back(owner);
     std::sort(site.owners.begin(), site.owners.end());
+  }
+  if (folded) {
+    auto owner = read<uint32_t>(db->methods, 12ull * method) & id_mask;
+    log_message(ANDROID_LOG_INFO, ("Shared hook entry: " + db->full_name(owner) + "." +
+                                   std::string(db->method(method, owner)) +
+                                   " is one function with other overloads; its hooks see their calls too")
+                                      .c_str());
   }
   log_message(ANDROID_LOG_INFO, site.owners.empty()
       ? "Shared hook entry: methods with identical calling convention share callbacks"

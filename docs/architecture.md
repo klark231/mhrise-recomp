@@ -115,7 +115,7 @@ The game's buffers are its own memory, and the GPU can't read that memory direct
    and `kKeyVersion` in `program.cpp`. **Bump `kKeyVersion` whenever a change alters the SPIR-V produced**, or old
    cached translations keep being used. A graphics stage missing from the cache is translated on a background thread
    (`translate_or_queue`); the draws that need it are skipped until it's ready, instead of the game freezing on it.
-   Compute shaders are still translated where they're used. `no_async_shaders` turns this off.
+   Compute shaders are still translated where they're used. The spirv-opt pass of a new compute shader with a switch runs on that thread, though: the plain translation is used until it's done (`sync_spirv_opt` turns this off). `no_async_shaders` turns this off.
 4. Pipelines: built in the background, with a warm-up at start (`pipelines_estado.bin` lists what was used last time)
    and the driver's pipeline cache. If a driver rejects a pipeline, the stages are retranslated more conservatively
    (`no_safe_translation` turns that off), and the rejected SPIR-V goes to `<data>/pipelines_fallidas/`.

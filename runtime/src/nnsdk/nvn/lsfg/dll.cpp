@@ -209,6 +209,9 @@ const char* dll_status_name(DllStatus s) {
         case DllStatus::Unreadable: return "no se puede leer";
         case DllStatus::NotPortableExecutable: return "no es un PE";
         case DllStatus::MissingShaders: return "faltan shaders";
+        case DllStatus::DirectXOnly:
+            return "only Direct3D shaders: use the Lossless.dll of Lossless Scaling's lsfg-vk beta branch (Steam: "
+                   "Properties, Betas)";
     }
     return "?";
 }
@@ -218,7 +221,8 @@ std::string find_dll() {
     const char* home = getenv("NIER_INTERNO");  // the one imported from the GPU driver screen (DriverActivity)
     const std::string candidates[] = {std::string(home && *home ? home : ".") + "/Lossless.dll",
                                       std::string(data ? data : ".") + "/lsfg/Lossless.dll",
-                                      "/storage/emulated/0/Download/Lossless.dll"};
+                                      "/storage/emulated/0/Download/Lossless.dll",
+                                      "/storage/emulated/0/Download/lsfg-vk.dll"};
     for (const std::string& path : candidates)
         if (access(path.c_str(), R_OK) == 0) return path;
     return {};
@@ -267,7 +271,11 @@ DllStatus load_shaders(const std::string& path, Modules& fp16, Modules& fp32, si
             out->emplace(id, std::move(words));
         }
     }
-    return fp16.empty() && fp32.empty() ? DllStatus::MissingShaders : DllStatus::Ok;
+    if (!fp16.empty() || !fp32.empty()) return DllStatus::Ok;
+    auto generate = resources.find(shader::kGenerate);
+    if (generate != resources.end() && generate->second.size() >= 4 && memcmp(generate->second.data(), "DXBC", 4) == 0)
+        return DllStatus::DirectXOnly;
+    return DllStatus::MissingShaders;
 }
 
 bool audit_module(const std::vector<uint32_t>& w, bool float16, std::string* entry, std::vector<int>* bindings,

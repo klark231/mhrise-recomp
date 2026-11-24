@@ -251,10 +251,14 @@ final class SettingsMenu {
                         + "your controls as player 1's Pro Controller. Much more work for the GPU: for strong phones. Takes "
                         + "effect on the next start.", "使用主机的电视模式（1080p 输出，像素约为掌机的两倍），控制器作为玩家一的 Pro 手柄。GPU 负载较高，下次启动生效。"),
                 "dock_mode", false);
-        flag(tr("Dynamic resolution", "动态分辨率"),
-                tr("If the GPU can't finish a frame in time, it lowers the resolution in steps (down to 73 % of the base) "
-                        + "and raises it again when there's room. Off: always the base.", "GPU 来不及完成一帧时逐级降低分辨率，最低为基础分辨率的 73%；负载降低后再升高。关闭后固定为基础分辨率。"),
-                "no_dynamic_resolution", true);
+        exclusive(tr("Dynamic resolution", "动态分辨率"),
+                tr("If the GPU can't finish a frame in time, the resolution goes down in steps and back up when there's "
+                        + "room. Standard: down to 73 % of the base, starting at full. Wide: down to half, starting low "
+                        + "after every load and climbing while the GPU keeps up (for weak phones that sit at 73 %). Off: "
+                        + "always the base. Applies at once.",
+                        "GPU 来不及完成一帧时逐级降低分辨率，有余力时再升高。标准：最低为基础分辨率的 73%，从满分辨率开始。宽范围：最低为一半，每次加载后从低分辨率开始，GPU 跟得上时逐步升高（适合停在 73% 的弱机）。关闭：固定为基础分辨率。立即生效。"),
+                new String[] {tr("Standard (73-100 %)", "标准（73-100%）"), tr("Wide (50-100 %)", "宽范围（50-100%）"), tr("Off", "关")},
+                new String[] {null, "dynres_wide", "no_dynamic_resolution"});
         flag(tr("FSR upscaling", "FSR 超分辨率"),
                 tr("AMD FSR 1 takes the 720p picture to the screen sharper than a plain scale. Off: linear scaling, a "
                         + "little cheaper.", "使用 AMD FSR 1 将 720p 画面放大至屏幕。关闭后采用开销较低的线性缩放。"),
@@ -358,6 +362,13 @@ final class SettingsMenu {
                         + "less work for the GPU, simpler models a little closer. Applies at once.", "调整随距离切换低细节模型的时机。调低后，更近的模型也会简化，GPU 负载随之下降。立即生效。"),
                 new String[] {tr("Game's", "游戏默认"), tr("Low", "低"), tr("Lowest", "更低"), tr("Minimum", "最低"), tr("High", "高")},
                 new String[] {null, "model_detail_low", "model_detail_lowest", "model_detail_min", "model_detail_high"});
+        exclusive(tr("Render distance", "渲染距离"),
+                tr("How far away small and medium things (rocks, plants, props, small monsters) stay drawn, as a share of "
+                        + "the game's own distance. Lower: they disappear sooner in the distance and the GPU draws less. "
+                        + "Terrain, big monsters and hunters are big enough to stay. Applies at once.",
+                        "小型和中型物体（岩石、植物、道具、小怪物）在多远距离内仍会绘制，按游戏默认距离的比例计算。调低后远处物体更早消失，GPU 绘制更少。地形、大型怪物和猎人足够大，不受影响。立即生效。"),
+                new String[] {tr("100% (game's)", "100%（游戏默认）"), "75%", "50%", "33%", "25%"},
+                new String[] {null, "draw_distance_75", "draw_distance_50", "draw_distance_33", "draw_distance_25"});
         exclusive(tr("Texture streaming", "纹理流送"),
                 tr("How many of the largest texture sizes the game skips loading. Fewer: blurrier textures up close, less "
                         + "memory and bandwidth. Applies as textures load.", "跳过最高的若干级纹理。较小的纹理在近处更模糊，但可节省内存和带宽。加载纹理时生效。"),
@@ -533,12 +544,12 @@ final class SettingsMenu {
                         + "still make the GPU wait and flush. On: those are skipped (less waiting, a little less heat). Off "
                         + "by default: if graphics glitch with it on, turn it off. Applies at once.", "省略中间没有任务的连续 GPU 屏障，减少等待与发热。默认关闭，若开启后画面异常可关闭。立即生效。"),
                 "tight_barriers", false);
-        flag(tr("Fast textures", "快速纹理"),
-                tr("For speed over accuracy: each draw's textures are looked up by where the game keeps them ("
-                        + "not what they are now), and textures the CPU rewrites are checked every other frame. Less CPU time "
-                        + "in busy places, but old glitches can come back: blood as big patches, magnified particles, a texture "
-                        + "a frame late. Applies at once.", "以准确性换取速度：按游戏存放纹理的位置查找每次绘制的纹理，CPU 改写的纹理隔帧检查。人多的场景 CPU 负担更低，但旧问题可能重现：血迹变成大块、粒子被放大、纹理晚一帧更新。立即生效。"),
-                "fast_textures", false);
+        flag(tr("Lighter GPU barriers", "更轻的 GPU 屏障"),
+                tr("Many of the game's GPU stops in a hunt only ask the GPU to finish drawing pixels before drawing more. "
+                        + "On: those wait for the pixel work only instead of the whole GPU (less waiting, a little "
+                        + "less heat). Off by default: if graphics glitch with it on, turn it off. Applies at once.",
+                        "狩猎中游戏的许多 GPU 屏障只要求先画完像素。开启后这些屏障只等待像素部分，而不是整个 GPU（等待更少，发热略低）。默认关闭，若开启后画面异常可关闭。立即生效。"),
+                "barrier_bits", false);
         exclusive(tr("Pipeline worker threads", "管线编译线程数"),
                 tr("Threads available to build GPU pipelines. More can finish shader warm-up sooner. "
                         + "A draw waits if its pipeline is still being built. Takes effect on the next start.", "可用于编译 GPU 管线的线程数。增加线程可加快预热；绘制仍会等待正在构建的管线。下次启动生效。"),
@@ -2085,13 +2096,13 @@ final class SettingsMenu {
 
     // Every switch the menu has ever written as its own file, so Restore default settings clears old folders too.
     private static final String[] SWITCHES = {
-        "60fps", "adreno_turbo", "fast_textures", "cutout", "system_bars", "cool_down", "no_hud_heat", "no_tight_barriers", "tight_barriers", "int_attribs", "gpu_unswizzle", "async_present", "pipeline_threads_1", "pipeline_threads_3", "pipeline_threads_4", "fg_target_60", "fg_target_90", "fg_target_120", "dynamic_state", "vertex_input_state",
+        "60fps", "adreno_turbo", "fast_textures", "cutout", "system_bars", "cool_down", "no_hud_heat", "no_tight_barriers", "tight_barriers", "barrier_bits", "int_attribs", "gpu_unswizzle", "async_present", "pipeline_threads_1", "pipeline_threads_3", "pipeline_threads_4", "fg_target_60", "fg_target_90", "fg_target_120", "dynamic_state", "vertex_input_state",
         "no_dynamic_state", "astc_cache_in_data_folder", "bc_astc", "aspect_16_10", "aspect_21_9", "aspect_4_3", "aspect_stretch", "bindless_arrays", "breadcrumbs",
         "capture_button", "count_check", "depth_gequal", "dock_mode", "effects_lower", "effects_lowest", "fast_depth", "fps_20", "fps_25", "fps_40",
         "fps_45", "gpu_occlusion", "hud_battery", "hud_cpu", "hud_frametime", "hud_gpu", "hud_ram", "hud_shaders", "no_hud_battery", "no_hud_cpu",
-        "no_hud_frametime", "no_hud_gpu", "no_hud_ram", "no_hud_shaders", "lsfg_no_guard", "keep_dead_functions", "log_lines", "low_memory", "model_detail_high", "model_detail_low",
+        "no_hud_frametime", "no_hud_gpu", "no_hud_ram", "no_hud_shaders", "lsfg_no_guard", "keep_dead_functions", "log_lines", "low_memory", "model_detail_high", "model_detail_low", "draw_distance_75", "draw_distance_50", "draw_distance_33", "draw_distance_25",
         "model_detail_lowest", "model_detail_min", "no_adpf", "no_af", "no_affinity", "no_ao", "no_async_shaders", "no_bindless_arrays", "no_bloom",
-        "no_chromatic_aberration", "no_depth_of_field", "no_dynamic_resolution", "no_dynamic_shadows",
+        "no_chromatic_aberration", "no_depth_of_field", "no_dynamic_resolution", "dynres_wide", "no_dynamic_shadows",
         "no_effect_ssr", "no_film_grain", "no_foliage_sway", "no_fps", "no_fsr", "no_fxaa", "no_god_rays",
         "no_gpu_occlusion", "no_int_attribs", "no_lens_flare", "no_motion_blur", "no_quad_derivatives", "no_readback_copies",
         "no_return_mali", "no_return_qualcomm", "no_robust", "no_count_check", "no_safe_translation", "no_shadows", "no_short_subgroups",

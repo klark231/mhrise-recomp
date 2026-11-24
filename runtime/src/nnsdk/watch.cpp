@@ -322,6 +322,15 @@ void collect(uintptr_t address, size_t size, std::vector<uint64_t>& keys, std::v
     }
 }
 
+bool fully_mapped(uintptr_t address, size_t size) {
+    if (!g_enabled || !size) return true;
+    bool is_virtual = false;
+    if (heap_page(address, &is_virtual) == -1 || !is_virtual) return true;
+    for (uintptr_t a = address & ~(kPage - 1); a < address + size; a += kPage)
+        if (heap_page(a) < 0) return false;
+    return true;
+}
+
 uint64_t faults() { return g_faults.load(std::memory_order_relaxed); }
 uint64_t protects() { return g_protects.load(std::memory_order_relaxed); }
 uint64_t protect_ns() { return g_protect_ns.load(std::memory_order_relaxed); }

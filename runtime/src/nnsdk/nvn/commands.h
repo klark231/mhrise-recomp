@@ -24,7 +24,6 @@ struct BufferRange {
 };
 struct CopyRegion {
     int x, y, z, width, height, depth;
-    bool operator==(const CopyRegion&) const = default;
 };
 
 // Lista corta de T guardada dentro del propio comando (antes un std::vector: ~13k reservas de memoria por
@@ -52,6 +51,15 @@ public:
     const T* begin() const { return data(); }
     const T* end() const { return data() + size_; }
     const T& operator[](size_t k) const { return data()[k]; }
+    // El estado del ejecutor guarda std::vector (`st_.attribs = v.attribs`): se copia a un vector del hilo y la
+    // asignación reutiliza la capacidad del destino, sin reservar memoria. La referencia vale hasta la siguiente
+    // conversión de este mismo tipo en el mismo hilo: no se guarda.
+    operator const std::vector<T>&() const {
+        thread_local std::vector<T> scratch;
+        scratch.assign(begin(), end());
+        return scratch;
+    }
+
 private:
     uint32_t size_ = 0;
     union {
@@ -64,9 +72,9 @@ namespace cmd {
 
 struct SetRenderTargets {
     int count;
-    ResourceRef<Texture> colors[8];
+    Texture* colors[8];
     TextureViewDesc color_views[8];
-    ResourceRef<Texture> depth;
+    Texture* depth;
     TextureViewDesc depth_view;
 };
 struct ClearColor {
@@ -124,8 +132,8 @@ struct BindVertexStreams {
     SmallVector<VertexStreamState, 8> streams;
 };
 struct SetPools {
-    ResourceRef<DescriptorPool> textures;
-    ResourceRef<DescriptorPool> samplers;
+    DescriptorPool* textures;
+    DescriptorPool* samplers;
 };
 struct Stencil {
     enum What { Ref, Mask, ValueMask } what;
@@ -169,22 +177,21 @@ struct ClearBuffer {
 };
 struct FenceSync {
     void* sync;
-    int flags = 0;
 };
 struct CopyBuffer {
     uint64_t src, dst, size;
 };
 struct CopyTexture {
-    ResourceRef<Texture> src;
+    Texture* src;
     TextureViewDesc src_view;
     CopyRegion src_region;
-    ResourceRef<Texture> dst;
+    Texture* dst;
     TextureViewDesc dst_view;
     CopyRegion dst_region;
 };
 struct CopyBufferToTexture {
     uint64_t src;
-    ResourceRef<Texture> dst;
+    Texture* dst;
     TextureViewDesc dst_view;
     CopyRegion region;
 };
@@ -202,7 +209,7 @@ struct BindImage {
 };
 // nvnCommandBufferClearTexture{,i,ui}: una región de una textura a un color (float, int o uint según el formato).
 struct ClearTexture {
-    ResourceRef<Texture> texture;
+    Texture* texture;
     TextureViewDesc view;
     CopyRegion region;
     uint32_t color[4];  // los bits tal cual: VkClearColorValue los lee como float, int o uint según el formato
@@ -302,8 +309,10 @@ void perf_hint_frame(int64_t period_ns);
 void game_tweaks();
 // Copia la textura de la ventana a la imagen del swapchain (la llama window.cpp al presentar).
 // Con FSR 1 (fsr.cpp) si el formato lo permite; si no, un blit lineal.
-PicturePath blit_to_swapchain(Texture& texture, const VkRect2D& crop, VkImage swapchain_image, VkFormat format, VkExtent2D extent,
+bool blit_to_swapchain(Texture& texture, const VkRect2D& crop, VkImage swapchain_image, VkFormat format, VkExtent2D extent,
                        VkCommandBuffer cmd);
+// Where the picture goes on a screen of that size (the aspect ratio setting): its size and top-left corner
+void picture_rect(VkExtent2D screen, VkExtent2D* out, VkOffset2D* at);
 // Se presentó un frame (window.cpp): las texturas que escribe la CPU se revisan una vez por frame.
 void next_frame();
 // Para la resolución dinámica (window.cpp): la GPU del último frame del juego que ya se leyó (sus timestamps de
@@ -316,16 +325,13 @@ uint64_t last_frame_run_ns();
 void request_trace(bool full);
 // DEPURACIÓN: en ciertos frames vuelca a la SD la textura presentada y los render targets del frame.
 void debug_dump_frame(Texture* presented);
-void capture_loading_present(ResourceRef<Texture> presented, const VkRect2D& crop);
 // Envíos asíncronos (executor.cpp): número del último envío, espera a que termine uno (false si vence
 // el plazo; no espera a que acabe la reproducción de otro) y espera a que terminen todos.
 uint64_t last_submit();
 // Un NVNsync queda señalado al terminar ese envío (queue.cpp; FenceSync de la cola y del command buffer).
 void sync_signal_at(void* sync, uint64_t submit);
-void sync_fail_at(void* sync, uint64_t submit);
 bool wait_submit(uint64_t submit, uint64_t timeout_ns);
 void wait_idle();
-bool sync_texture_storage(Texture& texture, const Texture::TexelWrite& region);
 // La VkQueue no admite accesos concurrentes: todo vkQueueSubmit/vkQueuePresentKHR pasa por este mutex (solo
 // la llamada: no se espera nada con él). Va después de executor_mutex() si se toman los dos.
 std::mutex& vk_queue_mutex();
@@ -334,9 +340,6 @@ std::mutex& vk_queue_mutex();
 // framebuffers. Quien toca un objeto que el ejecutor puede estar leyendo toma executor_mutex() (el mismo
 // que serializa la ejecución de los comandos).
 std::recursive_mutex& executor_mutex();
-bool publish_virtual_pool(void* pool, Texture* only = nullptr);
-bool publish_virtual_buffers(void* pool);
-void queue_cpu_fence(void* sync);
 // Perfil de cargas: lo que un hilo del juego esperó a executor_mutex() (el ejecutor lo tiene durante todo un envío).
 void note_executor_lock_wait(uint64_t ns);
 // Toma executor_mutex() con `lock` (sin tomar) y, si estaba ocupado, apunta la espera.

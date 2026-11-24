@@ -15,7 +15,7 @@ struct VkContext {
     VkDevice device = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
     VkQueue queue = VK_NULL_HANDLE;
-    // The enabled device extensions support VK_ATTACHMENT_STORE_OP_NONE on this Vulkan 1.1 instance.
+    // VK_QCOM_render_pass_store_ops activa: los render passes pueden usar VK_ATTACHMENT_STORE_OP_NONE.
     bool store_op_none = false;
     // VK_GOOGLE_display_timing activa: se puede pedir a qué hora se muestra cada imagen (LSFG: el real 16,7 ms
     // después del generado, para que el compositor no tire uno de los dos).
@@ -42,8 +42,6 @@ struct VkContext {
     bool tessellation = false;         // the tessellationShader feature
     bool multi_draw_indirect = false;  // the multiDrawIndirect feature: more than one draw per indirect call
     bool fill_non_solid = true;        // the fillModeNonSolid feature: point and line polygon modes
-    bool present_fences = false;
-    bool load_op_none = false;
 };
 
 // Se crea en la primera llamada; nullptr si Vulkan no arranca.

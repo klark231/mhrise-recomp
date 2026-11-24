@@ -37,7 +37,7 @@
 
 #include "nnsdk/nvn/commands.h"
 #include "nnsdk/nvn/flags.h"
-#include "nnsdk/nvn/present_image.h"
+#include "nnsdk/nvn/fsr.h"
 #include "nnsdk/nvn/hud.h"
 #include "nnsdk/nvn/lsfg/chain.h"
 #include "nnsdk/nvn/lsfg/dll.h"
@@ -71,18 +71,16 @@ std::string data_path(const char* name) {
 constexpr int kMaxExtra = 2;
 constexpr int kTargetFrames = 15;  // real frames a new multiplier has to hold before it's used (no flip-flopping)
 struct Extra {
-    hud::Uploads hud;
     VkCommandBuffer cmd = VK_NULL_HANDLE, blit = VK_NULL_HANDLE;
-    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE, rendered = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
     bool pending = false;
 };
 
 struct Slot {
-    hud::Uploads hud;
     Extra extra[kMaxExtra];
     VkCommandBuffer cmd = VK_NULL_HANDLE, blit = VK_NULL_HANDLE;
-    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE, rendered = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
     bool pending = false, timed = false;
     const Generator* chain = nullptr;  // la cadena que usa este envío (no se suelta hasta que acabe)
@@ -91,7 +89,7 @@ struct Slot {
 class FrameGen {
 public:
     uint32_t swapchain_images(const VkSurfaceCapabilitiesKHR& caps);
-    void present(Window& w, ResourceRef<Texture> source);
+    void present(Window& w, Texture* t);
     uint64_t generated() const { return total_generated_; }  // desde el arranque (las estadísticas se reinician)
     // Lo que le cuesta a la GPU un frame generado (media móvil, ns) mientras LSFG está encendido; 0 apagado.
     int64_t reserved_ns() const {
@@ -117,7 +115,7 @@ private:
     bool compile(std::string* why, bool* missing);
     void log_stats(Clock::time_point now);
     bool record_lsfg(int index, const Texture& t, const VkRect2D& crop, uint64_t n, bool generate);
-    bool record_blit(hud::Uploads& uploads, VkCommandBuffer blit, const Window& w, VkImage image);
+    bool record_blit(VkCommandBuffer blit, const Window& w, uint32_t image);
     bool wait_generations(uint64_t timeout_ns);
     int64_t refresh_ns(const Window& w);
     void present_extras(Window& w, Slot& s, uint64_t n, int m, int64_t first_ns);
@@ -210,6 +208,7 @@ bool FrameGen::setup() {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkAllocateCommandBuffers(c->device, &ai, cmds) != VK_SUCCESS ||
             vkCreateSemaphore(c->device, &si, nullptr, &s.acquired) != VK_SUCCESS ||
+            vkCreateSemaphore(c->device, &si, nullptr, &s.rendered) != VK_SUCCESS ||
             vkCreateFence(c->device, &fi, nullptr, &s.done) != VK_SUCCESS)
             return disable("sin memoria para los envíos"), false;
         s.cmd = cmds[0];
@@ -218,6 +217,7 @@ bool FrameGen::setup() {
             VkCommandBuffer more[2];
             if (vkAllocateCommandBuffers(c->device, &ai, more) != VK_SUCCESS ||
                 vkCreateSemaphore(c->device, &si, nullptr, &e.acquired) != VK_SUCCESS ||
+                vkCreateSemaphore(c->device, &si, nullptr, &e.rendered) != VK_SUCCESS ||
                 vkCreateFence(c->device, &fi, nullptr, &e.done) != VK_SUCCESS)
                 return disable("sin memoria para los envíos"), false;
             e.cmd = more[0];
@@ -545,23 +545,54 @@ bool FrameGen::record_lsfg(int index, const Texture& t, const VkRect2D& crop, ui
 }
 
 // La salida de la cadena (1280x720) escalada a la imagen del swapchain, igual que window.cpp hace con el real.
-bool FrameGen::record_blit(hud::Uploads& uploads, VkCommandBuffer blit, const Window& w, VkImage image) {
+bool FrameGen::record_blit(VkCommandBuffer blit, const Window& w, uint32_t image) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkResetCommandBuffer(blit, 0);
     if (VkResult r = vkBeginCommandBuffer(blit, &bi); r != VK_SUCCESS)
         return disable(std::string("vkBeginCommandBuffer: ") + vk_result_name(r)), false;
-    present_image_barrier(blit, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = w.images[image];
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(blit, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                         1, &b);
     const Image& out = chain_->output();
-    compose_picture(blit, out.image, out.view, out.extent, {{0,0}, out.extent}, image, w.format, w.extent);
-    hud::record(uploads, blit, image, w.extent, w.format);
-    present_image_barrier(blit, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // Con FSR, como el frame real (window.cpp): si no, el generado salía más blando y la nitidez parpadeaba a 30 Hz.
+    // (in the same rectangle as the real frames: the aspect ratio setting)
+    VkExtent2D rect;
+    VkOffset2D at;
+    picture_rect(w.extent, &rect, &at);
+    if (rect.width != w.extent.width || rect.height != w.extent.height) {
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(blit, w.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    }
+    if (!fsr::record(blit, out.view, out.extent, out.extent, w.images[image], w.format, rect, at)) {
+        VkImageBlit region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffsets[1] = {static_cast<int32_t>(out.extent.width), static_cast<int32_t>(out.extent.height), 1};
+        region.dstOffsets[0] = {at.x, at.y, 0};
+        region.dstOffsets[1] = {at.x + static_cast<int32_t>(rect.width), at.y + static_cast<int32_t>(rect.height), 1};
+        vkCmdBlitImage(blit, out.image, VK_IMAGE_LAYOUT_GENERAL, w.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                       &region, VK_FILTER_LINEAR);
+    }
+    hud::record(blit, w.images[image], w.extent, w.format);  // el HUD también en los generados
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = 0;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(blit, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
     if (VkResult r = vkEndCommandBuffer(blit); r != VK_SUCCESS)
         return disable(std::string("vkEndCommandBuffer: ") + vk_result_name(r)), false;
     return true;
 }
 
-void FrameGen::present(Window& w, ResourceRef<Texture> source) {
+void FrameGen::present(Window& w, Texture* t) {
     const bool on = NVN_FLAG("lsfg");
     const Clock::time_point now = Clock::now();
     const double dt = last_ == Clock::time_point{} ? 0.0 : ms_between(last_, now);
@@ -572,7 +603,6 @@ void FrameGen::present(Window& w, ResourceRef<Texture> source) {
     // Primero el del ejecutor (lee t->image, que el juego puede rehacer) y luego el de la cola: el mismo orden que
     // el resto (ejecutor -> cola), sin cruces.
     std::lock_guard executor_lock(executor_mutex());
-    Texture* t = source.get();
     std::lock_guard lock(vk_queue_mutex());
     poll_slots();
     poll_job();
@@ -727,11 +757,7 @@ void FrameGen::present(Window& w, ResourceRef<Texture> source) {
         warming_++;
     }
     // Sin imagen se graba igual la copia y lo compartido: la historia sigue llena para el frame siguiente.
-    if (!record_lsfg(index, *t, crop, n, generate) ||
-        (generate && !record_blit(s.hud, s.blit, w, w.images[image].image))) {
-        if (generate) w.rebuild = true;
-        return;
-    }
+    if (!record_lsfg(index, *t, crop, n, generate) || (generate && !record_blit(s.blit, w, image))) return;
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si[2] = {{VK_STRUCTURE_TYPE_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_SUBMIT_INFO}};
@@ -743,7 +769,7 @@ void FrameGen::present(Window& w, ResourceRef<Texture> source) {
     si[1].commandBufferCount = 1;
     si[1].pCommandBuffers = &s.blit;
     si[1].signalSemaphoreCount = 1;
-    si[1].pSignalSemaphores = generate ? &w.images[image].ready : nullptr;
+    si[1].pSignalSemaphores = &s.rendered;
     vkResetFences(c->device, 1, &s.done);
     if (VkResult r = vkQueueSubmit(c->queue, generate ? 2 : 1, si, s.done); r != VK_SUCCESS)
         return disable(std::string("vkQueueSubmit: ") + vk_result_name(r));
@@ -754,12 +780,23 @@ void FrameGen::present(Window& w, ResourceRef<Texture> source) {
     warm_++;
     if (!generate) return;
 
+    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &s.rendered;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &w.swapchain;
+    pi.pImageIndices = &image;
     // presentID impar (2k+1): window.cpp pregunta luego cuándo salió en pantalla (VK_GOOGLE_display_timing).
     VkPresentTimeGOOGLE when{static_cast<uint32_t>(2 * total_generated_ + 1), 0};
+    VkPresentTimesInfoGOOGLE times{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+    if (c->display_timing) {
+        times.swapchainCount = 1;
+        times.pTimes = &when;
+        pi.pNext = &times;
+    }
     const int64_t queued_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
-    VkResult r = w.queue_image(image, &when);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) return;
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+    VkResult r = vkQueuePresentKHR(c->queue, &pi);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
         return disable(std::string("vkQueuePresentKHR: ") + vk_result_name(r));
     generated_++;
     hud::generated_frame();
@@ -835,10 +872,7 @@ void FrameGen::present_extras(Window& w, Slot& s, uint64_t n, int m, int64_t fir
         vkCmdPipelineBarrier(e.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
         if (vkEndCommandBuffer(e.cmd) != VK_SUCCESS) return disable("vkEndCommandBuffer");
-        if (!record_blit(e.hud, e.blit, w, w.images[image].image)) {
-            w.rebuild = true;
-            return;
-        }
+        if (!record_blit(e.blit, w, image)) return;
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo si[2] = {{VK_STRUCTURE_TYPE_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_SUBMIT_INFO}};
         si[0].commandBufferCount = 1;
@@ -849,16 +883,27 @@ void FrameGen::present_extras(Window& w, Slot& s, uint64_t n, int m, int64_t fir
         si[1].commandBufferCount = 1;
         si[1].pCommandBuffers = &e.blit;
         si[1].signalSemaphoreCount = 1;
-        si[1].pSignalSemaphores = &w.images[image].ready;
+        si[1].pSignalSemaphores = &e.rendered;
         vkResetFences(c->device, 1, &e.done);
         if (VkResult q = vkQueueSubmit(c->queue, 2, si, e.done); q != VK_SUCCESS)
             return disable(std::string("vkQueueSubmit: ") + vk_result_name(q));
         e.pending = true;
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &e.rendered;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &w.swapchain;
+        pi.pImageIndices = &image;
         VkPresentTimeGOOGLE when{static_cast<uint32_t>(2 * total_generated_ + 1),
                                  static_cast<uint64_t>(first_ns + (k - 1) * spacing_ns_)};
-        r = w.queue_image(image, &when);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) return;
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+        VkPresentTimesInfoGOOGLE times{VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
+        if (c->display_timing) {
+            times.swapchainCount = 1;
+            times.pTimes = &when;
+            pi.pNext = &times;
+        }
+        r = vkQueuePresentKHR(c->queue, &pi);
+        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR)
             return disable(std::string("vkQueuePresentKHR: ") + vk_result_name(r));
         generated_++;
         hud::generated_frame();
@@ -876,7 +921,7 @@ int64_t reserved_ns() { return g_framegen.reserved_ns(); }
 
 int64_t spacing_ns() { return g_framegen.spacing_ns(); }
 
-int64_t present_generated(Window& w, ResourceRef<Texture> t, uint32_t* id) {
+int64_t present_generated(Window& w, Texture* t, uint32_t* id) {
     const uint64_t before = g_framegen.generated();
     g_framegen.present(w, t);
     if (g_framegen.generated() == before) return 0;

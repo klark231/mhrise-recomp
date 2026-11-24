@@ -196,7 +196,7 @@ TextureViewDesc view_of(const void* view) {
 void clear_texture(void* cmd, const void* texture, const void* view, const CopyRegion* region, const void* color, int mask) {
     if (!texture || !region || !color) return;
     cmd::ClearTexture c{};
-    c.texture = g_textures.reference(texture);
+    c.texture = g_textures.get(texture);
     c.view = view_of(view);
     c.region = *region;
     memcpy(c.color, color, sizeof c.color);
@@ -295,10 +295,10 @@ void nvnCommandBufferSetRenderTargets(void* cmd, int count, void* const* colors,
     cmd::SetRenderTargets c{};
     c.count = count > 8 ? 8 : count;
     for (int k = 0; k < c.count; k++) {
-        c.colors[k] = colors && colors[k] ? g_textures.reference(colors[k]) : nullptr;
+        c.colors[k] = colors && colors[k] ? g_textures.get(colors[k]) : nullptr;
         c.color_views[k] = view_of(color_views ? color_views[k] : nullptr);
     }
-    c.depth = depth ? g_textures.reference(depth) : nullptr;
+    c.depth = depth ? g_textures.get(depth) : nullptr;
     c.depth_view = view_of(depth_view);
     static int logged = 0;  // DEPURACIÓN: ¿se pierde algún target de un MRT?
     if (count > 1 && logged < 20) {
@@ -448,10 +448,10 @@ void nvnCommandBufferBindImages(void* cmd, int stage, int first, int count, cons
     for (int k = 0; k < count && handles; k++) record(cmd, cmd::BindImage{stage, first + k, handles[k]});
 }
 void nvnCommandBufferSetTexturePool(void* cmd, const void* pool) {
-    record(cmd, cmd::SetPools{g_texture_pools.reference(pool), nullptr});
+    record(cmd, cmd::SetPools{g_texture_pools.get(pool), nullptr});
 }
 void nvnCommandBufferSetSamplerPool(void* cmd, const void* pool) {
-    record(cmd, cmd::SetPools{nullptr, g_sampler_pools.reference(pool)});
+    record(cmd, cmd::SetPools{nullptr, g_sampler_pools.get(pool)});
 }
 
 // --- Draws y compute ---
@@ -512,12 +512,12 @@ void nvnCommandBufferCopyBufferToBuffer(void* cmd, uint64_t src, uint64_t dst, s
 }
 void nvnCommandBufferCopyTextureToTexture(void* cmd, const void* src, const void* src_view, const CopyRegion* src_region,
                                           const void* dst, const void* dst_view, const CopyRegion* dst_region, int) {
-    record(cmd, cmd::CopyTexture{g_textures.reference(src), view_of(src_view), *src_region, g_textures.reference(dst),
+    record(cmd, cmd::CopyTexture{g_textures.get(src), view_of(src_view), *src_region, g_textures.get(dst),
                                  view_of(dst_view), *dst_region});
 }
 void nvnCommandBufferCopyBufferToTexture(void* cmd, uint64_t src, const void* dst, const void* dst_view,
                                          const CopyRegion* region, int) {
-    record(cmd, cmd::CopyBufferToTexture{src, g_textures.reference(dst), view_of(dst_view), *region});
+    record(cmd, cmd::CopyBufferToTexture{src, g_textures.get(dst), view_of(dst_view), *region});
 }
 void nvnCommandBufferBarrier(void* cmd, int bits) { record(cmd, cmd::Barrier{bits}); }
 void nvnCommandBufferSetBlendColor(void* cmd, const float* color) {
@@ -538,7 +538,7 @@ void nvnCommandBufferResetCounter(void*, int) {}
 void nvnCommandBufferClearBuffer(void* cmd, uint64_t address, size_t size, uint32_t value) {
     record(cmd, cmd::ClearBuffer{address, size, value});
 }
-void nvnCommandBufferFenceSync(void* cmd, void* sync, int, int flags) { record(cmd, cmd::FenceSync{sync, flags}); }
+void nvnCommandBufferFenceSync(void* cmd, void* sync, int, int) { record(cmd, cmd::FenceSync{sync}); }
 // Constantes en línea (las de cada draw en MH Rise): los bytes se copian ahora a la lista y se escriben en
 // buffer + offset al reproducir, entre los comandos de antes y los de después (ver el ejecutor).
 void nvnCommandBufferUpdateUniformBuffer(void* cmd, uint64_t buffer, size_t buffer_size, int64_t offset, size_t size,
