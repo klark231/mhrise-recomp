@@ -106,7 +106,9 @@ mixed each time. It's now one continuous queue (`audio_cola.h`).
   distance, through the game's own small-object culling (its ratio divided by the share picked).
 - **First-use freezes on Turnip:** every compute shader went through spirv-opt, which took 4.3 s for 4 new shaders the
   first time an attack used them (plus 1.5 s of their pipelines). That was a fix for Qualcomm's own compiler; on Mesa
-  drivers only compute shaders with a switch (BRX) go through it now (`spirv_opt_compute` restores the old rule).
+  drivers only compute shaders with a switch (BRX) go through it now (`spirv_opt_compute` restores the old rule), and
+  on a background thread, with the plain translation until it's done (`sync_spirv_opt`: as before). Up to 6 s of freeze
+  the first time an effect appeared was enough for an online hunt to close the session.
 - **BC textures as ASTC on drivers without BC** (`bc_astc`, off by default until tested; BC1, and BC2/BC3 with one alpha per block, convert without the encoder): 2-8 times less texture memory traffic
   than RGBA8. The first load of each texture is slower (CPU encode); the cache in the data folder makes the next ones a
   file read.

@@ -3763,6 +3763,9 @@ void Executor::apply(const Command& c) {
                 // El compute va aparte: st_.stages solo lleva las etapas del pipeline gráfico.
                 if (v.program)
                     for (ProgramStage& ps : v.program->stages)
+                        if (ps.optimize_pending) take_optimized(ps);  // its spirv-opt translation, once it's ready
+                if (v.program)
+                    for (ProgramStage& ps : v.program->stages)
                         if (ps.tried ? ps.module != VK_NULL_HANDLE : [&] {
                                 LoadTimer timer(*this, kLdShader);  // solo la primera vez (traducir o de la caché)
                                 if (translate_or_queue(ps) == 1) {
