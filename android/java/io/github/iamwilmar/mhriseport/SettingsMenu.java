@@ -336,6 +336,12 @@ final class SettingsMenu {
                         + "which can give a few more FPS, mostly on Adreno. Grass and leaves keep the game's own test so "
                         + "they don't turn into solid cards. Applies at once.", "在颜色绘制时提前剔除被遮挡的像素，部分 Adreno 设备可提升帧率。草木保留游戏的深度测试。立即生效。"),
                 "fast_depth", false);
+        flag(tr("Skip depth pre-pass (experimental)", "跳过深度预渲染（实验性）"),
+                tr("Doesn't draw the scene's depth pre-pass; the colour pass does the depth work itself. Can save several "
+                        + "ms of GPU time on a weak GPU. May break things that read the depth early: missing or flickering "
+                        + "objects, wrong fog or shadows. Grass and leaves may disappear. If anything looks wrong, turn it "
+                        + "off. Off by default. Applies at once.", "不绘制场景的深度预渲染，由颜色绘制自行完成深度。在较弱的 GPU 上可节省数毫秒。可能导致物体缺失或闪烁、雾和阴影异常，草木可能消失。若画面异常请关闭。默认关闭，立即生效。"),
+                "skip_prepass", false);
         header(tr("Detail", "细节"));
         flag(tr("Occlusion results", "遮挡查询结果"),
                 tr("Lets the game see which small things its GPU test found visible, so endemic life, wirebugs and some "
@@ -2097,7 +2103,7 @@ final class SettingsMenu {
     private static final String[] SWITCHES = {
         "60fps", "adreno_turbo", "sustained_perf", "fast_textures", "cutout", "system_bars", "cool_down", "no_hud_heat", "no_tight_barriers", "tight_barriers", "barrier_bits", "int_attribs", "gpu_unswizzle", "async_present", "pipeline_threads_1", "pipeline_threads_3", "pipeline_threads_4", "fg_target_60", "fg_target_90", "fg_target_120", "dynamic_state", "vertex_input_state",
         "no_dynamic_state", "astc_cache_in_data_folder", "bc_astc", "aspect_16_10", "aspect_21_9", "aspect_4_3", "aspect_stretch", "bindless_arrays", "breadcrumbs",
-        "capture_button", "count_check", "depth_gequal", "dock_mode", "effects_lower", "effects_lowest", "fast_depth", "fps_20", "fps_25", "fps_40",
+        "capture_button", "count_check", "depth_gequal", "dock_mode", "effects_lower", "effects_lowest", "fast_depth", "skip_prepass", "fps_20", "fps_25", "fps_40",
         "fps_45", "gpu_occlusion", "hud_battery", "hud_cpu", "hud_frametime", "hud_gpu", "hud_ram", "hud_shaders", "no_hud_battery", "no_hud_cpu",
         "no_hud_frametime", "no_hud_gpu", "no_hud_ram", "no_hud_shaders", "lsfg_no_guard", "keep_dead_functions", "log_lines", "low_memory", "model_detail_high", "model_detail_low", "draw_distance_75", "draw_distance_50", "draw_distance_33", "draw_distance_25",
         "model_detail_lowest", "model_detail_min", "no_adpf", "no_af", "no_affinity", "no_ao", "no_async_shaders", "no_bindless_arrays", "no_bloom",

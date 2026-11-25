@@ -1674,6 +1674,19 @@ private:
         return true;
     }
     bool shadow_skip_logged_ = false;
+    // EXPERIMENTAL (<datos>/skip_prepass, Graphics menu): the scene's depth pre-pass (depth only, the 1280x720 depth
+    // target, one layer) is not drawn. The colour pass then does the depth work itself: its EQUAL draws become GEQUAL with
+    // depth writes on (reversed Z), as fast_depth does but writing the depth. Cut-out meshes (grass, leaves) keep EQUAL,
+    // so they don't show without their pre-pass. Anything that reads the depth between the two passes sees it empty.
+    bool skip_prepass_ = false;
+    bool prepass_skip_logged_ = false;
+    bool scene_prepass() const {
+        if (!st_.rt.depth || st_.rt.depth->layers > 1) return false;
+        if (st_.rt.depth->desc.width != 1280 || st_.rt.depth->desc.height != 720) return false;
+        for (int k = 0; k < st_.rt.count && k < 8; k++)
+            if (st_.rt.colors[k]) return false;
+        return st_.depth_stencil.depth_test && st_.depth_stencil.depth_write;
+    }
     VkSampleCountFlagBits rp_samples_ = VK_SAMPLE_COUNT_1_BIT;
     VkRect2D rp_area_{};          // renderArea del pase abierto
     bool rp_area_full_ = true;    // ...y si es el framebuffer entero
@@ -3583,6 +3596,7 @@ void Executor::run(const std::vector<const CommandList*>& lists) {
     skip_compaction_gs_ = !NVN_FLAG("no_gs_skip");
     log_state_ = NVN_FLAG("verbose_log");
     fast_depth_ = NVN_FLAG("fast_depth");
+    skip_prepass_ = NVN_FLAG("skip_prepass");
     prof_gpu_report();
     run_stamps_ = 0;
     // A la resolución dinámica se le dice que el frame cuesta lo suyo más LSFG más 2 ms de margen (con todo justo a 32 ms
@@ -7865,6 +7879,24 @@ void Executor::draw(const cmd::Draw& in) {
         }
         return;
     }
+    if (skip_prepass_ && scene_prepass()) {
+        // Not drawn. The pass is still opened (its depth clear happens there), and the cut-out meshes are remembered as
+        // fast_depth does, so the colour pass leaves them on the game's own test.
+        if (st_.stages[static_cast<int>(Stage::Fragment)]) {
+            if (cutout_meshes_.size() > 65536) cutout_meshes_.clear();
+            cutout_meshes_.insert(st_.vertex_buffers[0].address * 0x9E3779B97F4A7C15ull ^ in.index_address);
+        }
+        if (!ensure_render_pass()) {
+            skip_draw(6);  // (pass)
+            return;
+        }
+        if (!prepass_skip_logged_) {
+            prepass_skip_logged_ = true;
+            NVN_LOG("depth pre-pass off (<datos>/skip_prepass): scene pre-pass draws skipped (%ux%u depth)\n",
+                    st_.rt.depth->desc.width, st_.rt.depth->desc.height);
+        }
+        return;
+    }
     cmd::Draw d = in;
     if (d.indirect) note_read(4, d.indirect, 20);
     // Argumentos escritos por la GPU (p. ej. el geometry shader del pre-pase de NieR compacta los triángulos
@@ -8309,7 +8341,7 @@ void Executor::draw(const cmd::Draw& in) {
     if (frame_ == trace_frame_ && traced_in_list("NIER_SIN_BLEND")) st_.color.blend_enable = 0;
     if (frame_ == trace_frame_ && traced_in_list("NIER_SIN_DEPTH")) st_.depth_stencil.depth_test = false;
     if (depth_lequal_ && st_.depth_stencil.depth_func == kDepthEqual) st_.depth_stencil.depth_func = kDepthLequal;
-    if (fast_depth_ && st_.depth_stencil.depth_test) {
+    if ((fast_depth_ || skip_prepass_) && st_.depth_stencil.depth_test) {
         const uint64_t mesh = st_.vertex_buffers[0].address * 0x9E3779B97F4A7C15ull ^ d.index_address;
         if (rp_color_count_ == 0 && st_.depth_stencil.depth_write) {
             if (st_.stages[static_cast<int>(Stage::Fragment)]) {
@@ -8318,6 +8350,7 @@ void Executor::draw(const cmd::Draw& in) {
             }
         } else if (st_.depth_stencil.depth_func == kDepthEqual && !cutout_meshes_.count(mesh)) {
             st_.depth_stencil.depth_func = kDepthGequal;
+            if (skip_prepass_) st_.depth_stencil.depth_write = true;  // the pre-pass didn't write the depth: this pass does
         }
     }
     VkPipeline p = pipeline(d, rp_, l, rp_color_count_, rp_samples_);
