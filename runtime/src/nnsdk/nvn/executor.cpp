@@ -2054,6 +2054,8 @@ private:
     // Overlays de la GPU que un rango nuevo solapa solo en parte: se parten en vez de tirarse (merge_overlays).
     // <datos>/no_split_overlays (en vivo): como antes, se tiran y lo suyo sale de la memoria del juego.
     bool split_overlays_ = true;
+    // <datos>/no_gather_vertex_streams (en vivo): como antes, un stream que la GPU escribió solo en parte sale de la memoria del juego.
+    bool gather_vertex_streams_ = true;
     static constexpr uint64_t kMergeReadMax = 1ull << 20;  // unión por una lectura: hasta esto
     // Perfil (con registro, en "perfil overlays"): overlays escritos por la GPU tirados, por motivo (erase_reason; su
     // texto, el mismo que el de '[vigía] se tira el overlay'), y uniones y parches parciales. Siempre se cuentan, sin el
@@ -3681,6 +3683,7 @@ void Executor::read_flags() {
     keep_gpu_overlays_ = !NVN_FLAG("no_keep_overlays");
     merge_reads_ = !NVN_FLAG("no_merge_reads");
     split_overlays_ = !NVN_FLAG("no_split_overlays");
+    gather_vertex_streams_ = !NVN_FLAG("no_gather_vertex_streams");
     vigilar_nan_ = NVN_FLAG("watch_nan");  // DEPURACIÓN
     trace_on_print_ = NVN_FLAG("trace_print");  // DEPURACIÓN
     read_after_ = NVN_FLAG("read_after_dispatch");  // DEPURACIÓN
@@ -8148,6 +8151,138 @@ void Executor::draw(const cmd::Draw& in) {
         skip_draw(4);  // (no_vs)
         return;
     }
+    // 0. Vértices (antes del pase): la ventana de vértices del draw y, para los streams que la GPU escribió solo en
+    // parte, la unión de lo de la CPU y lo de la GPU. Una unión copia (barrera + copias), y eso no cabe dentro de un
+    // pase; por eso va aquí, y solo cuando hace falta: find_overlay exige que UN overlay cubra el rango pedido, y si
+    // la GPU escribió solo una parte del stream (o el rango enlazado es mayor que lo escrito) el draw leía la memoria
+    // vieja del juego y parpadeaba. Sin overlays (casi siempre) esto no cuesta nada.
+    const uint8_t* indices = d.index_type >= 0 ? reinterpret_cast<const uint8_t*>(d.index_address) : nullptr;
+    const uint32_t isize = indices ? index_size(d.index_type) : 0;
+    VkBuffer gpu_index = VK_NULL_HANDLE;  // índices que escribió la GPU
+    VkDeviceSize gpu_index_offset = 0;
+    if (indices)
+        if (const Overlay* o = find_overlay(d.index_address, VkDeviceSize{isize} * std::max(d.count, 1), &gpu_index_offset))
+            gpu_index = o->buffer;
+    if ((gpu_index || gpu_args) && (d.primitive == 7 || d.index_type == 0)) {
+        static int logged = 0;
+        if (logged++ < 8)
+            NVN_LOG("draw con datos de la GPU no soportado (primitiva %d, índices %d, args %d, índices en la GPU %d)\n",
+                    d.primitive, d.index_type, gpu_args != VK_NULL_HANDLE, gpu_index != VK_NULL_HANDLE);
+        skip_draw(10);  // (gpu_data)
+        return;
+    }
+    if (indices && !gpu_index) note_read(1, d.index_address, uint64_t{isize} * d.count);
+    // Multi-draw con los índices en la memoria del juego: de su ventana en espejo (revisada antes del pase).
+    VkBuffer mirror_index = VK_NULL_HANDLE;
+    VkDeviceSize mirror_index_offset = 0;
+    if (multi && indices && !gpu_index && d.index_type >= 1) {
+        uint64_t base = 0, size = 0;
+        VkDeviceSize off = 0;
+        if (index_window(d.index_address, &base, &size))
+            if (const Mirror* m = mirror(base, size, &off, false)) {
+                mirror_index = m->buffer;
+                mirror_index_offset = off + (d.index_address - base);
+            }
+    }
+    // Cuántos índices leer: los del draw; con el número en la GPU y los índices en la CPU (p. ej. quads de
+    // balas o partículas, que la GPU cuenta) no se sabe: un rango generoso, hasta el final del memory pool.
+    size_t index_bytes = size_t{isize} * d.count;
+    if (gpu_args && indices && !gpu_index && !mirror_index) {
+        size_t avail = 0;
+        uint64_t pool_start = 0, pool_size = 0;
+        if (pool_range(d.index_address, &pool_start, &pool_size)) avail = pool_start + pool_size - d.index_address;
+        // Multi-draw: todas las mallas suelen compartir un buffer de índices (hasta lo que cabe en el staging).
+        index_bytes = std::min<size_t>(avail, multi ? kStagingChunk : size_t{1} << 20) / isize * isize;
+        if (frame_ == trace_frame_)
+            NVN_LOG("F indirecto en la GPU con índices de la CPU: %zu bytes desde %#llx\n", index_bytes,
+                    static_cast<unsigned long long>(d.index_address));
+    }
+    const BufferCache::Entry* cached_indices =
+        indices && !gpu_index && d.primitive != 7 && index_bytes
+            ? buffer_cache_.get(d.index_address, index_bytes, d.index_type, submit_index_)
+            : nullptr;
+    VkBuffer host_index = VK_NULL_HANDLE;  // ese rango, si cambia demasiado para la caché: copia directa
+    VkDeviceSize host_index_offset = 0;
+    if (gpu_args && indices && !gpu_index && !cached_indices && index_bytes && !mirror_index) {
+        Staging::Alloc al = staging_->alloc(index_bytes, 16);
+        if (!al.data) return;
+        memcpy(al.data, indices, index_bytes);
+        host_index = al.buffer;
+        host_index_offset = al.offset;
+    }
+    if (gpu_args && indices && !gpu_index && !cached_indices && !host_index && !mirror_index) {
+        skip_draw(11);  // (indices)
+        return;
+    }
+    // Con índices escritos por la GPU no se sabe cuántos vértices se leen: los streams se copian enteros. Con
+    // argumentos de la GPU pero índices de la CPU, el máximo del rango de índices acota los vértices (copiar los
+    // streams enteros en cada draw de partículas agotaba la RAM en segundos).
+    const bool unknown_vertices = gpu_index != VK_NULL_HANDLE || (gpu_args && !indices) || multi;
+    // Ventana de vértices: los streams por vértice se copian (y se enlazan) desde first_vertex, vertex_count
+    // vértices. En un draw directo empieza en el primer vértice que usa y el draw se desplaza para compensar:
+    // las mallas de la fábrica comparten un buffer de 4 MB con índices absolutos (149724…) y cada draw copiaba
+    // desde el vértice 0 hasta su máximo, 4 MB por draw y sin compartirse (cada uno con su máximo).
+    const bool direct = !gpu_args && !gpu_index;
+    uint32_t first_vertex = 0, vertex_count = 1u << 24;
+    int32_t vertex_offset = d.base_vertex;  // vertexOffset de los draws indexados
+    if (!unknown_vertices && !indices) {
+        first_vertex = direct ? static_cast<uint32_t>(d.first) : 0;
+        vertex_count = static_cast<uint32_t>(d.first + d.count) - first_vertex;
+    } else if (!unknown_vertices) {
+        uint32_t lo, hi;
+        if (cached_indices)
+            lo = cached_indices->min_index, hi = cached_indices->max_index;
+        else
+            BufferCache::index_range(indices, index_bytes, d.index_type, &lo, &hi);
+        if (lo > hi) lo = hi = 0;  // sin índices válidos
+        if (direct && d.base_vertex >= 0) {
+            first_vertex = lo + static_cast<uint32_t>(d.base_vertex);
+            vertex_count = hi - lo + 1;
+            vertex_offset = -static_cast<int32_t>(lo);
+        } else {
+            vertex_count = hi + 1 + static_cast<uint32_t>(std::max(d.base_vertex, 0));
+        }
+    }
+    // Mayor desplazamiento de atributo de cada stream: todos sus atributos comparten una entrada de la caché
+    // (con el desplazamiento de cada uno, un stream de 5 atributos se copiaba 5 veces).
+    uint32_t stream_offset[kMaxVertexBuffers] = {};
+    for (uint32_t k = 0; k < 16 && k < st_.attribs.size(); k++)
+        if ((vs->shader.input_generics & (1ull << k)) && st_.attribs[k].stream < kMaxVertexBuffers)
+            stream_offset[st_.attribs[k].stream] = std::max<uint32_t>(stream_offset[st_.attribs[k].stream], st_.attribs[k].offset);
+    VkBuffer gathered_buf[kMaxVertexBuffers] = {};  // streams resueltos aquí: buffer y desfase de su ventana
+    VkDeviceSize gathered_off[kMaxVertexBuffers] = {};
+    if (gather_vertex_streams_ && !overlays_.empty()) {
+        uint32_t tried = 0;
+        for (uint32_t k = 0; k < 16; k++) {
+            if (!(vs->shader.input_generics & (1ull << k))) continue;
+            const VertexAttribState a = k < st_.attribs.size() ? st_.attribs[k] : VertexAttribState{};
+            if (a.stream >= kMaxVertexBuffers || (tried >> a.stream & 1)) continue;
+            tried |= 1u << a.stream;
+            const BufferRange range = st_.vertex_buffers[a.stream];
+            if (!range.address) continue;
+            const VertexStreamState sv = a.stream < st_.streams.size() ? st_.streams[a.stream] : VertexStreamState{};
+            const VkDeviceSize skip = sv.divisor ? 0 : VkDeviceSize{sv.stride} * first_vertex;
+            if (skip >= range.size || range.size <= stream_offset[a.stream]) continue;
+            VkDeviceSize off = 0;
+            if (find_overlay(range.address, range.size, &off)) continue;  // uno cubre todo: el paso 5 lo enlaza tal cual
+            const uint32_t elements = sv.divisor ? static_cast<uint32_t>(d.base_instance + d.instances) : vertex_count;
+            const VkDeviceSize need = sv.stride ? VkDeviceSize{sv.stride} * elements : 64;
+            const VkDeviceSize window = std::min<VkDeviceSize>(range.size - skip, stream_offset[a.stream] + need);
+            const uint64_t at = range.address + skip;
+            if (!window || window > kStagingChunk || !overlay_maybe_in(at, window)) continue;
+            if (const Overlay* o = find_overlay(at, window, &off)) {  // cubre lo que lee el draw, aunque no el rango entero
+                gathered_buf[a.stream] = o->buffer;
+                gathered_off[a.stream] = off;
+                continue;
+            }
+            VkBuffer gb = VK_NULL_HANDLE;
+            VkDeviceSize go = 0;
+            if (gather_overlays(at, window, &gb, &go)) {  // false: ningún overlay toca la ventana
+                gathered_buf[a.stream] = gb;
+                gathered_off[a.stream] = go;
+            }
+        }
+    }
     auto prof_t = prof_now();  // perfil por secciones (solo en los frames medidos)
     // 1. Texturas: crear y subir lo que falte (las subidas van fuera del render pass).
     struct Bound {
@@ -8728,97 +8863,9 @@ void Executor::draw(const cmd::Draw& in) {
     prof_mark(3, prof_t);
     auto prof_v = prof_t;  // los tramos de "vértices" (prof_split)
     // 5. Vértices: cada atributo usado, desde la caché si su stream no cambia; si no, copiado al staging.
-    const uint8_t* indices = d.index_type >= 0 ? reinterpret_cast<const uint8_t*>(d.index_address) : nullptr;
-    const uint32_t isize = indices ? index_size(d.index_type) : 0;
-    VkBuffer gpu_index = VK_NULL_HANDLE;  // índices que escribió la GPU
-    VkDeviceSize gpu_index_offset = 0;
-    if (indices)
-        if (const Overlay* o = find_overlay(d.index_address, VkDeviceSize{isize} * std::max(d.count, 1), &gpu_index_offset))
-            gpu_index = o->buffer;
-    if ((gpu_index || gpu_args) && (d.primitive == 7 || d.index_type == 0)) {
-        static int logged = 0;
-        if (logged++ < 8)
-            NVN_LOG("draw con datos de la GPU no soportado (primitiva %d, índices %d, args %d, índices en la GPU %d)\n",
-                    d.primitive, d.index_type, gpu_args != VK_NULL_HANDLE, gpu_index != VK_NULL_HANDLE);
-        skip_draw(10);  // (gpu_data)
-        return;
-    }
-    if (indices && !gpu_index) note_read(1, d.index_address, uint64_t{isize} * d.count);
-    // Multi-draw con los índices en la memoria del juego: de su ventana en espejo (revisada antes del pase).
-    VkBuffer mirror_index = VK_NULL_HANDLE;
-    VkDeviceSize mirror_index_offset = 0;
-    if (multi && indices && !gpu_index && d.index_type >= 1) {
-        uint64_t base = 0, size = 0;
-        VkDeviceSize off = 0;
-        if (index_window(d.index_address, &base, &size))
-            if (const Mirror* m = mirror(base, size, &off, false)) {
-                mirror_index = m->buffer;
-                mirror_index_offset = off + (d.index_address - base);
-            }
-    }
-    // Cuántos índices leer: los del draw; con el número en la GPU y los índices en la CPU (p. ej. quads de
-    // balas o partículas, que la GPU cuenta) no se sabe: un rango generoso, hasta el final del memory pool.
-    size_t index_bytes = size_t{isize} * d.count;
-    if (gpu_args && indices && !gpu_index && !mirror_index) {
-        size_t avail = 0;
-        uint64_t pool_start = 0, pool_size = 0;
-        if (pool_range(d.index_address, &pool_start, &pool_size)) avail = pool_start + pool_size - d.index_address;
-        // Multi-draw: todas las mallas suelen compartir un buffer de índices (hasta lo que cabe en el staging).
-        index_bytes = std::min<size_t>(avail, multi ? kStagingChunk : size_t{1} << 20) / isize * isize;
-        if (frame_ == trace_frame_)
-            NVN_LOG("F indirecto en la GPU con índices de la CPU: %zu bytes desde %#llx\n", index_bytes,
-                    static_cast<unsigned long long>(d.index_address));
-    }
-    const BufferCache::Entry* cached_indices =
-        indices && !gpu_index && d.primitive != 7 && index_bytes
-            ? buffer_cache_.get(d.index_address, index_bytes, d.index_type, submit_index_)
-            : nullptr;
-    VkBuffer host_index = VK_NULL_HANDLE;  // ese rango, si cambia demasiado para la caché: copia directa
-    VkDeviceSize host_index_offset = 0;
-    if (gpu_args && indices && !gpu_index && !cached_indices && index_bytes && !mirror_index) {
-        Staging::Alloc al = staging_->alloc(index_bytes, 16);
-        if (!al.data) return;
-        memcpy(al.data, indices, index_bytes);
-        host_index = al.buffer;
-        host_index_offset = al.offset;
-    }
-    if (gpu_args && indices && !gpu_index && !cached_indices && !host_index && !mirror_index) {
-        skip_draw(11);  // (indices)
-        return;
-    }
-    // Con índices escritos por la GPU no se sabe cuántos vértices se leen: los streams se copian enteros. Con
-    // argumentos de la GPU pero índices de la CPU, el máximo del rango de índices acota los vértices (copiar los
-    // streams enteros en cada draw de partículas agotaba la RAM en segundos).
-    const bool unknown_vertices = gpu_index != VK_NULL_HANDLE || (gpu_args && !indices) || multi;
-    // Ventana de vértices: los streams por vértice se copian (y se enlazan) desde first_vertex, vertex_count
-    // vértices. En un draw directo empieza en el primer vértice que usa y el draw se desplaza para compensar:
-    // las mallas de la fábrica comparten un buffer de 4 MB con índices absolutos (149724…) y cada draw copiaba
-    // desde el vértice 0 hasta su máximo, 4 MB por draw y sin compartirse (cada uno con su máximo).
-    const bool direct = !gpu_args && !gpu_index;
-    uint32_t first_vertex = 0, vertex_count = 1u << 24;
-    int32_t vertex_offset = d.base_vertex;  // vertexOffset de los draws indexados
-    if (!unknown_vertices && !indices) {
-        first_vertex = direct ? static_cast<uint32_t>(d.first) : 0;
-        vertex_count = static_cast<uint32_t>(d.first + d.count) - first_vertex;
-    } else if (!unknown_vertices) {
-        uint32_t lo, hi;
-        if (cached_indices)
-            lo = cached_indices->min_index, hi = cached_indices->max_index;
-        else
-            BufferCache::index_range(indices, index_bytes, d.index_type, &lo, &hi);
-        if (lo > hi) lo = hi = 0;  // sin índices válidos
-        if (direct && d.base_vertex >= 0) {
-            first_vertex = lo + static_cast<uint32_t>(d.base_vertex);
-            vertex_count = hi - lo + 1;
-            vertex_offset = -static_cast<int32_t>(lo);
-        } else {
-            vertex_count = hi + 1 + static_cast<uint32_t>(std::max(d.base_vertex, 0));
-        }
-    }
     prof_split(4, prof_v);
     // Mayor desplazamiento de atributo de cada stream: todos sus atributos comparten una entrada de la caché
     // (con el desplazamiento de cada uno, un stream de 5 atributos se copiaba 5 veces).
-    uint32_t stream_offset[kMaxVertexBuffers] = {};
     // De dónde sale cada stream (overlay, caché o copia): se resuelve con su primer atributo y los demás solo le
     // suman su desplazamiento. Los binds se juntan en una llamada, solo con lo que cambia respecto a cmd_.
     std::pair<VkBuffer, VkDeviceSize> stream_src[kMaxVertexBuffers] = {};
@@ -8831,9 +8878,6 @@ void Executor::draw(const cmd::Draw& in) {
         bind_off[k] = offset;
         bind_used |= 1u << k;
     };
-    for (uint32_t k = 0; k < 16 && k < st_.attribs.size(); k++)
-        if ((vs->shader.input_generics & (1ull << k)) && st_.attribs[k].stream < kMaxVertexBuffers)
-            stream_offset[st_.attribs[k].stream] = std::max<uint32_t>(stream_offset[st_.attribs[k].stream], st_.attribs[k].offset);
     for (uint32_t k = 0; k < 16; k++) {
         if (!(vs->shader.input_generics & (1ull << k))) continue;
         VertexAttribState a = k < st_.attribs.size() ? st_.attribs[k] : VertexAttribState{};
@@ -8873,6 +8917,11 @@ void Executor::draw(const cmd::Draw& in) {
                     remember(m->buffer, ov_offset);
                     continue;
                 }
+        }
+        if (a.stream < kMaxVertexBuffers && gathered_buf[a.stream]) {  // unión de lo de la CPU y lo de la GPU (paso 0)
+            remember(gathered_buf[a.stream], gathered_off[a.stream]);
+            gpu_vertices = true;
+            continue;
         }
         // El rango desde el primer vértice de la ventana.
         if (skip < range.size) {

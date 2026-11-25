@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, lean]
+    branches: [main, lean, test]
   pull_request:
   workflow_dispatch:
 
@@ -42,7 +42,18 @@ jobs:
       - name: Build APK
         env:
           LUA_LAB: '1'
-        run: bash tools/build_apk.sh
+          # The test branch builds the optimized (release) APK; main and lean stay the testing build.
+          RELEASE: ${{ github.ref_name == 'test' && '1' || '0' }}
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.RELEASE_KS_PASS }}
+        run: |
+          # Sign with the project's release key when the secrets exist (it installs over a release APK), else debug key.
+          if [ "$RELEASE" = 1 ] && [ -n "$KEYSTORE_B64" ] && [ -n "$KS_PASS" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            export KEYSTORE="$RUNNER_TEMP/release.jks" KEY_ALIAS=recomp
+          fi
+          bash tools/build_apk.sh
+          rm -f "$RUNNER_TEMP/release.jks"
       - uses: actions/upload-artifact@v4
         with:
           name: mhriseport
