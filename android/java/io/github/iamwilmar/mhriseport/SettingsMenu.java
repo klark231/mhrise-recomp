@@ -575,6 +575,11 @@ final class SettingsMenu {
                     "adreno_turbo", false);
         }
         header("CPU");
+        flag(tr("Sustained performance", "持续性能模式"),
+                tr("Asks Android to hold the CPU and GPU at the highest clocks the phone can keep without overheating, while "
+                        + "the game is open. Steadier than short boosts that end in a throttle. Only works on phones that "
+                        + "support it (others ignore it). Off by default. Takes effect when you return to the game.", "请求系统在游戏前台时保持设备可长期维持的最高频率，比短时提频后降频更稳定。仅部分设备支持，不支持的设备会忽略。默认关闭，回到游戏后生效。"),
+                "sustained_perf", false);
         flag(tr("Performance hints", "性能提示"),
                 tr("Tells Android how long each frame should take and how much work it took, so it raises the clocks in "
                         + "time instead of letting them drop on every wait (Android 13 or newer). Usually a steadier pace.", "向 Android 13 及以上报告每帧的目标和实际耗时，帮助系统及时调频，使帧间隔更稳定。"),
@@ -2090,7 +2095,7 @@ final class SettingsMenu {
 
     // Every switch the menu has ever written as its own file, so Restore default settings clears old folders too.
     private static final String[] SWITCHES = {
-        "60fps", "adreno_turbo", "fast_textures", "cutout", "system_bars", "cool_down", "no_hud_heat", "no_tight_barriers", "tight_barriers", "barrier_bits", "int_attribs", "gpu_unswizzle", "async_present", "pipeline_threads_1", "pipeline_threads_3", "pipeline_threads_4", "fg_target_60", "fg_target_90", "fg_target_120", "dynamic_state", "vertex_input_state",
+        "60fps", "adreno_turbo", "sustained_perf", "fast_textures", "cutout", "system_bars", "cool_down", "no_hud_heat", "no_tight_barriers", "tight_barriers", "barrier_bits", "int_attribs", "gpu_unswizzle", "async_present", "pipeline_threads_1", "pipeline_threads_3", "pipeline_threads_4", "fg_target_60", "fg_target_90", "fg_target_120", "dynamic_state", "vertex_input_state",
         "no_dynamic_state", "astc_cache_in_data_folder", "bc_astc", "aspect_16_10", "aspect_21_9", "aspect_4_3", "aspect_stretch", "bindless_arrays", "breadcrumbs",
         "capture_button", "count_check", "depth_gequal", "dock_mode", "effects_lower", "effects_lowest", "fast_depth", "fps_20", "fps_25", "fps_40",
         "fps_45", "gpu_occlusion", "hud_battery", "hud_cpu", "hud_frametime", "hud_gpu", "hud_ram", "hud_shaders", "no_hud_battery", "no_hud_cpu",

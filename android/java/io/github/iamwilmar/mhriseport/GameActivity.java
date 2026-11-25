@@ -277,6 +277,18 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         }
     }
 
+    // Sustained performance (Performance → Sustained performance): asks Android to hold clocks at a level the phone can keep
+    // up without heating into a throttle, while the game is in front. Phones without it ignore it.
+    private void applySustained(boolean front) {
+        try {
+            File folder = SettingsMenu.gameFolder(this);
+            boolean on = front && folder != null && new Ini(folder).on("sustained_perf");
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && pm.isSustainedPerformanceModeSupported()) getWindow().setSustainedPerformanceMode(on);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
@@ -284,12 +296,14 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         RuntimeLifecycle.update(true, false);
         if (modUi != null) modUi.onResume();
         applyTurbo(true);
+        applySustained(true);
     }
 
     @Override
     protected void onPause() {
         if (modUi != null) modUi.onPause();
         applyTurbo(false);
+        applySustained(false);
         if (pad != null) pad.releaseAll();  // (un dedo que se queda en un botón al irse la app no lo deja pulsado)
         if (controls != null) controls.saveNow();  // (the app may not come back: swiped away from recents, killed for memory)
         resumed = false;
