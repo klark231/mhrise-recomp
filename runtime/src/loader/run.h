@@ -13,6 +13,7 @@ struct RunConfig {
     struct NnsdkWindow* window_state = nullptr;  // la ventana cuando cambia (APK)
     struct NnsdkText* text_input = nullptr;          // el teclado (APK)
     void (*ask_text)(struct NnsdkText*) = nullptr;
+    void* overlay = nullptr;
 };
 
 // Carga main, lo enlaza y corre nninitStartup, constructores y nnMain. Vuelve al terminar nnMain.
