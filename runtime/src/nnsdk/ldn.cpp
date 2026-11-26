@@ -14,6 +14,13 @@
 // "#" in front: kept in the list but not used; missing: the default server; "off": none), hub_key (the matchmaking key: only its SHA-256 is sent), hub_hosts,
 // hub_port. Read when a network is created or searched for.
 //
+// Newer hub servers (MHGU Relink's Rust mhgu-hub, "link protocol 4") differ from the first ones in two ways that matter here:
+// they turn away a link protocol above their -max-proto (100 unless the owner changed it), which kLinkProtocol and
+// kLinkProtocolV1 are, and they answer a LIST for any protocol from 4 up with HUBS4 (u32 count, count x (u64 id, u16 link
+// protocol, code[8], NetworkInfo)) instead of HUBS. So a search takes both answers, and a server that answers ERR_VERSION to
+// kLinkProtocol is spoken to under kLinkProtocolHub (below) instead, with the code[8] a HOST may carry after the
+// NetworkInfo left empty. The older servers are spoken to exactly as before.
+//
 // Server control frames: u32 size (of what follows), u8 type, payload, little endian. The first one has a header:
 // "MHGS", u16 server protocol (1), u16 link protocol, room[16] (SHA-256 of the key, the first 16 bytes; zeros without
 // a key). LIST -> HUBS (u32 count, count x (u64 id, NetworkInfo)); HOST + NetworkInfo -> HOSTED (u64 id), then UPDATE
@@ -140,6 +147,11 @@ constexpr uint16_t kLinkVersion = 2;         // 2: UDP and pings both ways
 // Builds before the UDP links: TCP only, the station pings the host, and they list under their own link protocol. A
 // host lists itself under both and takes their hellos too; a search lists both, and a join speaks the hub's version.
 constexpr uint16_t kLinkProtocolV1 = 0x5201, kLinkVersionV1 = 1;
+// For hub servers that turn kLinkProtocol away with ERR_VERSION (a -max-proto of 100 or so): small enough to pass, and
+// outside the 3-4 that MHGU's hubs pool under, so MH Rise's hubs still stay apart from MHGU's. The link frames are
+// kLinkVersion's: a hub server only splices them.
+constexpr uint16_t kLinkProtocolHub = 0x52;  // 'R'
+constexpr uint32_t kErrVersion = 4;
 constexpr uint16_t kDefaultPort = 39510;
 // (Not the MHGU hub servers: their owners asked for MH Rise hubs to stay off them.)
 constexpr const char* kDefaultServers[] = {"meoli.viewdns.net"};
@@ -359,7 +371,12 @@ bool read_frame(int fd, uint8_t* type, std::vector<uint8_t>* payload, size_t max
 // ---- the hub server's protocol ---------------------------------------------------------------------------------------
 
 enum : uint8_t { kList = 1, kHost = 2, kAttach = 3, kJoin = 4, kUpdate = 5, kPing = 6 };
-enum : uint8_t { kHubs = 16, kHosted = 17, kIncoming = 18, kSpliced = 19, kError = 20 };
+enum : uint8_t { kHubs = 16, kHosted = 17, kIncoming = 18, kSpliced = 19, kError = 20, kHubs4 = 21 };
+
+// The server turned our link protocol away (ERR_VERSION)
+bool refused_version(uint8_t type, const std::vector<uint8_t>& p) {
+    return type == kError && p.size() >= 4 && get32(p.data()) == kErrVersion;
+}
 
 std::vector<uint8_t> server_header(const std::array<uint8_t, 16>& room, uint16_t protocol = kLinkProtocol) {
     std::vector<uint8_t> h = {'M', 'H', 'G', 'S'};
@@ -811,9 +828,13 @@ void host_serve(int fd, uint64_t generation, uint32_t relay_pair, uint64_t relay
 }
 
 // The host's listing on one hub server: HOST, then tickets for players who join (ATTACH opens their link)
-void host_on_server(Endpoint server, uint64_t generation, uint16_t protocol) {
+void host_on_server(Endpoint server, uint64_t generation, uint16_t first_protocol) {
     const std::array<uint8_t, 16> room = room_of_key();
+    // (a server that turns kLinkProtocol away is listed on under kLinkProtocolHub instead; kLinkProtocolV1's listing
+    // just fails there as it did)
+    bool hub_dialect = false;
     while (g_generation == generation) {
+        const uint16_t protocol = first_protocol == kLinkProtocol && hub_dialect ? kLinkProtocolHub : first_protocol;
         const int fd = connect_to(server, kConnectTimeoutMs);
         if (fd >= 0) {
             auto conn = std::make_shared<Link>();
@@ -823,12 +844,14 @@ void host_on_server(Endpoint server, uint64_t generation, uint16_t protocol) {
                 std::lock_guard lock(g_mu);
                 body.insert(body.end(), g_info.begin(), g_info.end());
             }
+            if (protocol == kLinkProtocolHub) body.insert(body.end(), 8, 0);  // (no session code: a hub of 4 or more may carry one)
             uint8_t type = 0;
             std::vector<uint8_t> p;
             if (conn->send(kHost, body) && read_frame(fd, &type, &p, kMaxServerFrame, kAnswerTimeoutMs) &&
                 type == kHosted && p.size() >= 8) {
                 printf("[ldn] hub listed on %s (id %016llx)%s\n", server.host.c_str(),
-                       static_cast<unsigned long long>(get64(p.data())), protocol == kLinkProtocolV1 ? " for older builds" : "");
+                       static_cast<unsigned long long>(get64(p.data())), protocol == kLinkProtocolV1    ? " for older builds"
+                                                        : protocol == kLinkProtocolHub ? " (link protocol 0x52)" : "");
                 {
                     std::lock_guard lock(g_mu);
                     g_server_conns.push_back(conn);
@@ -864,6 +887,16 @@ void host_on_server(Endpoint server, uint64_t generation, uint16_t protocol) {
                 }
                 std::lock_guard lock(g_mu);
                 g_server_conns.erase(std::remove(g_server_conns.begin(), g_server_conns.end(), conn), g_server_conns.end());
+            } else if (first_protocol == kLinkProtocol && refused_version(type, p)) {
+                // (the other way round too: a server that stopped turning it away, or one that turns both away, is tried again)
+                hub_dialect = !hub_dialect;
+                printf("[ldn] %s turned link protocol %#x away: listing %s\n", server.host.c_str(), protocol,
+                       hub_dialect ? "under 0x52 (a newer hub server)" : "under the usual one");
+                if (hub_dialect) {  // (listed again at once, not 10 s later)
+                    conn->close();
+                    ::close(fd);
+                    continue;
+                }
             } else if (type == kError && p.size() >= 4 && protocol == kLinkProtocol) {
                 printf("[ldn] %s didn't list the hub (error %u)\n", server.host.c_str(), get32(p.data()));
             }
@@ -987,24 +1020,32 @@ bool station_join(int fd, const UserConfig& user, uint16_t lcv, bool direct, uin
 
 // ---- search ----------------------------------------------------------------------------------------------------------
 
-std::vector<Found> list_server(int index, const Endpoint& server, const std::array<uint8_t, 16>& room, uint16_t protocol) {
+std::vector<Found> list_server(int index, const Endpoint& server, const std::array<uint8_t, 16>& room, uint16_t protocol,
+                               bool* refused = nullptr) {
     std::vector<Found> out;
     const int fd = connect_to(server, kConnectTimeoutMs);
     if (fd < 0) return out;
     const std::vector<uint8_t> f = make_frame(kList, server_header(room, protocol));
-    uint8_t type;
+    uint8_t type = 0;
     std::vector<uint8_t> p;
-    if (send_all(fd, f.data(), f.size()) && read_frame(fd, &type, &p, kMaxServerFrame, kAnswerTimeoutMs) && type == kHubs &&
-        p.size() >= 4) {
-        const uint32_t count = get32(p.data());
-        for (uint32_t i = 0; i < count && 4 + (i + 1) * (8 + kInfoSize) <= p.size(); i++) {
-            Found h;
-            h.server = index;
-            h.protocol = protocol;
-            h.version = protocol == kLinkProtocolV1 ? kLinkVersionV1 : kLinkVersion;
-            h.hub = get64(p.data() + 4 + i * (8 + kInfoSize));
-            memcpy(h.info.data(), p.data() + 4 + i * (8 + kInfoSize) + 8, kInfoSize);
-            out.push_back(h);
+    if (send_all(fd, f.data(), f.size()) && read_frame(fd, &type, &p, kMaxServerFrame, kAnswerTimeoutMs)) {
+        if ((type == kHubs || type == kHubs4) && p.size() >= 4) {
+            // HUBS: id, NetworkInfo. HUBS4 (a newer server, for a protocol of 4 or more): id, u16 the hub's link protocol,
+            // code[8], NetworkInfo. (A hub is joined under the protocol it was searched for under.)
+            const size_t entry = 8 + (type == kHubs4 ? 2 + 8 : 0) + kInfoSize;
+            const uint32_t count = get32(p.data());
+            for (uint32_t i = 0; i < count && 4 + (i + 1) * entry <= p.size(); i++) {
+                const uint8_t* e = p.data() + 4 + i * entry;
+                Found h;
+                h.server = index;
+                h.protocol = protocol;
+                h.version = protocol == kLinkProtocolV1 ? kLinkVersionV1 : kLinkVersion;
+                h.hub = get64(e);
+                memcpy(h.info.data(), e + entry - kInfoSize, kInfoSize);
+                out.push_back(h);
+            }
+        } else if (refused && refused_version(type, p)) {
+            *refused = true;
         }
     }
     ::close(fd);
@@ -1058,16 +1099,23 @@ Result scan(NetworkInfo* out, int* count, int max, const ScanFilter& filter) {
     const std::vector<Endpoint> servers = hub_servers();
     const std::vector<Endpoint> hosts = search_hosts();
     const std::array<uint8_t, 16> room = room_of_key();
-    // (this version's hubs first: a newer host is also listed for older builds, and the duplicate is dropped below)
-    std::vector<std::vector<Found>> results(2 * servers.size() + hosts.size());
+    // (this version's hubs first: a newer host is also listed for older builds, and the duplicate is dropped below.) Slots:
+    // [0, n) kLinkProtocol, [n, 2n) kLinkProtocolV1, [2n, 3n) kLinkProtocolHub (only for a server that turned kLinkProtocol
+    // away), then the direct hosts
+    const size_t n_servers = servers.size();
+    std::vector<std::vector<Found>> results(3 * n_servers + hosts.size());
     std::vector<std::thread> threads;
-    for (size_t i = 0; i < servers.size(); i++) {
-        threads.emplace_back([&, i] { results[i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocol); });
+    for (size_t i = 0; i < n_servers; i++) {
+        threads.emplace_back([&, i] {
+            bool refused = false;
+            results[i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocol, &refused);
+            if (refused) results[2 * n_servers + i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocolHub);
+        });
         threads.emplace_back(
-            [&, i] { results[servers.size() + i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocolV1); });
+            [&, i] { results[n_servers + i] = list_server(static_cast<int>(i), servers[i], room, kLinkProtocolV1); });
     }
     for (size_t i = 0; i < hosts.size(); i++)
-        threads.emplace_back([&, i] { results[2 * servers.size() + i] = query_host(hosts[i]); });
+        threads.emplace_back([&, i] { results[3 * n_servers + i] = query_host(hosts[i]); });
     for (auto& t : threads) t.join();
     std::vector<Found> all;
     for (auto& r : results)
