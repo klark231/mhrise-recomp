@@ -126,6 +126,8 @@ float wanted_lod_scale() {
 }
 
 uint32_t wanted_texture_bias() {
+    if (NVN_FLAG("texture_bias_4")) return 4;
+    if (NVN_FLAG("texture_bias_3")) return 3;
     if (NVN_FLAG("texture_bias_2")) return 2;
     if (NVN_FLAG("texture_bias_1")) return 1;
     return 0;

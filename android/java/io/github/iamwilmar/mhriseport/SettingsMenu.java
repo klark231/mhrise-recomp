@@ -378,8 +378,9 @@ final class SettingsMenu {
         exclusive(tr("Texture streaming", "纹理流送"),
                 tr("How many of the largest texture sizes the game skips loading. Fewer: blurrier textures up close, less "
                         + "memory and bandwidth. Applies as textures load.", "跳过最高的若干级纹理。较小的纹理在近处更模糊，但可节省内存和带宽。加载纹理时生效。"),
-                new String[] {tr("Game's", "游戏默认"), tr("One size smaller", "缩小一级"), tr("Two sizes smaller", "缩小两级")},
-                new String[] {null, "texture_bias_1", "texture_bias_2"});
+                new String[] {tr("Game's", "游戏默认"), tr("One size smaller", "缩小一级"), tr("Two sizes smaller", "缩小两级"),
+                        tr("Three sizes smaller", "缩小三级"), tr("Four sizes smaller", "缩小四级")},
+                new String[] {null, "texture_bias_1", "texture_bias_2", "texture_bias_3", "texture_bias_4"});
         header(tr("Textures", "纹理"));
         {
             final String[] files = {null, "bindless_arrays", "no_bindless_arrays"};
@@ -2114,7 +2115,7 @@ final class SettingsMenu {
         "no_shuffle_qualcomm", "no_spirv_opt_brx", "no_tess", "tess_accurate", "tess_fast", "no_area", "no_deferred_clear", "no_store_ops", "no_ubwc", "no_warmup", "perf_stats", "resolution_240", "resolution_360",
         "resolution_432", "resolution_480", "resolution_576", "resolution_648", "resolution_720", "shadow_cache",
         "shadow_half", "shadow_quarter", "short_subgroups", "single_thread_pipelines", "small_object_culling",
-        "texture_bias_1", "texture_bias_2", "tv_mode", "ultrawide", "verbose_log", "wide_view",
+        "texture_bias_1", "texture_bias_2", "texture_bias_3", "texture_bias_4", "tv_mode", "ultrawide", "verbose_log", "wide_view",
     };
 
     private boolean has(String name) {
