@@ -135,10 +135,11 @@ resolution (see [mh-rise.md](mh-rise.md)).
 - `SetupActivity`: the start screen. It asks for the game folder (only `exefs`, `romfs` and the DLC) and a data folder
   (saves, logs, cache, settings). Two copies of the app with different data folders can play Local Play together.
   `DumpScanner` checks the files: the build ID of `main`, the update's RomFS, and DLC IDs from the folder names.
-- `SettingsMenu`: the in-game menu, with Display, Graphics, Performance, Touch, Combos, Controller, Multiplayer and
+- `SettingsMenu`: the in-game menu, with Display, Graphics, Performance, Touch, Controller, Multiplayer and
   Debug. It shows only the options for the GPU the game last ran on (`<data>/gpu.txt`, written by `vk.cpp`;
-  `GpuInfo.java`); before the first start it shows them all. Display → Restore default settings deletes `mhr.ini` and the old switch files. The touch layout, combos and
+  `GpuInfo.java`); before the first start it shows them all. Display → Restore default settings deletes `mhr.ini` and the old switch files. The touch layout, controller bindings and
   button mapping are kept in SharedPreferences and survive that.
+- `Rumble`: the controller's haptics. `hid_vibration.cpp` leaves the loudest low/high amplitude of the game's vibration graph in `NnsdkInput::rumble_*` every 5 ms; the loader's `rumble_pusher` thread passes changes to `GameActivity.rumble`, which scales them by Settings → Controller → Haptic strength and plays them on each gamepad's motors (`Rumble.java`).
 - `TouchPad`, `Controls`: the on-screen controller, layout editing, show/hide per button and camera swipe.
 - `DriverActivity`: adding a custom Vulkan driver (AdrenoTools zips, loaded with libadrenotools) and `Lossless.dll`.
 - Package-name builds (`PACKAGE=com.antutu.ABenchMark tools/build_apk.sh`): some phones keep their clocks up for apps

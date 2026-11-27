@@ -24,6 +24,12 @@ struct NnsdkInput {
     // llega la tecla BACK): abre o cierra el panel del HUD. En los 32 bits altos, el touch_serial del toque que lo hizo; en
     // los bajos, una cuenta que sube con cada gesto.
     std::atomic<uint64_t> hud_gesture{0};
+    // Controller haptics: what the game's vibration graph asks of the motors right now (0..1 amplitude of the low and the
+    // high band, the loudest of every actuator), written by nn::hid every update (5 ms) with CLOCK_MONOTONIC's time in
+    // rumble_ns. The loader sends it on to the controller (GameActivity.rumble); a value older than a few updates
+    // means the game stopped asking (paused, or the graph is gone) and counts as silence.
+    std::atomic<float> rumble_low{0.0f}, rumble_high{0.0f};
+    std::atomic<int64_t> rumble_ns{0};
 };
 
 // La ventana de Android: se destruye al irse la app a segundo plano (o al apagar la pantalla) y llega otra al volver.

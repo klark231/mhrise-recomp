@@ -118,14 +118,26 @@ may stutter while its shaders are translated and compiled; they are cached for t
     cut to the control's shape or in its own shape, where only the picture itself takes touches. A stick's picture is
     its knob, and its shape is its base's. Buttons and the menu also get a shape (circle, rounded square, square), an
     icon and your own label, and buttons *Tap to hold* (a tap keeps it pressed until the next tap). *Add* makes a new button and *Copy as a new button* another of a console button;
-    both are combos, so a controller button can fire them too. *Grid* shows a grid and snaps what you drag to it.
+    both are touch-only buttons. *Grid* shows a grid and snaps what you drag to it.
   - *Export layout* / *Import layout:* the whole touch layout in a `.zip` (`layout.json` and the pictures), to keep or
     to share; places are fractions of the screen, so it fits another phone.
-  - *Combos:* up to eight. Each presses several buttons at once (A+X, say, or a stick direction: LS↑ holds the left
-    stick all the way up), from its own button on the screen and, if you
-    choose one, from a controller button or a pair of them (L3, −+R…). One of a single button is called *Button n* and
-    looks like that button; one of several, *Combo n*. Under *Controller → Added buttons and combos* each can also get
-    any key of a controller or a keyboard.
+  - *Added buttons:* up to eight, made with *Add* or *Copy as a new button* in the layout editor. Each presses one or
+    several buttons at once (A+X, say, or a stick direction: LS↑ holds the left stick all the way up) when you touch it.
+    One of a single button is called *Button n* and looks like that button; one of several, *Combo n*. They are for the
+    touch screen only; a controller button that does the same is a *custom binding* (under *Controller*).
+  - *With a controller* (under Controller): *Hide touch controls when a controller is connected* (on by default) hides
+    the on-screen buttons and sticks while a gamepad is connected and brings them back when it's unplugged; the gear
+    stays, and Edit layout still shows everything. Turn it off to keep them on screen. *Back button / gesture* sets what
+    Android's Back does (the button, or the swipe from the left edge): *Open settings* (the default, as in other
+    emulators) or *Minus (−)*. The swipe from the right edge still opens the HUD panel, and a controller's own Back key
+    is always −.
+  - *Haptic feedback* (under Controller): the game's vibration on the controller's motors, with a *Strength* from 0
+    (off) to 200 % (100 is as the game asks) and a *Test vibration* button. Needs a controller Android can vibrate; with
+    two motors (Android 12 and up) the game's low band goes to the first and the high band to the second.
+  - *Custom bindings* (under Controller): *+ Add button / combo* makes a binding of the controller's own, up to sixteen:
+    pick the console buttons it presses, then any key of a controller or a keyboard and/or a pair of controller buttons
+    (L3 + R3…) that fires it. They are kept apart from the touch layout and never drawn on the screen. Bindings set on
+    added buttons by an older version are copied here the first time it runs.
   - *Controller:* the sticks' dead zone, how far an analog trigger travels before it is ZL / ZR, and where the right stick
     is read from. *By controller* picks Z/RZ or RX/RY from the axes each pad says it has, with triggers on LTRIGGER /
     RTRIGGER, BRAKE / GAS or Z/RZ, so Xbox, DualSense and generic pads all work. The log says what it chose for each pad.

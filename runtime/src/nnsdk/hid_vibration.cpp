@@ -14,7 +14,9 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <time.h>
 
+#include "nnsdk/host.h"
 #include "nnsdk/runtime.h"
 #include "nnsdk/types.h"
 
@@ -292,6 +294,16 @@ Result parse_vibration_file(VibrationFileInfo* info, const uint8_t** data, int32
 
 }  // namespace
 
+namespace {
+
+// The loudest band of every target that has a controller, for the sample being computed (under graph_mutex): Update()
+// clears it, VibrationTarget fills it, and Update() hands it to the loader (NnsdkInput::rumble_*) for the controller's motors.
+float g_acc_low = 0.0f, g_acc_high = 0.0f;
+
+float clamp01(float v) { return v != v ? 0.0f : v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+}  // namespace
+
 namespace nn::hid {
 
 // --- VibrationNode ---
@@ -335,9 +347,18 @@ void VibrationNode::SyncSampleNumber() {
 void VibrationNode::Update() {
     std::lock_guard lock(graph_mutex());
     ++g_sample;
+    g_acc_low = g_acc_high = 0.0f;
     detail::ListNode& head = all_nodes();
     for (detail::ListNode* n = head.next; n != &head; n = n->next) static_cast<VibrationNode*>(n)->SyncSampleNumber();
-    // Aquí el SDK manda a los mandos lo que dejaron los VibrationTarget: la Flip no tiene dónde.
+    // Aquí el SDK manda a los mandos lo que dejaron los VibrationTarget: la Flip no tiene dónde, pero un mando de Android
+    // sí: el loader lo lee de NnsdkInput y lo manda a sus motores (nada en la terminal: no hay mando).
+    if (NnsdkInput* in = nnsdk::host().input) {
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        in->rumble_low.store(clamp01(g_acc_low), std::memory_order_relaxed);
+        in->rumble_high.store(clamp01(g_acc_high), std::memory_order_relaxed);
+        in->rumble_ns.store(static_cast<int64_t>(ts.tv_sec) * 1000000000ll + ts.tv_nsec, std::memory_order_release);
+    }
 }
 
 // --- VibrationNodeConnection ---
@@ -457,7 +478,10 @@ bool VibrationTarget::IsVibrationDeviceHandleSet() const {
 // Sin handle conserva el último valor, como el SDK. Con handle mezcla; el SDK además lo encola para el mando.
 void VibrationTarget::OnNextSampleRequired(VibrationValue* value, detail::ListNode* inputs) {
     std::lock_guard lock(graph_mutex());
-    if (handle_set_) VibrationMixer::OnNextSampleRequired(value, inputs);
+    if (!handle_set_) return;
+    VibrationMixer::OnNextSampleRequired(value, inputs);
+    g_acc_low = std::fmax(g_acc_low, value->amplitude_low);
+    g_acc_high = std::fmax(g_acc_high, value->amplitude_high);
 }
 
 // --- VibrationWriter: el valor que escribe el juego, tal cual ---

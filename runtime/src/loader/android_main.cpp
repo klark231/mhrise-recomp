@@ -353,6 +353,8 @@ struct PadSettings {
 };
 std::mutex g_pad_mutex;
 PadSettings g_pad;
+// What Android's Back does (GameActivity.nativeBackAction): 1 opens the settings menu, 0 is "-" for the game
+std::atomic<int> g_back_mode{1};
 
 // The buttons a mapped key presses; false if the key keeps its usual meaning
 bool mapped_key(int32_t keycode, uint64_t* out) {
@@ -585,6 +587,7 @@ void touch_point(int32_t action, float x, float y, int64_t time_ns, int32_t widt
 }
 
 bool mod_ui_hotkey(AInputEvent* event);  // (below, with the activity)
+void request_settings();
 void forget_held_keys();
 
 int32_t on_input(android_app* app, AInputEvent* event) {
@@ -609,6 +612,13 @@ int32_t on_input(android_app* app, AInputEvent* event) {
             }
             if (AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_UP && swallow_up) {
                 swallow_up = false;
+                return 1;
+            }
+            // Android's own Back (the navigation bar's button, or the swipe from the left edge) opens the settings menu, as
+            // in other emulators, unless the player chose the old "-" (Settings → Controller). A controller's Back key
+            // (its source is a gamepad's) stays "-". Acts on the release; the press and its repeats are swallowed.
+            if ((AInputEvent_getSource(event) & AINPUT_SOURCE_GAMEPAD) != AINPUT_SOURCE_GAMEPAD && g_back_mode.load() == 1) {
+                if (AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_UP) request_settings();
                 return 1;
             }
         }
@@ -837,6 +847,11 @@ extern "C" JNIEXPORT void JNICALL Java_io_github_iamwilmar_mhriseport_GameActivi
     publish();
 }
 
+extern "C" JNIEXPORT void JNICALL Java_io_github_iamwilmar_mhriseport_GameActivity_nativeBackAction(JNIEnv*, jclass, jint mode) {
+    g_back_mode.store(mode == 0 ? 0 : 1);
+    printf("[entrada] Back de Android: %s\n", mode == 0 ? "es \"-\" para el juego" : "abre los ajustes");
+}
+
 // ---- el teclado de la consola (nn::swkbd: host.h, NnsdkText; android/java: GameActivity.askText, TextPrompt) ------
 
 namespace {
@@ -931,6 +946,72 @@ void* mod_ui_toggler(void*) {
         g_activity->vm->DetachCurrentThread();
     }
     return nullptr;
+}
+
+// Android's Back with the settings as its action: the menu opens on the activity's thread (GameActivity.backToSettings); this
+// calls it from a thread of its own, since the input thread of the loader isn't attached to Java.
+void* settings_opener(void*) {
+    pthread_setname_np(pthread_self(), "Back");
+    JNIEnv* env = nullptr;
+    JavaVMAttachArgs attach{JNI_VERSION_1_6, "Back", nullptr};
+    if (g_activity && g_activity->vm->AttachCurrentThread(&env, &attach) == JNI_OK && env) {
+        jclass cls = env->GetObjectClass(g_activity->clazz);
+        jmethodID open = cls ? env->GetMethodID(cls, "backToSettings", "()V") : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear(), open = nullptr;
+        if (open) {
+            env->CallVoidMethod(g_activity->clazz, open);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        g_activity->vm->DetachCurrentThread();
+    }
+    return nullptr;
+}
+
+void request_settings() {
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, settings_opener, nullptr) == 0) pthread_detach(thread);
+}
+
+// Controller haptics (GameActivity.rumble). nn::hid leaves what the game's vibration graph asks of the motors in
+// g_input.rumble_* every 5 ms; this thread (it needs to be attached to Java, and the game's threads aren't) hands it to the
+// activity when it changes, and again every 40 ms while it's on: the vibration the activity starts is a short one, so it is
+// renewed, and a game that stops asking (paused, or the graph gone) lets it end by itself. The strength the player chose and
+// which motors there are is the activity's business (Rumble.java), so this sends the game's amplitudes as they are.
+void* rumble_pusher(void*) {
+    pthread_setname_np(pthread_self(), "Rumble");
+    JNIEnv* env = nullptr;
+    JavaVMAttachArgs attach{JNI_VERSION_1_6, "Rumble", nullptr};
+    if (!g_activity || g_activity->vm->AttachCurrentThread(&env, &attach) != JNI_OK || !env) return nullptr;
+    jclass cls = env->GetObjectClass(g_activity->clazz);
+    jmethodID rumble = cls ? env->GetMethodID(cls, "rumble", "(FF)V") : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear(), rumble = nullptr;
+    if (!rumble) {  // (an app without haptics)
+        g_activity->vm->DetachCurrentThread();
+        return nullptr;
+    }
+    constexpr int64_t kStaleNs = 200ll * 1000000, kRenewNs = 40ll * 1000000;
+    float sent_low = 0.0f, sent_high = 0.0f;
+    int64_t sent_ns = 0;
+    for (;;) {
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int64_t now = static_cast<int64_t>(ts.tv_sec) * 1000000000ll + ts.tv_nsec;
+        float low = 0.0f, high = 0.0f;
+        if (now - g_input.rumble_ns.load(std::memory_order_acquire) < kStaleNs) {
+            low = g_input.rumble_low.load(std::memory_order_relaxed);
+            high = g_input.rumble_high.load(std::memory_order_relaxed);
+        }
+        const bool on = low > 0.0f || high > 0.0f, was_on = sent_low > 0.0f || sent_high > 0.0f;
+        const bool changed = on != was_on || std::fabs(low - sent_low) >= 0.03f || std::fabs(high - sent_high) >= 0.03f;
+        if (changed || (on && now - sent_ns >= kRenewNs)) {
+            env->CallVoidMethod(g_activity->clazz, rumble, static_cast<jfloat>(low), static_cast<jfloat>(high));
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            sent_low = low;
+            sent_high = high;
+            sent_ns = now;
+        }
+        usleep(10000);
+    }
 }
 
 void forget_held_keys() { g_held_keys.clear(); }
@@ -1056,6 +1137,10 @@ void android_main(android_app* app) {
     g_cfg.window_state = &g_window_state;
     g_cfg.text_input = &g_text;
     g_cfg.ask_text = ask_text;
+    {
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, rumble_pusher, nullptr) == 0) pthread_detach(thread);
+    }
     if (const char* a = getenv("NIER_AUTOJUEGO"); a && *a) {
         pthread_t thread;
         pthread_create(&thread, nullptr, autoplay, nullptr);

@@ -10,6 +10,10 @@ import android.widget.Toast;
 import android.graphics.PixelFormat;
 import android.os.Bundle;
 import android.os.VibrationEffect;
+import android.hardware.input.InputManager;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.InputDevice;
 import android.view.Gravity;
 import android.os.Vibrator;
 import android.view.View;
@@ -34,6 +38,8 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     static native void nativeTouchPoint(int action, float x, float y, long timeNs, int viewWidth, int viewHeight);
     static native void nativePad(float deadzone, float trigger, int rightAxes, long[] combos, long[] mapping);
     static native void nativeTextAnswer(int serial, String text);
+    // What Android's Back does (1: opens the settings, 0: it is "-" for the game), to the loader
+    static native void nativeBackAction(int mode);
     static native void nativeTurbo(boolean on);
     // Load after the NativeActivity has configured the game paths and driver environment.
     private static final class RuntimeLifecycle {
@@ -143,6 +149,33 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     }
     private boolean shown;
     private Vibrator vibrator;
+    private Rumble rumbler;  // the controller's motors (Rumble.java)
+    private InputManager inputs;
+    // Controllers plugged in or out: the touch controls hide while there is one (Settings → Controller)
+    private final InputManager.InputDeviceListener padListener = new InputManager.InputDeviceListener() {
+        @Override public void onInputDeviceAdded(int id) { checkPad(); }
+        @Override public void onInputDeviceRemoved(int id) { checkPad(); }
+        @Override public void onInputDeviceChanged(int id) { checkPad(); }
+    };
+
+    // Whether a gamepad is connected (a real one: not Android's virtual devices)
+    static boolean controllerConnected() {
+        try {
+            for (int id : InputDevice.getDeviceIds()) {
+                InputDevice d = InputDevice.getDevice(id);
+                if (d == null || d.isVirtual()) continue;
+                int sources = d.getSources();
+                if ((sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                        || (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return true;
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return false;
+    }
+
+    private void checkPad() {
+        if (pad != null) pad.setPadConnected(controllerConnected());
+    }
     private CaptureButton capture;  // the floating capture button, while Debug → Capture button is on
     private WindowManager.LayoutParams captureLp;
 
@@ -159,8 +192,12 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         }
         controls = new Controls(this);
         vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+        rumbler = new Rumble();
         applyPad();
         pad = new TouchPad(this, controls, this);
+        pad.setPadConnected(controllerConnected());
+        inputs = (InputManager) getSystemService(Context.INPUT_SERVICE);
+        if (inputs != null) inputs.registerInputDeviceListener(padListener, new Handler(Looper.getMainLooper()));
         pad.setGameFps(gameFps());
         luaAtLaunch = luaScripts();
         pad.setModsAvailable(luaAtLaunch);
@@ -291,6 +328,7 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         if (modUi != null) modUi.onPause();
         applyTurbo(false);
         if (pad != null) pad.releaseAll();  // (un dedo que se queda en un botón al irse la app no lo deja pulsado)
+        if (rumbler != null) rumbler.stop();  // (a controller left buzzing in the background)
         if (controls != null) controls.saveNow();  // (the app may not come back: swiped away from recents, killed for memory)
         resumed = false;
         RuntimeLifecycle.update(false, false);
@@ -365,6 +403,7 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     protected void onDestroy() {
         // NativeActivity will tear down the runtime. Let parked threads finish cleanup with audio paused.
         RuntimeLifecycle.update(false, true);
+        if (inputs != null) inputs.unregisterInputDeviceListener(padListener);
         if (modUi != null) modUi.dispose();
         if (capture != null) {
             try {
@@ -391,6 +430,20 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         } catch (UnsatisfiedLinkError e) {
             System.err.println("[controles] el loader no tiene nativePad: " + e);
         }
+        try {
+            nativeBackAction(controls.backOpensMenu ? 1 : 0);
+        } catch (UnsatisfiedLinkError e) {
+            System.err.println("[controles] el loader no tiene nativeBackAction: " + e);
+        }
+    }
+
+    // Android's Back (the button, or the swipe from the left edge) with Settings → Controller → Back set to open the
+    // settings: the loader (android_main.cpp, from a thread of its own) asks for the menu, as other emulators do
+    public void backToSettings() {
+        runOnUiThread(() -> {
+            if (pad == null || isFinishing() || pad.editing || (modUi != null && modUi.menuOpen())) return;
+            openMenu();
+        });
     }
 
     void refresh() {
@@ -442,6 +495,22 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         int amplitude = level == 1 ? 60 : level == 2 ? 140 : 255;
         vibrator.vibrate(VibrationEffect.createOneShot(ms, vibrator.hasAmplitudeControl() ? amplitude
                                                                                           : VibrationEffect.DEFAULT_AMPLITUDE));
+    }
+
+    // Controller haptics, from the loader's own thread (android_main.cpp, rumble_pusher): the game's vibration as amplitudes
+    // of its low and high bands, 0..1, at the strength Settings → Controller → Haptic strength gives (0: off)
+    void rumble(float low, float high) {
+        Rumble r = rumbler;
+        Controls c = controls;
+        if (r != null && c != null) r.set(low, high, c.rumble);
+    }
+
+    // Settings' Test button: a short pulse at the chosen strength. False: no controller with a motor is connected.
+    boolean rumbleTest() {
+        Rumble r = rumbler;
+        if (r == null || !r.available()) return false;
+        r.test(controls.rumble);
+        return true;
     }
 
     // Software keyboard (swkbd.cpp, TextPrompt). The loader calls this from its own thread; the answer goes back with the

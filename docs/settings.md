@@ -3,9 +3,9 @@
 The in-game settings menu (the gear of the touch controls) sets the common ones by section; choices with more than two options open a drop-down, and the menus start at a size that fits the screen, which Display > Menu size scales (the MOD UI too): **Display** (base
 resolution, dynamic resolution, FSR, FPS limit, FPS counter), **Graphics** (shadows, texture arrays, anisotropic filtering), **GPU driver** (the system's or one of your own), **Frame generation** (on/off, generator, Quality Preset, Lossless.dll),
 **Performance** (performance hints, fast cores, low memory, shader warm-up, pipelines on one thread), and the touch
-controls, combos and controller. Underneath, each is a `name = value` line (`1` is on) in `mhr.ini` in your data
+controls and controller. Underneath, each is a `name = value` line (`1` is on) in `mhr.ini` in your data
 folder, which the game checks once a second; the ones only read at start-up say so. You can edit `mhr.ini` by hand
-too, and Display → Restore default settings puts everything back (touch layout, combos and button mapping stay). An empty file with the switch's name in the data folder still works for switches the ini doesn't mention (handy
+too, and Display → Restore default settings puts everything back (touch layout, controller bindings and button mapping stay). An empty file with the switch's name in the data folder still works for switches the ini doesn't mention (handy
 with adb); changing that setting in the menu moves it into the ini.
 
 | Name | Effect |

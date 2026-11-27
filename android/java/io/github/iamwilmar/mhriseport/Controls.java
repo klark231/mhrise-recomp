@@ -75,9 +75,12 @@ final class Controls {
         {0.48f, 0.56f, 1}, // COMBO8
     };
 
-    // Combos are also the layout editor's added buttons (Add, or Copy as a new button): every button on the screen
-    // that isn't one of the console's is a combo, so a controller button can always fire it too.
+    // The layout editor's added buttons (Add, or Copy as a new button): every button on the screen that isn't one of the
+    // console's is one of these "combos", a set of console buttons one touch presses. They belong to the touch layout only.
     static final int COMBOS = 8;
+    // The controller's own: a controller key (or a pair of controller buttons) that presses console buttons, kept apart from
+    // the touch layout (Settings → Controller → Custom bindings). Nothing of the layout, drawn or not, has anything to do with them.
+    static final int BINDS = 16;
 
     // A button's look in the layout editor: its shape (0 its own) and an icon instead of its letters (0 none)
     static final String[] SHAPES = {"Its own", "Circle", "Rounded square", "Square"};
@@ -119,15 +122,22 @@ final class Controls {
     // Button mapping: the controller key (an Android keycode) that presses each of BUTTONS instead of its own
     // (0: the usual one). Analog triggers count as L2 / R2 and a hat as the d-pad keys (android_main.cpp).
     final int[] mapKey = new int[BUTTONS.length];
-    final long[] comboPad = new long[COMBOS];  // el botón (o los dos) del mando que lo dispara (0: ninguno)
-    // A controller or keyboard key of any kind that fires it too (an Android keycode; 0: none), as the button mapping
-    final int[] comboKey = new int[COMBOS];
+    // The controller's custom bindings (BINDS): the console buttons one presses (0: the slot is free)...
+    final long[] bindButtons = new long[BINDS];
+    // ...the controller button (or the two) that fires it, one of PAD_TRIGGERS (0: none)...
+    final long[] bindPad = new long[BINDS];
+    // ...and a controller or keyboard key of any kind that fires it too (an Android keycode; 0: none), as the button mapping
+    final int[] bindKey = new int[BINDS];
     // El mando físico
     int padDeadzone = 12;   // % del recorrido del stick
     int trigger = 35;       // % del recorrido de un gatillo analógico desde el que cuenta como ZL / ZR
     int rightAxes = 0;      // 0 según el mando, 1 Z/RZ, 2 RX/RY (android_main.cpp: kAxes*)
+    boolean hideOnPad = true;     // the touch controls go while a controller is connected (the gear stays); off: they stay
+    boolean backOpensMenu = true; // Android's Back (button, or the swipe from the left edge) opens the settings; off: it is "-"
+    int rumble = 100;       // % of the game's own vibration the controller's motors play (0 off; Rumble.java)
 
     private final SharedPreferences prefs;
+    private boolean migrated;  // load() copied the old combo triggers into bindings: save() records it
 
     Controls(Context context) {
         prefs = context.getSharedPreferences("controles", Context.MODE_PRIVATE);
@@ -195,10 +205,24 @@ final class Controls {
         trigger = prefs.getInt("gatillo", trigger);
         rightAxes = prefs.getInt("stick_derecho", rightAxes);
         for (int i = 0; i < BUTTONS.length; i++) mapKey[i] = prefs.getInt("map_key" + i, 0);
-        for (int i = 0; i < COMBOS; i++) {
-            combo[i] = prefs.getLong("combo" + i, 0);
-            comboPad[i] = prefs.getLong("combo_mando" + i, 0);
-            comboKey[i] = prefs.getInt("combo_key" + i, 0);
+        rumble = prefs.getInt("rumble", rumble);
+        hideOnPad = prefs.getBoolean("hide_on_pad", hideOnPad);
+        backOpensMenu = prefs.getBoolean("back_menu", backOpensMenu);
+        for (int i = 0; i < COMBOS; i++) combo[i] = prefs.getLong("combo" + i, 0);
+        for (int i = 0; i < BINDS; i++) {
+            bindButtons[i] = prefs.getLong("bind" + i, 0);
+            bindPad[i] = prefs.getLong("bind_mando" + i, 0);
+            bindKey[i] = prefs.getInt("bind_key" + i, 0);
+        }
+        // Until now the controller button of an added button or combo was kept with it. It's a binding of its own now: the
+        // ones set are copied over, once, so nothing a player set up stops working (and the touch button stays as it was).
+        if (!prefs.getBoolean("binds_moved", false)) {
+            for (int i = 0; i < COMBOS; i++) {
+                long pad = prefs.getLong("combo_mando" + i, 0);
+                int key = prefs.getInt("combo_key" + i, 0);
+                if (combo[i] != 0 && (pad != 0 || key != 0)) addBinding(combo[i], pad, key);
+            }
+            migrated = true;
         }
         grid = prefs.getBoolean("grid", grid);
         // "LSTICK:0.12,0.46,1,1,0,0,0;..." (x, y, tamaño, se ve, forma, icono, tap to hold): lo que no esté, como viene
@@ -262,8 +286,14 @@ final class Controls {
                 .putInt("zona_mando", padDeadzone).putInt("gatillo", trigger).putInt("stick_derecho", rightAxes)
                 .putBoolean("camera_swipe", cameraSwipe).putInt("swipe_speed", swipeSpeed).putBoolean("grid", grid)
                 .putString("disposicion", layout.toString()).putInt("layout_version", 2);
-        for (int i = 0; i < COMBOS; i++)
-            e.putLong("combo" + i, combo[i]).putLong("combo_mando" + i, comboPad[i]).putInt("combo_key" + i, comboKey[i]);
+        e.putInt("rumble", rumble).putBoolean("hide_on_pad", hideOnPad).putBoolean("back_menu", backOpensMenu);
+        for (int i = 0; i < COMBOS; i++) e.putLong("combo" + i, combo[i]);
+        for (int i = 0; i < BINDS; i++)
+            e.putLong("bind" + i, bindButtons[i]).putLong("bind_mando" + i, bindPad[i]).putInt("bind_key" + i, bindKey[i]);
+        if (migrated || !prefs.getBoolean("binds_moved", false)) {
+            e.putBoolean("binds_moved", true);
+            for (int i = 0; i < COMBOS; i++) e.remove("combo_mando" + i).remove("combo_key" + i);
+        }
         for (Ctl c : Ctl.values()) {
             String l = label[c.ordinal()];
             if (l == null || l.isEmpty()) e.remove("label_" + c.name());
@@ -309,8 +339,7 @@ final class Controls {
                     .put("shape", shape[k]).put("icon", icon[k]).put("hold", hold[k]).put("alpha", alpha[k])
                     .put("color", color[k]).put("image", image[k]).put("outline", outline[k]).put("fit", fit[k]);
             if (label[k] != null) e.put("label", label[k]);
-            if (c.combo())
-                e.put("buttons", combo[c.comboIndex()]).put("pad", comboPad[c.comboIndex()]).put("key", comboKey[c.comboIndex()]);
+            if (c.combo()) e.put("buttons", combo[c.comboIndex()]);
             controls.put(c.name(), e);
         }
         o.put("controls", controls);
@@ -355,8 +384,10 @@ final class Controls {
             fit[k] = e.optBoolean("fit", false);
             if (c.combo()) {
                 combo[c.comboIndex()] = e.optLong("buttons", 0);
-                comboPad[c.comboIndex()] = e.optLong("pad", 0);
-                comboKey[c.comboIndex()] = e.optInt("key", 0);
+                // (a file from before the bindings were apart carries the controller button with the combo: it becomes one)
+                long pad = e.optLong("pad", 0);
+                int key = e.optInt("key", 0);
+                if (combo[c.comboIndex()] != 0 && (pad != 0 || key != 0)) addBinding(combo[c.comboIndex()], pad, key);
             }
         }
     }
@@ -396,10 +427,9 @@ final class Controls {
         return shape[k] != 0 || icon[k] != 0 || hold[k] || color[k] != 0 || label[k] != null || image[k] || outline[k] != 100;
     }
 
-    // The editor's Delete: an added button goes, with its controller buttons and its look (its place is free for Add)
+    // The editor's Delete: an added button goes, with its look (its place is free for Add)
     void removeButton(int k) {
-        combo[k] = comboPad[k] = 0;
-        comboKey[k] = 0;
+        combo[k] = 0;
         int o = Ctl.COMBO1.ordinal() + k;
         place[o] = HOME[o].clone();
         shown[o] = true;
@@ -417,34 +447,66 @@ final class Controls {
         return -1;
     }
 
-    // Los combos del mando para el loader: pares (botones del mando, botones que pulsa), los de dos botones primero
+    // ---- the controller's custom bindings ----
+
+    // The first slot with no buttons (-1: all taken)
+    int freeBind() {
+        for (int i = 0; i < BINDS; i++)
+            if (bindButtons[i] == 0) return i;
+        return -1;
+    }
+
+    // Adds a binding unless the same one is there; its slot, or -1 (all taken, or nothing to press or nothing to fire it)
+    int addBinding(long buttons, long pad, int key) {
+        if (buttons == 0 || (pad == 0 && key == 0)) return -1;
+        for (int i = 0; i < BINDS; i++)
+            if (bindButtons[i] == buttons && bindPad[i] == pad && bindKey[i] == key) return i;
+        int i = freeBind();
+        if (i < 0) return -1;
+        bindButtons[i] = buttons;
+        bindPad[i] = pad;
+        bindKey[i] = key;
+        return i;
+    }
+
+    void removeBind(int i) {
+        bindButtons[i] = bindPad[i] = 0;
+        bindKey[i] = 0;
+    }
+
+    // What a binding is called in the menu: the console buttons it presses
+    String bindName(int i) {
+        return bindButtons[i] == 0 ? "Empty" : names(bindButtons[i]);
+    }
+
+    // The controller's bindings for the loader: pairs (controller buttons, buttons it presses), the two-button ones first
     long[] padCombos() {
-        long[] out = new long[COMBOS * 2];
+        long[] out = new long[BINDS * 2];
         int n = 0;
         for (int pass = 0; pass < 2; pass++)
-            for (int i = 0; i < COMBOS; i++) {
-                if (comboPad[i] == 0 || combo[i] == 0) continue;
-                boolean two = Long.bitCount(comboPad[i]) > 1;
+            for (int i = 0; i < BINDS; i++) {
+                if (bindPad[i] == 0 || bindButtons[i] == 0) continue;
+                boolean two = Long.bitCount(bindPad[i]) > 1;
                 if ((pass == 0) != two) continue;
-                out[n++] = comboPad[i];
-                out[n++] = combo[i];
+                out[n++] = bindPad[i];
+                out[n++] = bindButtons[i];
             }
         return java.util.Arrays.copyOf(out, n);
     }
 
     // The button mapping for the loader: pairs (keycode, the buttons it presses)
     long[] padMapping() {
-        long[] out = new long[(BUTTONS.length + COMBOS) * 2];
+        long[] out = new long[(BUTTONS.length + BINDS) * 2];
         int n = 0;
         for (int i = 0; i < BUTTONS.length; i++) {
             if (mapKey[i] == 0) continue;
             out[n++] = mapKey[i];
             out[n++] = BUTTONS[i];
         }
-        for (int i = 0; i < COMBOS; i++) {  // (an added button's or a combo's key: it presses all of its buttons)
-            if (comboKey[i] == 0 || combo[i] == 0) continue;
-            out[n++] = comboKey[i];
-            out[n++] = combo[i];
+        for (int i = 0; i < BINDS; i++) {  // (a custom binding's key: it presses all of its buttons)
+            if (bindKey[i] == 0 || bindButtons[i] == 0) continue;
+            out[n++] = bindKey[i];
+            out[n++] = bindButtons[i];
         }
         return java.util.Arrays.copyOf(out, n);
     }
