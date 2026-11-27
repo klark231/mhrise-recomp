@@ -2056,6 +2056,16 @@ private:
     bool split_overlays_ = true;
     // <datos>/no_gather_vertex_streams (en vivo): como antes, un stream que la GPU escribió solo en parte sale de la memoria del juego.
     bool gather_vertex_streams_ = true;
+    // Cada unión o copia de streams corta el pase (la barrera y las copias van fuera de él; en un tiler eso es guardar y
+    // volver a cargar los adjuntos), así que tiene tope: por frame (uniones y copias juntas), en bytes de copias y por
+    // ventana. Pasado el tope el draw sale como antes (de la memoria del juego). Las uniones ya cuentan en "perfil
+    // overlays"; las copias y lo saltado, en su propia línea.
+    static constexpr uint32_t kGatherMaxPerFrame = 16;
+    static constexpr uint64_t kGatherMaxBytesPerFrame = 24ull << 20;
+    static constexpr VkDeviceSize kGatherWindowMax = 4ull << 20;
+    uint64_t gather_frame_ = UINT64_MAX, gather_frame_bytes_ = 0;
+    uint32_t gather_frame_count_ = 0;
+    uint64_t prof_gather_ = 0, prof_gather_streams_ = 0, prof_gather_bytes_ = 0, prof_gather_capped_ = 0;
     static constexpr uint64_t kMergeReadMax = 1ull << 20;  // unión por una lectura: hasta esto
     // Perfil (con registro, en "perfil overlays"): overlays escritos por la GPU tirados, por motivo (erase_reason; su
     // texto, el mismo que el de '[vigía] se tira el overlay'), y uniones y parches parciales. Siempre se cuentan, sin el
@@ -2342,6 +2352,16 @@ private:
     // [address, address+size) con lo que haya de la GPU encima de la memoria del juego, en un buffer temporal
     // (argumentos indirectos escritos solo en parte por la GPU). false si ningún overlay lo toca.
     bool gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host = nullptr);
+    // gather_overlays en tres partes, para juntar varios streams de un draw con una sola pareja de barreras.
+    using GatherParts = std::vector<std::pair<const Overlay*, uint64_t>>;  // overlay e inicio de su rango
+    struct GatherJob {
+        uint32_t stream = 0;
+        uint64_t address = 0, size = 0;
+        GatherParts parts;
+        Staging::Alloc al{};
+    };
+    bool gather_collect(uint64_t address, uint64_t size, GatherParts* parts);  // false: ningún overlay toca el rango
+    void gather_emit(const GatherJob& job);                                     // las copias; las barreras, de quien llama
     uint64_t submit_index_ = 0;  // envíos ejecutados: la caché de vértices revisa una vez por envío
     std::vector<Texture*> frame_targets_, frame_uploads_;  // para los volcados de depuración
     void dump(Texture& t, const std::string& name, uint32_t layer = 0, int forced_mip = -1);
@@ -8252,7 +8272,20 @@ void Executor::draw(const cmd::Draw& in) {
     VkBuffer gathered_buf[kMaxVertexBuffers] = {};  // streams resueltos aquí: buffer y desfase de su ventana
     VkDeviceSize gathered_off[kMaxVertexBuffers] = {};
     if (gather_vertex_streams_ && !overlays_.empty()) {
-        uint32_t tried = 0;
+        if (gather_frame_ != frame_) gather_frame_ = frame_, gather_frame_count_ = 0, gather_frame_bytes_ = 0;
+        // Un stream que la GPU escribió solo en parte se resuelve, de más barato a más caro:
+        //  1. un overlay cubre lo que lee el draw: se enlaza tal cual (sin copia ni corte del pase);
+        //  2. se une UNA vez (merge_overlays, como los SSBO que se leen): la unión queda de overlay y los draws siguientes
+        //     caen en el caso 1 hasta que la CPU o la GPU la reescriban. Corta el pase una vez, no en cada draw;
+        //  3. si no se puede unir (más de kMergeReadMax, nada que unir), se copia para este draw, con tope.
+        // Las uniones van antes que las copias: una unión tira los overlays de dentro y las copias guardan punteros a ellos.
+        struct Pending {
+            uint32_t stream;
+            uint64_t at;
+            VkDeviceSize window;
+        };
+        Pending pending[kMaxVertexBuffers];
+        uint32_t npending = 0, tried = 0;
         for (uint32_t k = 0; k < 16; k++) {
             if (!(vs->shader.input_generics & (1ull << k))) continue;
             const VertexAttribState a = k < st_.attribs.size() ? st_.attribs[k] : VertexAttribState{};
@@ -8269,17 +8302,69 @@ void Executor::draw(const cmd::Draw& in) {
             const VkDeviceSize need = sv.stride ? VkDeviceSize{sv.stride} * elements : 64;
             const VkDeviceSize window = std::min<VkDeviceSize>(range.size - skip, stream_offset[a.stream] + need);
             const uint64_t at = range.address + skip;
-            if (!window || window > kStagingChunk || !overlay_maybe_in(at, window)) continue;
-            if (const Overlay* o = find_overlay(at, window, &off)) {  // cubre lo que lee el draw, aunque no el rango entero
+            if (!window || !overlay_maybe_in(at, window)) continue;
+            if (const Overlay* o = find_overlay(at, window, &off)) {  // 1. cubre lo que lee el draw, aunque no el rango entero
                 gathered_buf[a.stream] = o->buffer;
                 gathered_off[a.stream] = off;
                 continue;
             }
-            VkBuffer gb = VK_NULL_HANDLE;
-            VkDeviceSize go = 0;
-            if (gather_overlays(at, window, &gb, &go)) {  // false: ningún overlay toca la ventana
-                gathered_buf[a.stream] = gb;
-                gathered_off[a.stream] = go;
+            if (gather_frame_count_ >= kGatherMaxPerFrame) {  // cada unión o copia corta el pase: pasado el tope, como antes
+                prof_gather_capped_++;
+                continue;
+            }
+            if (const Overlay* m = merge_overlays(at, window, &off, true)) {  // 2. una vez, y queda de overlay
+                gathered_buf[a.stream] = m->buffer;
+                gathered_off[a.stream] = off;
+                gather_frame_count_++;
+                continue;
+            }
+            pending[npending++] = {a.stream, at, window};
+        }
+        std::vector<GatherJob> jobs;  // 3. sin reservar nada si ningún stream llega aquí
+        for (uint32_t i = 0; i < npending; i++) {
+            GatherJob job;
+            job.stream = pending[i].stream;
+            job.address = pending[i].at;
+            job.size = pending[i].window;
+            if (!gather_collect(job.address, job.size, &job.parts)) continue;  // ningún overlay toca la ventana
+            if (job.size > kGatherWindowMax) {  // demasiado para copiarlo en cada draw: como antes
+                prof_gather_capped_++;
+                continue;
+            }
+            jobs.push_back(std::move(job));
+        }
+        if (!jobs.empty()) {
+            uint64_t bytes = 0;
+            for (const GatherJob& job : jobs) bytes += job.size;
+            if (gather_frame_count_ >= kGatherMaxPerFrame || gather_frame_bytes_ + bytes > kGatherMaxBytesPerFrame) {
+                prof_gather_capped_ += jobs.size();  // pasado el tope del frame: de la memoria del juego, sin cortar el pase
+            } else {
+                bool staged = true;
+                for (GatherJob& job : jobs) {
+                    const VkDeviceSize size = std::max<VkDeviceSize>(job.size, 64);  // como el paso 5: nunca menos de 64
+                    job.al = staging_->alloc(size, 16);
+                    if (!job.al.data) {
+                        staged = false;
+                        break;
+                    }
+                    memcpy(job.al.data, reinterpret_cast<const void*>(job.address), job.size);  // lo de la CPU
+                    if (size > job.size) memset(static_cast<uint8_t*>(job.al.data) + job.size, 0, size - job.size);
+                }
+                if (staged) {  // una sola pareja de barreras para todos los streams del draw
+                    split_why_ = "copia de streams de vértices (paso 0)";
+                    barrier();
+                    for (const GatherJob& job : jobs) gather_emit(job);  // y encima lo de la GPU
+                    barrier();
+                    for (const GatherJob& job : jobs) {
+                        gathered_buf[job.stream] = job.al.buffer;
+                        gathered_off[job.stream] = job.al.offset;
+                    }
+                    gather_frame_count_++;
+                    gather_frame_bytes_ += bytes;
+                    prof_gather_++;
+                    prof_gather_streams_ += jobs.size();
+                    prof_gather_bytes_ += bytes;
+                }
             }
         }
     }
@@ -8896,6 +8981,11 @@ void Executor::draw(const cmd::Draw& in) {
             if (a.stream < kMaxVertexBuffers) stream_src[a.stream] = {buffer, base};
             bind(k, buffer, base + a.offset);
         };
+        if (a.stream < kMaxVertexBuffers && gathered_buf[a.stream]) {  // unión de lo de la CPU y lo de la GPU (paso 0)
+            remember(gathered_buf[a.stream], gathered_off[a.stream]);  // (antes que el espejo: este lo dejaría con lo viejo)
+            gpu_vertices = true;
+            continue;
+        }
         if (in_range) {
             VkDeviceSize ov_offset = 0;  // vértices escritos por la GPU (p. ej. instancias de un compute)
             if (const Overlay* o = find_overlay(range.address, range.size, &ov_offset)) {
@@ -8917,11 +9007,6 @@ void Executor::draw(const cmd::Draw& in) {
                     remember(m->buffer, ov_offset);
                     continue;
                 }
-        }
-        if (a.stream < kMaxVertexBuffers && gathered_buf[a.stream]) {  // unión de lo de la CPU y lo de la GPU (paso 0)
-            remember(gathered_buf[a.stream], gathered_off[a.stream]);
-            gpu_vertices = true;
-            continue;
         }
         // El rango desde el primer vértice de la ventana.
         if (skip < range.size) {
@@ -9644,10 +9729,9 @@ void Executor::reap_mirrors() {
         }
 }
 
-bool Executor::gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host) {
+bool Executor::gather_collect(uint64_t address, uint64_t size, GatherParts* parts) {
     auto it = overlays_.upper_bound(address);
     if (it != overlays_.begin()) --it;
-    std::vector<std::pair<const Overlay*, uint64_t>> parts;  // overlay e inicio de su rango
     while (it != overlays_.end() && it->first < address + size) {
         Overlay& o = it->second;
         if (it->first + o.size <= address) {
@@ -9664,25 +9748,36 @@ bool Executor::gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer
                 continue;
             }
         }
-        parts.push_back({&o, it->first});
+        parts->push_back({&o, it->first});
         ++it;
     }
-    if (parts.empty()) return false;
-    Staging::Alloc al = staging_->alloc(size, 16);
-    if (!al.data) return false;
-    memcpy(al.data, reinterpret_cast<const void*>(address), size);  // lo de la CPU, y encima lo de la GPU
+    return !parts->empty();
+}
+
+void Executor::gather_emit(const GatherJob& job) {
+    for (auto [o, start] : job.parts) {
+        const uint64_t from = std::max(job.address, start), to = std::min(job.address + job.size, start + o->size);
+        VkBufferCopy region{o->offset + (from - start), job.al.offset + (from - job.address), to - from};
+        note_gpu_work();
+        vkCmdCopyBuffer(cmd_, o->buffer, job.al.buffer, 1, &region);
+    }
+}
+
+bool Executor::gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host) {
+    GatherJob job;
+    job.address = address;
+    job.size = size;
+    if (!gather_collect(address, size, &job.parts)) return false;
+    job.al = staging_->alloc(size, 16);
+    if (!job.al.data) return false;
+    memcpy(job.al.data, reinterpret_cast<const void*>(address), size);  // lo de la CPU, y encima lo de la GPU
     split_why_ = "unión de overlays (argumentos indirectos)";
     barrier();
-    for (auto [o, start] : parts) {
-        const uint64_t from = std::max(address, start), to = std::min(address + size, start + o->size);
-        VkBufferCopy region{o->offset + (from - start), al.offset + (from - address), to - from};
-        note_gpu_work();
-        vkCmdCopyBuffer(cmd_, o->buffer, al.buffer, 1, &region);
-    }
+    gather_emit(job);
     barrier();
-    *buffer = al.buffer;
-    *offset = al.offset;
-    if (host) *host = al.data;
+    *buffer = job.al.buffer;
+    *offset = job.al.offset;
+    if (host) *host = job.al.data;
     return true;
 }
 
@@ -12010,6 +12105,12 @@ void Executor::profile_frame() {
         prof_lost_.clear();
         prof_merged_ = prof_merged_parts_ = prof_merged_bytes_ = prof_partial_patched_ = prof_split_ = 0;
     }
+    if (prof_gather_ || prof_gather_capped_)  // cada unión corta el pase: aquí se ve lo que cuestan
+        NVN_LOG("perfil overlays: %.1f copias de streams de vértices por frame (%.1f streams, %.1f KB; cada una corta el "
+                "pase), %.1f saltadas por el tope%s\n",
+                prof_gather_ / double(period), prof_gather_streams_ / double(period), prof_gather_bytes_ / 1024.0 / double(period),
+                prof_gather_capped_ / double(period), !gather_vertex_streams_ ? " (no_gather_vertex_streams)" : "");
+    prof_gather_ = prof_gather_streams_ = prof_gather_bytes_ = prof_gather_capped_ = 0;
     prof_overlay_new_bytes_ = prof_overlay_reused_bytes_ = prof_compactions_ = prof_compact_wait_us_ = prof_compact_copy_us_ = 0;
     prof_partial_ = 0;
     memset(prof_reads_, 0, sizeof prof_reads_);

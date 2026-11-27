@@ -142,7 +142,7 @@ final class SettingsMenu {
 
     private String[] sectionNames() {
         return new String[] {tr("Display", "显示"), tr("Graphics", "图形"), tr("GPU driver", "GPU 驱动"), tr("Frame generation", "帧生成"), tr("Performance", "性能"),
-                tr("Touch controls", "触控"), tr("Combos", "组合键"), tr("Controller", "实体手柄"),
+                tr("Touch controls", "触控"), tr("Controller", "实体手柄"),
                 tr("Multiplayer", "多人游戏"), tr("Saves", "存档"), tr("Mods & cheats", "MOD 与金手指"), tr("Debug", "调试")};
     }
 
@@ -174,11 +174,10 @@ final class SettingsMenu {
             case 3: buildFrameGen(); break;
             case 4: buildPerformance(); break;
             case 5: buildTouch(); break;
-            case 6: buildCombos(); break;
-            case 7: buildController(); break;
-            case 8: buildMultiplayer(); break;
-            case 9: buildSaves(); break;
-            case 10: buildMods(); break;
+            case 6: buildController(); break;
+            case 7: buildMultiplayer(); break;
+            case 8: buildSaves(); break;
+            case 9: buildMods(); break;
             default: buildDebug(); break;
         }
     }
@@ -204,7 +203,7 @@ final class SettingsMenu {
                 });
         action(resetArmed ? tr("Tap again to restore the defaults", "再点一次恢复默认设置") : tr("Restore default settings", "恢复默认设置"),
                 tr("Puts every setting of this menu back as it comes: graphics, performance, debug and the driver "
-                        + "variables. Your touch layout, combos and button mapping stay. Some settings need a restart.", "重置图形、性能、调试及驱动变量。保留触控布局、组合键和按键映射。部分设置重启后生效。"),
+                        + "variables. Your touch layout, controller bindings and button mapping stay. Some settings need a restart.", "重置图形、性能、调试及驱动变量。保留触控布局、手柄绑定和按键映射。部分设置重启后生效。"),
                 () -> {
                     if (!resetArmed) {
                         resetArmed = true;
@@ -1033,7 +1032,7 @@ final class SettingsMenu {
         number(tr("Opacity", "不透明度"), tr("How much of the game shows through the controls.", "调整透过控件看到游戏画面的程度。"), 20, 100, 5, " %", () -> cfg.opacity, v -> cfg.opacity = v);
         number(tr("Size", "大小"), tr("All controls at once. Each one also has its own, in Edit layout.", "统一调整所有控件大小。可在「编辑布局」中单独调整各个控件。"), 60, 160, 5, " %", () -> cfg.size,
                 v -> cfg.size = v);
-        choice(tr("Vibration", "振动"), tr("A short tap when a control is pressed.", "按下控件时给予短暂的振动反馈。"),
+        choice(tr("Touch vibration", "触控振动"), tr("A short tap of the phone when an on-screen control is pressed. (The controller's is under Controller.)", "按下屏幕控件时手机的短暂振动。（手柄振动在「实体手柄」中设置。）"),
                 new String[] {tr("Off", "关"), tr("Light", "弱"), tr("Medium", "中"), tr("Strong", "强")},
                 () -> cfg.vibration, v -> {
                     cfg.vibration = v;
@@ -1065,7 +1064,7 @@ final class SettingsMenu {
                     activity.startEditing();
                 });
         action(tr("Export layout", "导出布局"), tr("Saves the whole touch layout to a file: where each control is, its look and pictures, "
-                + "and the combos with their controller buttons. To keep it, or give it to someone.", "将所有控件的位置、外观、图片，以及组合键和实体手柄绑定保存到文件。"), () -> {
+                + "and the added buttons. To keep it, or give it to someone.", "将所有控件的位置、外观、图片，以及添加的按键保存到文件。"), () -> {
                     dialog.dismiss();
                     activity.exportLayout();
                 });
@@ -1088,22 +1087,6 @@ final class SettingsMenu {
                     + "in Edit layout, or turn camera swipe on.", "右摇杆已隐藏，滑动视角也已关闭。若要用触屏转动镜头，请在编辑布局中显示右摇杆，或开启滑动视角。"));
     }
 
-    private void buildCombos() {
-        header(tr("Combos", "组合键"));
-        note(tr("A combo presses several buttons at once: with its button on the screen, or with one (or two) of the controller's. "
-                + "The layout editor's Add and Copy as a new button make combos too, so every added button can be fired "
-                + "from a controller.", "组合键可同时按下多个按键，用触屏或手柄上的一至两个按键触发。布局编辑器中添加或复制的按键也可在此绑定。"));
-        for (int i = 0; i < Controls.COMBOS; i++) {
-            final int k = i;
-            String value = cfg.combo[k] == 0 ? tr("None", "无")
-                                             : Controls.names(cfg.combo[k]) + (cfg.comboPad[k] != 0
-                                                       ? tr("  ·  pad: ", "  ·  手柄：") + Controls.names(cfg.comboPad[k]) : "")
-                                                       + (cfg.comboKey[k] != 0 ? tr("  ·  key: ", "  ·  键位：") + Controls.keyName(cfg.comboKey[k]) : "");
-            row(cfg.comboName(k), value, tr("Choose the buttons it presses and, if you like, the controller button that does it.", "选择要同时按下的按键，也可指定触发它的实体按键。"), v -> editCombo(k), false);
-        }
-
-    }
-
     private void buildController() {
         header(tr("Controller", "实体手柄"));
         number(tr("Dead zone", "死区"), tr("How far a controller stick moves before it counts (both sticks).", "实体手柄左右摇杆离开中心多远后开始响应。"), 0, 40, 1, " %",
@@ -1116,6 +1099,33 @@ final class SettingsMenu {
                         + "triggers on Z/RZ) on many generic ones. Change it if the camera won't move or moves on its own.", "选择读取右摇杆的轴。自动模式下，Android 和 Xbox 手柄使用 Z/RZ，部分通用手柄使用 RX/RY。镜头不动或自行移动时可调整。"),
                 new String[] {tr("By controller", "按手柄识别"), "Z / RZ", "RX / RY"}, () -> cfg.rightAxes,
                 v -> cfg.rightAxes = v);
+
+        header(tr("With a controller", "使用手柄时"));
+        toggle(tr("Hide touch controls when a controller is connected", "连接手柄时隐藏触控按键"),
+                tr("The on-screen buttons and sticks go away while a controller is connected and come back when it's unplugged. "
+                        + "The gear stays, and Edit layout still shows them. Turn off to keep them on screen.", "连接手柄期间隐藏屏幕按键和摇杆，拔出后恢复。齿轮按钮保留，「编辑布局」仍会显示所有控件。关闭后始终显示。"),
+                () -> cfg.hideOnPad ? 1 : 0, v -> cfg.hideOnPad = v != 0);
+        note(GameActivity.controllerConnected() ? tr("A controller is connected right now.", "当前已连接手柄。")
+                                                : tr("No controller is connected right now.", "当前未连接手柄。"));
+        choice(tr("Back button / gesture", "返回键 / 手势"),
+                tr("What Android's Back does: the button, or the swipe from the left edge of the screen. Open settings, as in other "
+                        + "emulators, or press − for the game. (The swipe from the right edge opens the HUD panel, and a controller's own "
+                        + "Back key is always −.)", "安卓返回键或从屏幕左边缘滑动的作用：打开设置（与其他模拟器一致），或作为游戏中的 −。（从右边缘滑动打开 HUD 面板；手柄自带的返回键始终是 −。）"),
+                new String[] {tr("Open settings", "打开设置"), tr("Minus (−)", "减号 (−)")}, () -> cfg.backOpensMenu ? 0 : 1,
+                v -> cfg.backOpensMenu = v == 0);
+
+        header(tr("Haptic feedback", "手柄震动"));
+        number(tr("Strength", "强度"), tr("How strongly the controller vibrates, as a share of the game's own vibration: 100 is as the game "
+                + "asks, 0 turns it off. Raise it if your controller's motors feel weak.", "手柄震动相对于游戏原始震动的强度：100 为游戏原值，0 为关闭。若手柄马达偏弱可调高。"),
+                0, 200, 10, " %", () -> cfg.rumble, v -> cfg.rumble = v);
+        action(tr("Test vibration", "测试震动"), tr("A short pulse on the connected controller at this strength.", "以当前强度让已连接的手柄短暂震动一下。"), () -> {
+            if (!activity.rumbleTest())
+                android.widget.Toast.makeText(activity, tr("No controller with a vibration motor found.", "未找到带震动马达的手柄。"),
+                        android.widget.Toast.LENGTH_SHORT).show();
+        });
+        note(tr("Needs a controller Android can vibrate: wired and many Bluetooth ones, and on Android 12 and up the Xbox and "
+                + "PlayStation pads with both motors. The phone's own vibration for the touch controls is under Touch controls.",
+                "需要 Android 能驱动震动的手柄：有线手柄、多数蓝牙手柄；Android 12 及以上还支持 Xbox / PlayStation 双马达手柄。触控时手机自身的振动在「触控」中设置。"));
 
         header(tr("Button mapping", "按键映射"));
         note(tr("Tap a Switch button, then press the controller button you want for it. Everything else keeps its usual "
@@ -1132,24 +1142,37 @@ final class SettingsMenu {
             build();
         }, false);
 
-        header(tr("Added buttons and combos", "自定义按键和组合键"));
-        note(tr("Any key of a controller or a keyboard can fire one of your added buttons or combos (Combos, and the layout "
-                + "editor's Add): while it's held the game gets all of its buttons. Tap one, then press the key.", "可以用手柄或键盘的任意键触发已添加的按键或组合键。点选一项后按下要绑定的键。"));
+        header(tr("Custom bindings", "自定义绑定"));
+        note(tr("A controller key (or two controller buttons held together) that presses one or several console buttons at "
+                + "once. These are the controller's own: they don't show on the screen and have nothing to do with the touch "
+                + "controls or their layout.", "用手柄的某个键（或同时按住两个手柄键）一次按下一个或多个 Switch 按键。这些仅属于手柄，不会显示在屏幕上，与触控及其布局无关。"));
         boolean any = false;
-        for (int i = 0; i < Controls.COMBOS; i++) {
-            if (cfg.combo[i] == 0) continue;
+        for (int i = 0; i < Controls.BINDS; i++) {
+            if (cfg.bindButtons[i] == 0) continue;
             any = true;
             final int k = i;
-            final String name = cfg.comboName(k);
-            row(name + "  (" + Controls.names(cfg.combo[k]) + ")", cfg.comboKey[k] == 0 ? tr("None", "无") : Controls.keyName(cfg.comboKey[k]),
-                    tr("The controller or keyboard key that presses ", "选择用来触发此组合的手柄键或键盘键：") + Controls.names(cfg.combo[k]) + ".",
-                    v -> captureKey(name, cfg.comboKey[k], key -> {
-                        for (int j = 0; j < Controls.COMBOS; j++)
-                            if (cfg.comboKey[j] == key) cfg.comboKey[j] = 0;  // (one key, one of them)
-                        cfg.comboKey[k] = key;
-                    }), false);
+            row(cfg.bindName(k), bindValue(k), tr("Change the buttons it presses, or the controller key or buttons that fire it.", "更改要按下的按键，或触发它的手柄按键。"),
+                    v -> editBinding(k), false);
         }
-        if (!any) note(tr("None yet: make one in Combos, or with Add in Edit layout.", "尚无自定义按键。可在「组合键」或「编辑布局」中添加。"));
+        if (!any) note(tr("None yet.", "暂无。"));
+        action(tr("+ Add button / combo", "+ 添加按键 / 组合键"), tr("A new binding: pick the console buttons to press, then the controller key that does it.", "新建绑定：先选要按下的 Switch 按键，再选触发它的手柄按键。"), () -> {
+            int j = cfg.freeBind();
+            if (j < 0)
+                android.widget.Toast.makeText(activity, tr("All the slots are used: delete one first.", "槽位已满，请先删除一个。"),
+                        android.widget.Toast.LENGTH_SHORT).show();
+            else editBinding(j);
+        });
+    }
+
+    // What fires a custom binding, for its row in the list
+    private String bindValue(int k) {
+        StringBuilder sb = new StringBuilder();
+        if (cfg.bindKey[k] != 0) sb.append(tr("key: ", "键位：")).append(Controls.keyName(cfg.bindKey[k]));
+        if (cfg.bindPad[k] != 0) {
+            if (sb.length() > 0) sb.append("  ·  ");
+            sb.append(tr("pad: ", "手柄：")).append(Controls.names(cfg.bindPad[k]));
+        }
+        return sb.length() == 0 ? tr("not fired by anything yet", "尚未设置触发键") : sb.toString();
     }
 
     private String[] mappingNames() {
@@ -1483,8 +1506,8 @@ final class SettingsMenu {
             box.addView(pickRow(tr("Tap to hold", "点按锁定"), new String[] {tr("Off", "关"), tr("On", "开")}, () -> cfg.hold[k] ? 1 : 0, v -> cfg.hold[k] = v != 0,
                     tr("On: a tap presses it and keeps it pressed until the next tap (a small diamond shows it).", "点按一次保持按下，再点一次松开。小菱形表示已锁定。")));
             if (c.combo()) {
-                LinearLayout r = rowView(tr("Buttons and controller button", "按键组合及触发键"), text("›", 16, GOLD, false),
-                        tr("What it presses, and the controller button that does the same.", "设置要同时按下的按键，以及触发此组合的实体按键。"));
+                LinearLayout r = rowView(tr("Buttons it presses", "要按下的按键"), text("›", 16, GOLD, false),
+                        tr("What a touch of it presses. (A controller button for it: Settings → Controller → Custom bindings.)", "设置触摸它时同时按下的按键。（手柄按键请在「设置 → 实体手柄 → 自定义绑定」中设置。）"));
                 r.setOnClickListener(v -> {
                     d.dismiss();
                     editCombo(c.comboIndex());
@@ -1492,14 +1515,12 @@ final class SettingsMenu {
                 box.addView(r);
             } else {
                 LinearLayout r = rowView(tr("Copy as a new button", "复制为新按键"), text("›", 16, GOLD, false),
-                        tr("Adds another ", "添加一个新的 ") + Controls.label(c) + tr(" button (a combo of it alone: Settings → Combos, where a "
-                                + "controller button can fire it too).", "按键，可在「设置 → 组合键」中为其绑定实体按键。"));
+                        tr("Adds another ", "添加一个新的 ") + Controls.label(c) + tr(" button, for the touch screen only.", "按键，仅用于触屏。"));
                 r.setOnClickListener(v -> {
                     int j = cfg.freeCombo();
                     if (j < 0) return;
                     Controls.Ctl copy = Controls.Ctl.values()[Controls.Ctl.COMBO1.ordinal() + j];
                     cfg.combo[j] = cfg.buttons(c);
-                    cfg.comboPad[j] = 0;
                     float[] p = cfg.place[copy.ordinal()];
                     p[0] = Math.min(0.95f, cfg.place[k][0] + 0.06f);
                     p[1] = cfg.place[k][1];
@@ -1565,25 +1586,10 @@ final class SettingsMenu {
         return r;
     }
 
-    // ---- combo editor ---------------------------------------------------------------------------------------------------
+    // ---- combo editor (an added touch button) and binding editor (the controller's) -----------------------------------
 
-    void editCombo(int k) {
-        final Dialog d = new Dialog(activity);
-        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        LinearLayout box = new LinearLayout(activity);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(16), dp(12), dp(16), dp(14));
-        box.setBackground(plate(PANEL, 2, 0));
-        TextView title = text(cfg.comboName(k), 20, GOLD, true);
-        title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-        box.addView(title);
-        box.addView(rule(RED, 2));
-        box.addView(rule(GREEN, 1));
-        box.addView(text(tr("The buttons it presses:", "同时按下的按键"), 14, DIM, false));
-
-        // buttons in rows of eight: tap one to add or remove it
-        final long[] mask = {cfg.combo[k]};
-        final long[] padMask = {cfg.comboPad[k]};
+    // The console buttons in rows of eight: tap one to add it to mask or take it away
+    private LinearLayout buttonChips(final long[] mask) {
         LinearLayout grid = new LinearLayout(activity);
         grid.setOrientation(LinearLayout.VERTICAL);
         LinearLayout line = null;
@@ -1606,34 +1612,44 @@ final class SettingsMenu {
             lp.setMargins(dp(3), dp(3), dp(3), dp(3));
             line.addView(chip, lp);
         }
-        box.addView(grid);
+        return grid;
+    }
 
-        // the controller button that fires it: one of Controls.PAD_TRIGGERS, picked from a drop-down
-        final TextView padValue = text("", 16, GOLD, false);
-        LinearLayout padRow = rowView(tr("Controller button", "手柄触发键"), padValue,
-                tr("While it is held, the game gets the combo's buttons instead of it.", "按住此键时，游戏收到组合中设置的按键。"));
-        Runnable showPad = () -> padValue.setText((padMask[0] == 0 ? tr("None", "无") : Controls.names(padMask[0])) + "  ▾");
-        showPad.run();
-        padRow.setOnClickListener(v -> {
-            int at = 0;
-            final String[] names = new String[Controls.PAD_TRIGGERS.length];
-            for (int i = 0; i < names.length; i++) {
-                if (Controls.PAD_TRIGGERS[i] == padMask[0]) at = i;
-                names[i] = Controls.PAD_TRIGGERS[i] == 0 ? tr("None", "无") : Controls.names(Controls.PAD_TRIGGERS[i]);
-            }
-            dropDown(tr("Controller button", "手柄触发键"), names, at, i -> {
-                padMask[0] = Controls.PAD_TRIGGERS[i];
-                showPad.run();
-            });
-        });
-        box.addView(padRow);
+    private void showDialog(Dialog d, LinearLayout box) {
+        d.setContentView(box);
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            DisplayMetrics m = activity.getResources().getDisplayMetrics();
+            w.setLayout(Math.min(dp(620), (int) (m.widthPixels * 0.85f)), ViewGroup.LayoutParams.WRAP_CONTENT);
+        }
+        d.show();
+    }
+
+    // An added touch button's buttons. Touch only: its controller button is a custom binding (Settings → Controller).
+    void editCombo(int k) {
+        final Dialog d = new Dialog(activity);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(activity);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(12), dp(16), dp(14));
+        box.setBackground(plate(PANEL, 2, 0));
+        TextView title = text(cfg.comboName(k), 20, GOLD, true);
+        title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        box.addView(title);
+        box.addView(rule(RED, 2));
+        box.addView(rule(GREEN, 1));
+        box.addView(text(tr("The buttons it presses:", "同时按下的按键"), 14, DIM, false));
+        final long[] mask = {cfg.combo[k]};
+        box.addView(buttonChips(mask));
+        box.addView(text(tr("For the touch screen only. A controller button that does this is a custom binding: Settings → Controller.",
+                "仅用于触屏。若要用手柄按键触发，请在「设置 → 实体手柄 → 自定义绑定」中添加。"), 13, DIM, false));
 
         LinearLayout buttons = new LinearLayout(activity);
         buttons.setPadding(0, dp(10), 0, 0);
         TextView clear = button(tr("Clear", "清除"), false);
         clear.setOnClickListener(v -> {
             cfg.combo[k] = 0;
-            cfg.comboPad[k] = 0;
             d.dismiss();
             changed();
             build();
@@ -1641,7 +1657,6 @@ final class SettingsMenu {
         TextView ok = button(tr("Save", "保存"), true);
         ok.setOnClickListener(v -> {
             cfg.combo[k] = mask[0];
-            cfg.comboPad[k] = mask[0] == 0 ? 0 : padMask[0];
             d.dismiss();
             changed();
             build();
@@ -1651,15 +1666,95 @@ final class SettingsMenu {
         buttons.addView(clear, half);
         buttons.addView(ok, new LinearLayout.LayoutParams(half));
         box.addView(buttons);
+        showDialog(d, box);
+    }
 
-        d.setContentView(box);
-        Window w = d.getWindow();
-        if (w != null) {
-            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            DisplayMetrics m = activity.getResources().getDisplayMetrics();
-            w.setLayout(Math.min(dp(620), (int) (m.widthPixels * 0.85f)), ViewGroup.LayoutParams.WRAP_CONTENT);
-        }
-        d.show();
+    // A custom binding of the controller (Settings → Controller): the console buttons it presses, and what fires it: a
+    // controller or keyboard key, and/or a pair of controller buttons held together. Nothing is written until Save.
+    void editBinding(int k) {
+        final boolean existing = cfg.bindButtons[k] != 0;
+        final Dialog d = new Dialog(activity);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = new LinearLayout(activity);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(12), dp(16), dp(14));
+        box.setBackground(plate(PANEL, 2, 0));
+        TextView title = text(existing ? cfg.bindName(k) : tr("New binding", "新建绑定"), 20, GOLD, true);
+        title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        box.addView(title);
+        box.addView(rule(RED, 2));
+        box.addView(rule(GREEN, 1));
+        box.addView(text(tr("The buttons it presses:", "同时按下的按键"), 14, DIM, false));
+        final long[] mask = {cfg.bindButtons[k]};
+        final long[] pad = {cfg.bindPad[k]};
+        final int[] key = {cfg.bindKey[k]};
+        box.addView(buttonChips(mask));
+
+        // a controller or keyboard key of any kind (pressed to pick it)
+        final TextView keyValue = text("", 16, GOLD, false);
+        LinearLayout keyRow = rowView(tr("Controller key", "手柄按键"), keyValue,
+                tr("Any key of a controller or keyboard: tap, then press it.", "手柄或键盘的任意键：点选后按下该键。"));
+        final Runnable showKey = () -> keyValue.setText((key[0] == 0 ? tr("None", "无") : Controls.keyName(key[0])) + "  ›");
+        showKey.run();
+        keyRow.setOnClickListener(v -> captureKey(tr("this binding", "此绑定"), key[0], picked -> {
+            key[0] = picked;
+            showKey.run();
+        }));
+        box.addView(keyRow);
+
+        // or a button (or two together) of the controller, from a drop-down
+        final TextView padValue = text("", 16, GOLD, false);
+        LinearLayout padRow = rowView(tr("Controller buttons", "手柄组合键"), padValue,
+                tr("One button, or two held together (L3 + R3, ZL + ZR…).", "单个按键，或同时按住两个（L3 + R3、ZL + ZR 等）。"));
+        final Runnable showPad = () -> padValue.setText((pad[0] == 0 ? tr("None", "无") : Controls.names(pad[0])) + "  ▾");
+        showPad.run();
+        padRow.setOnClickListener(v -> {
+            int at = 0;
+            final String[] names = new String[Controls.PAD_TRIGGERS.length];
+            for (int i = 0; i < names.length; i++) {
+                if (Controls.PAD_TRIGGERS[i] == pad[0]) at = i;
+                names[i] = Controls.PAD_TRIGGERS[i] == 0 ? tr("None", "无") : Controls.names(Controls.PAD_TRIGGERS[i]);
+            }
+            dropDown(tr("Controller buttons", "手柄组合键"), names, at, i -> {
+                pad[0] = Controls.PAD_TRIGGERS[i];
+                showPad.run();
+            });
+        });
+        box.addView(padRow);
+
+        LinearLayout buttons = new LinearLayout(activity);
+        buttons.setPadding(0, dp(10), 0, 0);
+        TextView remove = button(existing ? tr("Delete", "删除") : tr("Cancel", "取消"), false);
+        remove.setOnClickListener(v -> {
+            if (existing) cfg.removeBind(k);
+            d.dismiss();
+            changed();
+            build();
+        });
+        TextView ok = button(tr("Save", "保存"), true);
+        ok.setOnClickListener(v -> {
+            if (mask[0] == 0 || (key[0] == 0 && pad[0] == 0)) {
+                android.widget.Toast.makeText(activity, mask[0] == 0
+                        ? tr("Pick at least one button to press.", "请至少选择一个要按下的按键。")
+                        : tr("Pick a controller key or buttons that fire it.", "请选择触发它的手柄按键。"), android.widget.Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if (key[0] != 0)
+                for (int j = 0; j < Controls.BINDS; j++)
+                    if (j != k && cfg.bindKey[j] == key[0]) cfg.bindKey[j] = 0;  // (one key, one of them)
+            cfg.bindButtons[k] = mask[0];
+            cfg.bindPad[k] = pad[0];
+            cfg.bindKey[k] = key[0];
+            d.dismiss();
+            changed();
+            build();
+        });
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, dp(46), 1);
+        half.setMargins(dp(4), 0, dp(4), 0);
+        buttons.addView(remove, half);
+        buttons.addView(ok, new LinearLayout.LayoutParams(half));
+        box.addView(buttons);
+        showDialog(d, box);
     }
 
     private void paintChip(TextView chip, boolean on) {
