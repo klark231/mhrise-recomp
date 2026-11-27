@@ -77,8 +77,8 @@ about the app itself are always welcome in the issues; just please don't share o
    that folder.
 4. Choose a **data folder**: where the port keeps your saves, the shader cache, `log.txt` and its settings. It can be any
    folder (*New folder here* makes one), or the game folder itself if you'd rather keep everything together.
-5. Press **Start game**. From then on the app starts the game directly; to change either folder, switch on
-   *Change folder* in the settings panel (see below) or open the app twice in a row (within ten seconds). Changing the
+5. Press **Start game**. From then on the app starts the game directly; to change either folder, open the app
+   twice in a row (within ten seconds). Changing the
    data folder copies your saves and settings to the new one (the old copy stays until you delete it).
 
 **Two copies on one phone.** A clone of the app (or the AnTuTu / Ludashi build next to the normal one) can play Local Play
@@ -95,15 +95,11 @@ benchmark first if you have it (same package name). Build one yourself with
 Saves, the shader cache and `log.txt` are written into the data folder. The first time you visit each place the game
 may stutter while its shaders are translated and compiled; they are cached for the next time.
 
-## Controls and the settings panel
+## Controls and settings
 
 - **Controllers are read by position.** Whatever is printed on them, the bottom face button is B, the right one A, the
   top one X and the left one Y, as on the game's own console. That goes for a handheld's built-in controls and for any
   pad over USB or Bluetooth (a DualSense, for example).
-- **Settings panel.** Swipe in from the right edge of the screen (the system's back gesture, the one that shows an arrow)
-  and a panel slides out over the game. It has a switch for the FPS counter (your choice is remembered) and *Change
-  folder*, which brings the folder screen back the next time you open the app. The same swipe, a tap outside the panel
-  or a few seconds without touching it hide it again.
 - **Touch controls.** A full controller on the screen, laid out like a traditional one: both sticks, the D-pad, A B X Y,
   L R ZL ZR, − and +, and L3 / R3 (also a short tap on a stick, without moving it). A finger can slide from one button to
   the next. The right stick is hidden by default: dragging on the game (camera swipe) turns the camera instead. A tap that
@@ -125,12 +121,9 @@ may stutter while its shaders are translated and compiled; they are cached for t
     several buttons at once (A+X, say, or a stick direction: LS↑ holds the left stick all the way up) when you touch it.
     One of a single button is called *Button n* and looks like that button; one of several, *Combo n*. They are for the
     touch screen only; a controller button that does the same is a *custom binding* (under *Controller*).
-  - *With a controller* (under Controller): *Hide touch controls when a controller is connected* (on by default) hides
-    the on-screen buttons and sticks while a gamepad is connected and brings them back when it's unplugged; the gear
-    stays, and Edit layout still shows everything. Turn it off to keep them on screen. *Back button / gesture* sets what
-    Android's Back does (the button, or the swipe from the left edge): *Open settings* (the default, as in other
-    emulators) or *Minus (−)*. The swipe from the right edge still opens the HUD panel, and a controller's own Back key
-    is always −.
+  - *Back button / gesture* (under Controller) sets what Android's Back does (the button, or the swipe from the left
+    edge): *Open settings* (the default, as in other emulators) or *Minus (−)*. A controller's own Back key is always −.
+    Turning the on-screen controls off hides the gear too, so keep Back on *Open settings* if you do.
   - *Haptic feedback* (under Controller): the game's vibration on the controller's motors, with a *Strength* from 0
     (off) to 200 % (100 is as the game asks) and a *Test vibration* button. Needs a controller Android can vibrate; with
     two motors (Android 12 and up) the game's low band goes to the first and the high band to the second.
@@ -396,9 +389,8 @@ CPU y este proyecto reimplementa el SDK de la consola y la API gráfica NVN sobr
   Las partidas y la caché de shaders se guardan en esa misma carpeta.
 - Funciona en móviles en general: Adreno (driver de Qualcomm o Turnip), Mali (driver de ARM o PanVK), Xclipse y
   PowerVR. Empezó como el port de IamWilmar para la Retroid Pocket 5 y la Flip 2.
-- Los mandos se leen por posición, por USB o Bluetooth, y hay controles táctiles con editor. Deslizando un dedo desde el borde derecho de
-  la pantalla sale un panel de ajustes, con el interruptor del contador de FPS y el de volver a elegir la
-  carpeta. Con la carpeta ya elegida, la app abre el juego directamente.
+- Los mandos se leen por posición, por USB o Bluetooth, y hay controles táctiles con editor. Con la carpeta ya elegida, la app abre el juego
+  directamente; para cambiarla, abre la app dos veces seguidas (en menos de diez segundos).
 - Proyecto de fans, gratis (las donaciones son opcionales y no desbloquean nada), sin relación con el fabricante de la consola ni
   con Capcom.
 

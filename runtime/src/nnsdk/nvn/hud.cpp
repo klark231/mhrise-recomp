@@ -44,12 +44,6 @@ constexpr uint32_t kRing = 12;             // buffers: más que presentaciones e
 constexpr uint32_t kStatsW = 360, kStatsH = 170;
 constexpr int kStatsLine = 20, kStatsPad = 8, kStatsLines = 8;
 std::atomic<int> g_building{0};  // pipelines in the background threads (shader_queued / shader_done)
-// El panel de ajustes (ver hud.h): un cajón que sale del borde derecho, de un tercio del ancho de la pantalla y toda su
-// altura, con una fila por ajuste.
-constexpr int64_t kPanelSlideNs = 180'000'000;    // lo que tarda en salir o esconderse
-constexpr int64_t kPanelIdleNs = 8'000'000'000;   // sin tocarlo, se esconde solo
-constexpr int kPanelHeader = 150, kPanelRow = 132;  // alto de la cabecera y de cada fila, en píxeles
-
 // Fuente de 5x7: cada fila, 5 bits (el alto a la izquierda).
 struct Glyph {
     char c;
@@ -84,35 +78,7 @@ struct Rgba {
 };
 constexpr Rgba kBack{12, 12, 14, 255};
 constexpr Rgba kGood{80, 210, 110, 255}, kWarn{235, 195, 60, 255}, kBad{235, 80, 70, 255};
-constexpr Rgba kEdge{58, 58, 66, 255}, kText{232, 232, 238, 255}, kOff{74, 74, 84, 255}, kKnob{240, 240, 244, 255};
-constexpr Rgba kDim{150, 150, 160, 255}, kLine{34, 34, 40, 255};
-
-// Los textos del panel, en español si el sistema está en español y en inglés si no.
-bool spanish() {
-#ifdef __ANDROID__
-    char value[PROP_VALUE_MAX] = "";
-    if (__system_property_get("persist.sys.locale", value) <= 0) __system_property_get("ro.product.locale", value);
-    return value[0] == 'e' && value[1] == 's';
-#else
-    return true;
-#endif
-}
-
-// El último toque de la pantalla, como lo deja el loader en NnsdkInput (host.h).
-struct Touch {
-    uint32_t serial = 0, state = 0;  // state: 1 posado, 0 levantado, 2 cancelado
-    int sx = 0, sy = 0, x = 0, y = 0;  // dónde se posó y por dónde va (o dónde se levantó), en píxeles de la ventana
-};
-bool read_touch(Touch* t) {
-    NnsdkInput* in = nnsdk::host().input;
-    if (!in) return false;
-    t->serial = in->touch_serial.load(std::memory_order_acquire);
-    t->state = in->touch_state.load(std::memory_order_acquire);
-    const uint64_t start = in->touch_start.load(std::memory_order_acquire), last = in->touch_last.load(std::memory_order_acquire);
-    t->sx = static_cast<int32_t>(start & 0xffffffffu), t->sy = static_cast<int32_t>(start >> 32);
-    t->x = static_cast<int32_t>(last & 0xffffffffu), t->y = static_cast<int32_t>(last >> 32);
-    return t->serial == in->touch_serial.load(std::memory_order_acquire);  // si cambió a medias, al frame siguiente
-}
+constexpr Rgba kText{232, 232, 238, 255}, kDim{150, 150, 160, 255};
 
 class Hud {
 public:
@@ -131,12 +97,10 @@ public:
         trim(generated_, last_real_);
     }
     void record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, VkFormat format) {
-        // The counter goes off with no_fps in mhr.ini (live, as always) or from the panel, which writes that same line:
-        // the choice also holds the next time the game opens.
+        // The counter goes off with no_fps in mhr.ini (live, as always) (the Settings menu writes that same line).
         if (const bool file = NVN_FLAG("no_fps"); !flag_seen_ || file != flag_) flag_seen_ = true, flag_ = hidden_ = file;
         const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        gestures(extent, now);
         if (failed_) return;
         const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
         if (!bgra && format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB) return;
@@ -168,7 +132,6 @@ public:
             region.imageExtent = {kW, kH, 1};
             vkCmdCopyBufferToImage(cmd, b.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
-        record_panel(cmd, image, extent, bgra, now);
     }
 
 private:
@@ -179,243 +142,6 @@ private:
     };
     static void trim(std::deque<int64_t>& q, int64_t now) {
         while (!q.empty() && now - q.front() > 1000000000) q.pop_front();
-    }
-    // El panel: cuánto asoma (0 a 1) en este instante, según cuándo se abrió o se cerró.
-    float panel_shown(int64_t now) const {
-        const float t = std::clamp(static_cast<float>(now - panel_at_) / kPanelSlideNs, 0.0f, 1.0f);
-        const float eased = 1.0f - (1.0f - t) * (1.0f - t);
-        return panel_open_ ? panel_from_ + (1.0f - panel_from_) * eased : panel_from_ * (1.0f - eased);
-    }
-    void set_panel(bool open, int64_t now) {
-        if (open == panel_open_) return;
-        panel_from_ = panel_shown(now);  // desde donde esté: abrirlo a medio esconderse no da un salto
-        panel_open_ = open;
-        panel_at_ = now;
-        touched_at_ = now;
-        if (open) {  // por si los ficheros cambiaron desde fuera
-            const bool marked = has_setup() && access(data_file("elegir_carpeta").c_str(), F_OK) == 0;
-            if (marked != choose_folder_) choose_folder_ = marked, panel_dirty_ = true;
-            const bool tv = has_tv() && nnsdk::ini::on("tv_mode");
-            if (tv != tv_) tv_ = tv, panel_dirty_ = true;
-            const bool fg = nnsdk::ini::on("lsfg");
-            if (fg != fg_) fg_ = fg, panel_dirty_ = true;
-        }
-    }
-    // Las filas del panel, en orden: el contador de FPS y la generación de frames siempre; el modo TV si el port lo tiene;
-    // cambiar de carpeta si la app tiene pantalla de inicio.
-    enum RowId { kRowFps, kRowFg, kRowTv, kRowFolder };
-    static int rows(RowId* out) {
-        int n = 0;
-        out[n++] = kRowFps;
-        out[n++] = kRowFg;
-        if (has_tv()) out[n++] = kRowTv;
-        if (has_setup()) out[n++] = kRowFolder;
-        return n;
-    }
-    // ¿El port tiene modo TV (la consola en la base)? El loader pone NIER_TV_MODE en los que lo traen.
-    static bool has_tv() {
-        static const bool tv = getenv("NIER_TV_MODE") != nullptr;
-        return tv;
-    }
-    // <datos>/<name>.
-    static std::string data_file(const char* name) {
-        const char* data = getenv("NIER_DATA");
-        return std::string(data ? data : ".") + "/" + name;
-    }
-    // ¿La app tiene pantalla de inicio (la que pide la carpeta del juego)? El loader pone NIER_SETUP cuando la carpeta sale
-    // de ella. Solo entonces tiene sentido la fila "Cambiar carpeta".
-    static bool has_setup() {
-        static const bool setup = getenv("NIER_SETUP") != nullptr;
-        return setup;
-    }
-    // Los gestos, una vez por frame presentado.
-    // Abrir: el gesto de "atrás" del sistema desde el borde derecho (el de la flecha; Android se queda con ese toque y al
-    // juego solo le llega la tecla, que el loader convierte en NnsdkInput::hud_gesture), o un dedo que se posa en la mitad
-    // derecha de la pantalla y va hacia la izquierda al menos un octavo de su ancho.
-    // Con el panel fuera: un toque en una fila cambia su ajuste; un toque fuera del panel, deslizar hacia la derecha, el
-    // mismo gesto del borde o un rato sin tocarlo lo esconden.
-    void gestures(VkExtent2D extent, int64_t now) {
-        const int w = static_cast<int>(extent.width);
-        const int panel_w = w / 3;
-        if (NnsdkInput* in = nnsdk::host().input) {
-            const uint64_t gesture = in->hud_gesture.load(std::memory_order_acquire);
-            if (!gesture_seen_) gesture_seen_ = true, gesture_ = gesture;  // lo de antes de empezar no cuenta
-            if (gesture != gesture_) {
-                gesture_ = gesture;
-                // Si ese mismo toque ya lo abrió deslizando (el sistema tardó en quedárselo), no lo cierra.
-                if (!(panel_open_ && opened_by_ == static_cast<uint32_t>(gesture >> 32))) set_panel(!panel_open_, now);
-            }
-        }
-        Touch t;
-        if (!read_touch(&t)) return;
-        if (!touch_seen_) touch_seen_ = true, touch_handled_ = t.serial;
-        if (t.serial != touch_handled_) {
-            const int dx = t.x - t.sx, dy = t.y - t.sy;
-            const bool ended = t.state != 1;
-            if (t.state == 2) {
-                touch_handled_ = t.serial;
-            } else if (!panel_open_) {
-                if (t.sx > w / 2 && dx < -w / 8 && std::abs(dy) * 2 < -dx) {
-                    set_panel(true, now);
-                    opened_by_ = t.serial;
-                    touch_handled_ = t.serial;  // al levantar este mismo dedo no pasa nada más
-                } else if (ended) {
-                    touch_handled_ = t.serial;
-                }
-            } else if (dx > w / 12 && std::abs(dy) * 2 < dx) {
-                set_panel(false, now);
-                touch_handled_ = t.serial;
-            } else if (ended) {
-                if (std::abs(dx) < 32 && std::abs(dy) < 32) {
-                    if (t.x < w - panel_w) {
-                        set_panel(false, now);
-                    } else {
-                        touched_at_ = now;
-                        const int row = t.y >= kPanelHeader ? (t.y - kPanelHeader) / kPanelRow : -1;
-                        RowId ids[4];
-                        if (row >= 0 && row < rows(ids)) {
-                            if (ids[row] == kRowFps) set_hidden(!hidden_);
-                            else if (ids[row] == kRowFg) set_fg(!fg_);
-                            else if (ids[row] == kRowTv) set_tv(!tv_);
-                            else set_choose_folder(!choose_folder_);
-                        }
-                    }
-                }
-                touch_handled_ = t.serial;
-            }
-        }
-        if (panel_open_ && now - touched_at_ > kPanelIdleNs) set_panel(false, now);
-    }
-    void set_hidden(bool hidden) {
-        hidden_ = hidden;
-        panel_dirty_ = true;
-        nnsdk::ini::set("no_fps", hidden ? "1" : "0");
-        NVN_LOG("hud: contador de FPS %s desde el panel\n", hidden ? "apagado" : "encendido");
-    }
-    // "Cambiar carpeta": con el fichero <datos>/elegir_carpeta, la pantalla de inicio de la app (que normalmente arranca el
-    // juego directamente) vuelve a salir la próxima vez que se abra, para elegir otra carpeta; ella misma borra el fichero.
-    void set_choose_folder(bool on) {
-        choose_folder_ = on;
-        panel_dirty_ = true;
-        const std::string file = data_file("elegir_carpeta");
-        if (!on) {
-            unlink(file.c_str());
-        } else if (const int fd = open(file.c_str(), O_WRONLY | O_CREAT, 0644); fd >= 0) {
-            close(fd);
-        }
-        NVN_LOG("hud: cambiar de carpeta al abrir la app: %s\n", on ? "sí" : "no");
-    }
-    // "Frame generation": the lsfg line of mhr.ini, which the presenter reads live (lsfg/framegen.cpp): on and off at
-    // once, and kept for the next start
-    void set_fg(bool on) {
-        fg_ = on;
-        panel_dirty_ = true;
-        nnsdk::ini::set("lsfg", on ? "1" : "0");
-        NVN_LOG("hud: frame generation %s from the panel\n", on ? "on" : "off");
-    }
-    // "TV mode": with tv_mode in mhr.ini the game thinks it's docked (more resolution, Pro Controller) from the next
-    // time it opens; the mode is decided at start-up (nnsdk::tv_mode).
-    void set_tv(bool on) {
-        tv_ = on;
-        panel_dirty_ = true;
-        nnsdk::ini::set("tv_mode", on ? "1" : "0");
-        NVN_LOG("hud: modo TV al abrir la app: %s\n", on ? "sí" : "no");
-    }
-    void record_panel(VkCommandBuffer cmd, VkImage image, VkExtent2D extent, bool bgra, int64_t now) {
-        const uint32_t w = extent.width / 3, h = extent.height;
-        if (w < 360 || h < static_cast<uint32_t>(kPanelHeader + kPanelRow)) return;
-        const uint32_t visible = static_cast<uint32_t>(panel_shown(now) * w + 0.5f);
-        if (!visible) return;
-        // Dos buffers del tamaño del panel: se redibuja en el otro solo cuando cambia lo que enseña, así las copias que
-        // la GPU aún tenga pendientes siguen leyendo uno que nadie toca (entre dos cambios pasa al menos un toque).
-        if (panel_buffers_.empty() || panel_w_ != w || panel_h_ != h) {
-            if (!panel_buffers_.empty() || !create(panel_buffers_, w, h, 2)) return;  // otro tamaño: no pasa (el swapchain no cambia)
-            panel_w_ = w, panel_h_ = h, panel_dirty_ = true;
-        }
-        if (hidden_ != panel_drawn_hidden_) panel_dirty_ = true;  // lo apagaron con el fichero, desde fuera
-        if (panel_dirty_) {
-            panel_dirty_ = false;
-            panel_drawn_hidden_ = hidden_;
-            panel_next_ ^= 1;
-            draw_panel(reinterpret_cast<Rgba*>(panel_buffers_[panel_next_].data), bgra);
-        }
-        // Asoma por el borde derecho: las `visible` primeras columnas del panel, pegadas al borde.
-        VkBufferImageCopy region{};
-        region.bufferRowLength = w;
-        region.bufferImageHeight = h;
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageOffset = {static_cast<int32_t>(extent.width - visible), 0, 0};
-        region.imageExtent = {visible, h, 1};
-        vkCmdCopyBufferToImage(cmd, panel_buffers_[panel_next_].buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    }
-    // La cabecera y una fila por ajuste: su nombre y un interruptor (verde con el pomo a la derecha, encendido; gris con el
-    // pomo a la izquierda, apagado).
-    void draw_panel(Rgba* px, bool bgra) const {
-        const int w = static_cast<int>(panel_w_), h = static_cast<int>(panel_h_);
-        const auto put = [&](int x, int y, Rgba c) {
-            if (x < 0 || y < 0 || x >= w || y >= h) return;
-            px[y * w + x] = bgra ? Rgba{c.b, c.g, c.r, c.a} : c;
-        };
-        const auto rect = [&](int x0, int y0, int rw, int rh, Rgba c) {
-            for (int y = y0; y < y0 + rh; y++)
-                for (int x = x0; x < x0 + rw; x++) put(x, y, c);
-        };
-        const auto pill = [&](int x0, int y0, int pw, int ph, Rgba c) {  // rectángulo con los extremos redondos
-            const int r = ph / 2;
-            for (int y = 0; y < ph; y++)
-                for (int x = 0; x < pw; x++) {
-                    const int cx = x < r ? r : x >= pw - r ? pw - r - 1 : x, ex = x - cx, ey = y - r;
-                    if (ex * ex + ey * ey <= r * r) put(x0 + x, y0 + y, c);
-                }
-        };
-        const auto text = [&](int x, int y, int scale, const char* s, Rgba c) {
-            for (; *s; s++, x += 6 * scale) {
-                const Glyph* g = nullptr;
-                for (const Glyph& f : kFont)
-                    if (f.c == *s) g = &f;
-                if (!g) continue;
-                for (int r = 0; r < 7; r++)
-                    for (int b = 0; b < 5; b++)
-                        if (g->rows[r] & (0x10 >> b)) rect(x + b * scale, y + r * scale, scale, scale, c);
-            }
-        };
-        const bool es = spanish();
-        const int margin = 44;
-        rect(0, 0, w, h, kBack);
-        rect(0, 0, 4, h, kEdge);  // el canto que da al juego
-        text(margin, (kPanelHeader - 7 * 6) / 2, 6, es ? "AJUSTES" : "SETTINGS", kText);
-        rect(4, kPanelHeader - 3, w - 4, 3, kEdge);
-        // Las filas de rows(): el contador de FPS, el modo TV y volver a elegir la carpeta del juego.
-        struct Row {
-            const char* es;
-            const char* en;
-            const char* hint_es;  // una línea pequeña debajo (o nullptr)
-            const char* hint_en;
-            bool on;
-        };
-        const Row all[] = {{"CONTADOR DE FPS", "FPS COUNTER", nullptr, nullptr, !hidden_},
-                           {"GENERAR FRAMES", "FRAME GEN", "X2 A 60 FPS", "X2 TO 60 FPS", fg_},
-                           {"MODO TV", "TV MODE", "AL ABRIR LA APP", "AT NEXT START", tv_},
-                           {"CAMBIAR CARPETA", "CHANGE FOLDER", "AL ABRIR LA APP", "AT NEXT START", choose_folder_}};
-        RowId ids[4];
-        const int count = rows(ids);
-        int y = kPanelHeader;
-        for (int k = 0; k < count; k++) {
-            const Row& row = all[ids[k]];
-            const int sw = 132, sh = 60, sx = w - sw - margin, sy = y + (kPanelRow - sh) / 2;
-            if (row.hint_es) {
-                text(margin, y + 30, 4, es ? row.es : row.en, kText);
-                text(margin, y + 30 + 7 * 4 + 14, 3, es ? row.hint_es : row.hint_en, kDim);
-            } else {
-                text(margin, y + (kPanelRow - 7 * 4) / 2, 4, es ? row.es : row.en, kText);
-            }
-            pill(sx, sy, sw, sh, row.on ? kGood : kOff);
-            pill(row.on ? sx + sw - sh + 5 : sx + 5, sy + 5, sh - 10, sh - 10, kKnob);
-            rect(margin, y + kPanelRow - 2, w - 2 * margin, 2, kLine);
-            y += kPanelRow;
-        }
-        // Al pie, cómo se cierra.
-        text(margin, h - 70, 3, es ? "TOCA FUERA PARA CERRAR" : "TAP OUTSIDE TO CLOSE", kDim);
     }
     bool create(std::vector<Buffer>& buffers, uint32_t width, uint32_t height, uint32_t count = kRing) {
         VkContext* c = vk();
@@ -647,8 +373,8 @@ private:
         text((static_cast<int>(kW) - width) / 2, 3, 3, line, color);
     }
 
-    std::vector<Buffer> buffers_, panel_buffers_, stats_buffers_;
-    uint32_t next_ = 0, panel_next_ = 0, stats_next_ = 0;
+    std::vector<Buffer> buffers_, stats_buffers_;
+    uint32_t next_ = 0, stats_next_ = 0;
     // What the overlay's lines show, read twice a second (sample)
     int64_t sampled_at_ = 0;
     uint64_t cpu_ticks_ = 0;  // the process's user + system time, in clock ticks, at sampled_at_
@@ -657,17 +383,6 @@ private:
     float frame_ms_ = 0.0f, low_fps_ = 0.0f;
     bool failed_ = false;
     bool hidden_ = false, flag_ = false, flag_seen_ = false;  // the counter off; what no_fps said last
-    bool panel_open_ = false, touch_seen_ = false, gesture_seen_ = false;
-    bool panel_dirty_ = true, panel_drawn_hidden_ = false;  // hay que redibujarlo; el estado con el que se dibujó
-    bool choose_folder_ = false;                   // la fila "Cambiar carpeta" (el fichero <datos>/elegir_carpeta)
-    bool tv_ = false;                              // the "TV mode" row (tv_mode in mhr.ini)
-    bool fg_ = nnsdk::ini::on("lsfg");             // the "Frame gen" row (lsfg in mhr.ini)
-    uint32_t panel_w_ = 0, panel_h_ = 0;           // el tamaño con el que se crearon sus buffers
-    float panel_from_ = 0.0f;                     // lo que asomaba cuando se abrió o se cerró por última vez
-    int64_t panel_at_ = 0, touched_at_ = 0;       // cuándo fue eso, y la última vez que se tocó
-    uint32_t touch_handled_ = 0;                  // el toque (NnsdkInput::touch_serial) ya atendido
-    uint32_t opened_by_ = 0;                      // el toque que lo abrió deslizando
-    uint64_t gesture_ = 0;                        // el último NnsdkInput::hud_gesture atendido
     std::deque<double> intervals_;          // ms entre frames reales (para el 1 % más lento, si vuelve a hacer falta)
     std::deque<int64_t> reals_, generated_;  // en el último segundo
     int64_t last_real_ = 0, text_at_ = 0;

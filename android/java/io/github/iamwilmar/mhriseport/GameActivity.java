@@ -10,10 +10,8 @@ import android.widget.Toast;
 import android.graphics.PixelFormat;
 import android.os.Bundle;
 import android.os.VibrationEffect;
-import android.hardware.input.InputManager;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.InputDevice;
 import android.view.Gravity;
 import android.os.Vibrator;
 import android.view.View;
@@ -150,32 +148,6 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     private boolean shown;
     private Vibrator vibrator;
     private Rumble rumbler;  // the controller's motors (Rumble.java)
-    private InputManager inputs;
-    // Controllers plugged in or out: the touch controls hide while there is one (Settings → Controller)
-    private final InputManager.InputDeviceListener padListener = new InputManager.InputDeviceListener() {
-        @Override public void onInputDeviceAdded(int id) { checkPad(); }
-        @Override public void onInputDeviceRemoved(int id) { checkPad(); }
-        @Override public void onInputDeviceChanged(int id) { checkPad(); }
-    };
-
-    // Whether a gamepad is connected (a real one: not Android's virtual devices)
-    static boolean controllerConnected() {
-        try {
-            for (int id : InputDevice.getDeviceIds()) {
-                InputDevice d = InputDevice.getDevice(id);
-                if (d == null || d.isVirtual()) continue;
-                int sources = d.getSources();
-                if ((sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
-                        || (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return true;
-            }
-        } catch (RuntimeException ignored) {
-        }
-        return false;
-    }
-
-    private void checkPad() {
-        if (pad != null) pad.setPadConnected(controllerConnected());
-    }
     private CaptureButton capture;  // the floating capture button, while Debug → Capture button is on
     private WindowManager.LayoutParams captureLp;
 
@@ -195,9 +167,6 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
         rumbler = new Rumble();
         applyPad();
         pad = new TouchPad(this, controls, this);
-        pad.setPadConnected(controllerConnected());
-        inputs = (InputManager) getSystemService(Context.INPUT_SERVICE);
-        if (inputs != null) inputs.registerInputDeviceListener(padListener, new Handler(Looper.getMainLooper()));
         pad.setGameFps(gameFps());
         luaAtLaunch = luaScripts();
         pad.setModsAvailable(luaAtLaunch);
@@ -403,7 +372,6 @@ public final class GameActivity extends NativeActivity implements TouchPad.Host 
     protected void onDestroy() {
         // NativeActivity will tear down the runtime. Let parked threads finish cleanup with audio paused.
         RuntimeLifecycle.update(false, true);
-        if (inputs != null) inputs.unregisterInputDeviceListener(padListener);
         if (modUi != null) modUi.dispose();
         if (capture != null) {
             try {
