@@ -63,7 +63,8 @@ mention it, which is handy over adb. Values (`wide_view`-style numbers, `env.NAM
 `nnsdk::ini::read()`. One-shot requests (`trazar`, `profile_gpu`) are files that the runtime deletes once it has acted
 on them, not settings.
 
-The Java side writes the ini (`Ini.java`). It re-reads the file before every change, in case something else edited it.
+The Java side writes the ini (`Ini.java`). It re-reads the file before every change, because the in-game panel writes
+it too (the FPS counter).
 
 ## NVN on Vulkan (`runtime/src/nnsdk/nvn`)
 
@@ -124,7 +125,7 @@ The game's buffers are its own memory, and the GPU can't read that memory direct
 The game's 1280x720 (or 1920x1080 docked) window texture is scaled to the screen by FSR 1 (EASU, then RCAS), or a
 plain blit with `no_fsr`. `picture_rect()` places it according to the aspect setting, with black around it when
 letterboxed. LSFG 2x frame generation (with the player's own `Lossless.dll`) can add a generated frame between real
-ones. The FPS counter is drawn by the CPU into a small buffer that is copied on top.
+ones. The FPS counter and the settings panel are drawn by the CPU into a small buffer that is copied on top.
 
 `window.cpp` also handles the frame rate (the game's clock, its MaxFps, the 20/25/40/45/60 limits) and dynamic
 resolution (see [mh-rise.md](mh-rise.md)).

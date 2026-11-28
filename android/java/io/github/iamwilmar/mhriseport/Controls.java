@@ -132,6 +132,7 @@ final class Controls {
     int padDeadzone = 12;   // % del recorrido del stick
     int trigger = 35;       // % del recorrido de un gatillo analógico desde el que cuenta como ZL / ZR
     int rightAxes = 0;      // 0 según el mando, 1 Z/RZ, 2 RX/RY (android_main.cpp: kAxes*)
+    boolean hideOnPad = true;     // the touch controls go while a controller is connected (the gear stays); off: they stay
     boolean backOpensMenu = true; // Android's Back (button, or the swipe from the left edge) opens the settings; off: it is "-"
     int rumble = 100;       // % of the game's own vibration the controller's motors play (0 off; Rumble.java)
 
@@ -205,6 +206,7 @@ final class Controls {
         rightAxes = prefs.getInt("stick_derecho", rightAxes);
         for (int i = 0; i < BUTTONS.length; i++) mapKey[i] = prefs.getInt("map_key" + i, 0);
         rumble = prefs.getInt("rumble", rumble);
+        hideOnPad = prefs.getBoolean("hide_on_pad", hideOnPad);
         backOpensMenu = prefs.getBoolean("back_menu", backOpensMenu);
         for (int i = 0; i < COMBOS; i++) combo[i] = prefs.getLong("combo" + i, 0);
         for (int i = 0; i < BINDS; i++) {
@@ -284,7 +286,7 @@ final class Controls {
                 .putInt("zona_mando", padDeadzone).putInt("gatillo", trigger).putInt("stick_derecho", rightAxes)
                 .putBoolean("camera_swipe", cameraSwipe).putInt("swipe_speed", swipeSpeed).putBoolean("grid", grid)
                 .putString("disposicion", layout.toString()).putInt("layout_version", 2);
-        e.putInt("rumble", rumble).putBoolean("back_menu", backOpensMenu);
+        e.putInt("rumble", rumble).putBoolean("hide_on_pad", hideOnPad).putBoolean("back_menu", backOpensMenu);
         for (int i = 0; i < COMBOS; i++) e.putLong("combo" + i, combo[i]);
         for (int i = 0; i < BINDS; i++)
             e.putLong("bind" + i, bindButtons[i]).putLong("bind_mando" + i, bindPad[i]).putInt("bind_key" + i, bindKey[i]);

@@ -286,7 +286,7 @@ public final class DriverActivity extends Activity {
                 + "Takes effect the next time the game starts.");
         File dll = losslessDll();
         File folder = gameFolder();
-        // (on and off in mhr.ini, which the game reads live)
+        // (on and off in mhr.ini, like the in-game panel's row, which the game reads live)
         Ini ini = folder != null ? new Ini(folder) : null;
         File builtin = folder != null ? new File(folder, "fg_builtin") : null;
         boolean on = ini != null && ini.on("lsfg");

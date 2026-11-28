@@ -61,6 +61,11 @@ the A725.
 
 To read a PGM or PPM, any image viewer works, or `PIL.Image.open()` in Python. Depth is reversed Z, so near is bright.
 
+For the normal-packing compute shader `525985a9ccdd7b21`, a full capture also saves the guest and Vulkan
+views of the vertex remap as `normal-remap-f<frame>-cs<dispatch>.{guest,gpu}.bin`. Its S1 input has one
+little-endian 32-bit word per vertex. The low 22 bits select a 12-byte entry in S0. The `normal remap` log
+line gives the guest address, binding source and buffer sizes for that dispatch.
+
 ## GPU breadcrumbs
 
 `breadcrumbs` (Debug menu). Every pass and dispatch writes a marker, and the GPU runs everything in order. When the GPU

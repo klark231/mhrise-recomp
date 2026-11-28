@@ -26,7 +26,7 @@ final class Ini {
         if (folder != null) migrateDriverEnv();
     }
 
-    // Again before each change, in case something else edited the file.
+    // Again before each change: the in-game panel also writes the file (the FPS counter).
     private void load() {
         values.clear();
         if (folder == null) return;

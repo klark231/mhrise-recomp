@@ -482,7 +482,7 @@ final class SettingsMenu {
         note(tr("Shows about twice the game's fps (30 → 60) by making a picture between each two of the game's. With your own "
                 + "Lossless.dll (from Lossless Scaling on Steam, Windows: in the program's folder; not included with the "
                 + "app) it can use Lossless Scaling's; otherwise the port's own.", "在相邻两帧之间生成中间帧，例如将 30 帧提升至 60 帧。可用内置算法，也可从自己的 Windows 版 Lossless Scaling 程序目录导入 Lossless.dll。"));
-        toggle(tr("Frame generation", "帧生成"), tr("On or off while you play.", "游戏中可随时开关。"),
+        toggle(tr("Frame generation", "帧生成"), tr("On or off while you play (the same as the in-game panel's row).", "游戏中可随时开关，与游戏内面板的选项相同。"),
                 () -> has("lsfg") ? 1 : 0, v -> ini.set("lsfg", v != 0 ? "1" : "0"));
         if (dll.isFile()) {
             String[] kinds = {"Lossless Scaling", tr("Built-in", "内置")};
@@ -1027,7 +1027,7 @@ final class SettingsMenu {
     private void buildTouch() {
         header(tr("Touch controls", "触控"));
         toggle(tr("On-screen controls", "显示虚拟手柄"),
-                tr("The buttons, sticks and the gear over the game. Off, they are all hidden: Back opens the settings (see Controller → Back button).", "在游戏画面上显示按键、摇杆和齿轮按钮。关闭后全部隐藏，可用返回键打开设置（见「实体手柄」→ 返回键）。"),
+                tr("The buttons and sticks over the game. Off, only the gear stays, to come back here.", "在游戏画面上显示按键和摇杆。关闭后保留齿轮按钮，可从那里重新打开设置。"),
                 () -> cfg.touchOn ? 1 : 0, v -> cfg.touchOn = v != 0);
         number(tr("Opacity", "不透明度"), tr("How much of the game shows through the controls.", "调整透过控件看到游戏画面的程度。"), 20, 100, 5, " %", () -> cfg.opacity, v -> cfg.opacity = v);
         number(tr("Size", "大小"), tr("All controls at once. Each one also has its own, in Edit layout.", "统一调整所有控件大小。可在「编辑布局」中单独调整各个控件。"), 60, 160, 5, " %", () -> cfg.size,
@@ -1100,10 +1100,17 @@ final class SettingsMenu {
                 new String[] {tr("By controller", "按手柄识别"), "Z / RZ", "RX / RY"}, () -> cfg.rightAxes,
                 v -> cfg.rightAxes = v);
 
-        header(tr("Back button", "返回键"));
+        header(tr("With a controller", "使用手柄时"));
+        toggle(tr("Hide touch controls when a controller is connected", "连接手柄时隐藏触控按键"),
+                tr("The on-screen buttons and sticks go away while a controller is connected and come back when it's unplugged. "
+                        + "The gear stays, and Edit layout still shows them. Turn off to keep them on screen.", "连接手柄期间隐藏屏幕按键和摇杆，拔出后恢复。齿轮按钮保留，「编辑布局」仍会显示所有控件。关闭后始终显示。"),
+                () -> cfg.hideOnPad ? 1 : 0, v -> cfg.hideOnPad = v != 0);
+        note(GameActivity.controllerConnected() ? tr("A controller is connected right now.", "当前已连接手柄。")
+                                                : tr("No controller is connected right now.", "当前未连接手柄。"));
         choice(tr("Back button / gesture", "返回键 / 手势"),
                 tr("What Android's Back does: the button, or the swipe from the left edge of the screen. Open settings, as in other "
-                        + "emulators, or press − for the game. (A controller's own Back key is always −.)", "安卓返回键或从屏幕左边缘滑动的作用：打开设置（与其他模拟器一致），或作为游戏中的 −。（手柄自带的返回键始终是 −。）"),
+                        + "emulators, or press − for the game. (The swipe from the right edge opens the HUD panel, and a controller's own "
+                        + "Back key is always −.)", "安卓返回键或从屏幕左边缘滑动的作用：打开设置（与其他模拟器一致），或作为游戏中的 −。（从右边缘滑动打开 HUD 面板；手柄自带的返回键始终是 −。）"),
                 new String[] {tr("Open settings", "打开设置"), tr("Minus (−)", "减号 (−)")}, () -> cfg.backOpensMenu ? 0 : 1,
                 v -> cfg.backOpensMenu = v == 0);
 

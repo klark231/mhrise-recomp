@@ -52,6 +52,19 @@ final class TouchPad extends View {
         invalidate();
     }
 
+    // A controller is connected (GameActivity watches the input devices): with Settings → Controller → "Hide touch controls
+    // when a controller is connected" on, the controls go (the gear stays, and the layout editor shows them all)
+    private boolean padConnected;
+
+    void setPadConnected(boolean connected) {
+        if (padConnected == connected) return;
+        padConnected = connected;
+        if (hiddenByPad()) releaseAll();  // (a finger left on a button that just went)
+        invalidate();
+    }
+
+    private boolean hiddenByPad() { return padConnected && cfg.hideOnPad && !editing; }
+
     private final Controls cfg;
     private final Host host;
     private static final Ctl[] CONTROLS = Ctl.values();
@@ -237,8 +250,8 @@ final class TouchPad extends View {
     }
 
     private boolean active(Ctl c) {
-        if (c == Ctl.MENU) return cfg.touchOn || editing;  // (the gear goes with the touch controls: Back opens the settings then)
-        if (!cfg.touchOn) return false;
+        if (c == Ctl.MENU) return true;  // (siempre: es la forma de volver a encender los demás)
+        if (!cfg.touchOn || hiddenByPad()) return false;
         if (c == Ctl.MOD && !modsAvailable) return false;
         if (c.combo() && cfg.combo[c.comboIndex()] == 0) return false;
         return cfg.shown[c.ordinal()] || editing;

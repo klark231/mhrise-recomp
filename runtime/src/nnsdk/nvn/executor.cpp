@@ -1431,6 +1431,7 @@ private:
         const char* from = "";
         uint32_t words = 0;  // cuántas palabras suyas se registran
         VkDescriptorBufferInfo bound{};  // lo que se enlazó (para volcar lo que ve la GPU: los espejos no están mapeados)
+        const uint8_t* snapshot = nullptr;
     };
     bool read_after_dumped_ = false;  // ya se volcaron las entradas del primer dispatch que dejó NaN
     void dump_gpu_buffer(const VkDescriptorBufferInfo& b, uint64_t size, const std::string& file);
@@ -2054,6 +2055,19 @@ private:
     // Overlays de la GPU que un rango nuevo solapa solo en parte: se parten en vez de tirarse (merge_overlays).
     // <datos>/no_split_overlays (en vivo): como antes, se tiran y lo suyo sale de la memoria del juego.
     bool split_overlays_ = true;
+    // <datos>/no_gather_vertex_streams (en vivo): como antes, un stream que la GPU escribió solo en parte sale de la memoria del juego.
+    bool gather_vertex_streams_ = true;
+    bool mixed_snapshot_off_ = false;
+    // Cada unión o copia de streams corta el pase (la barrera y las copias van fuera de él; en un tiler eso es guardar y
+    // volver a cargar los adjuntos), así que tiene tope: por frame (uniones y copias juntas), en bytes de copias y por
+    // ventana. Pasado el tope el draw sale como antes (de la memoria del juego). Las uniones ya cuentan en "perfil
+    // overlays"; las copias y lo saltado, en su propia línea.
+    static constexpr uint32_t kGatherMaxPerFrame = 16;
+    static constexpr uint64_t kGatherMaxBytesPerFrame = 24ull << 20;
+    static constexpr VkDeviceSize kGatherWindowMax = 4ull << 20;
+    uint64_t gather_frame_ = UINT64_MAX, gather_frame_bytes_ = 0;
+    uint32_t gather_frame_count_ = 0;
+    uint64_t prof_gather_ = 0, prof_gather_streams_ = 0, prof_gather_bytes_ = 0, prof_gather_capped_ = 0;
     static constexpr uint64_t kMergeReadMax = 1ull << 20;  // unión por una lectura: hasta esto
     // Perfil (con registro, en "perfil overlays"): overlays escritos por la GPU tirados, por motivo (erase_reason; su
     // texto, el mismo que el de '[vigía] se tira el overlay'), y uniones y parches parciales. Siempre se cuentan, sin el
@@ -2322,7 +2336,7 @@ private:
     void prepare_draw_overlays();
     // Lo mismo antes de los descriptores de un dispatch: una unión en su bucle tiraría el overlay al que apunta el
     // descriptor ya grabado de otro SSBO del mismo dispatch (lo que escribiera ahí se perdería).
-    void prepare_dispatch_overlays();
+    uint32_t prepare_dispatch_overlays();
     void wb_reference(uint64_t address, uint64_t size);  // con wb_mutex_
     // CopyBuffer/ClearBuffer/UpdateBuffer de la CPU: el overlay que contiene entero [address, address+size) y sigue al
     // día con la memoria del juego (mirado ANTES de escribirla), o overlays_.end().
@@ -2336,10 +2350,29 @@ private:
     std::vector<uint64_t> overlays_before_cpu_write(uint64_t address, uint64_t size);
     void cpu_wrote_partial(const std::vector<uint64_t>& kept, uint64_t address, uint64_t size);
     // CopyBuffer cuyo origen está en un overlay: copia en la GPU a un overlay del destino.
-    bool copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size);
+    enum class BufferCopySource { Guest, Snapshot, Copied, Error };
+    BufferCopySource copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size, std::vector<uint8_t>& snapshot);
     // [address, address+size) con lo que haya de la GPU encima de la memoria del juego, en un buffer temporal
     // (argumentos indirectos escritos solo en parte por la GPU). false si ningún overlay lo toca.
     bool gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host = nullptr);
+    // Like gather_overlays, with the contract the mixed-buffer code needs: true with a null buffer when no overlay touches the
+    // range (the guest memory is the whole truth: no copy, no barrier), true with the buffer when it joined guest memory and
+    // the GPU's parts, false only when it couldn't (no staging). gather_overlays returns false for "nothing to join".
+    bool gather_mixed(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host);
+    // <datos>/no_mixed_snapshot (live): the read-only SSBOs a compute reads that the GPU wrote only in part and the CopyBuffer
+    // sources like that are joined into a snapshot (exact, but a copy each time); with it, the old merge. Ranges over
+    // kMixedSnapshotMax always take the old merge: a copy of a big buffer on every dispatch costs more than it fixes.
+    static constexpr uint64_t kMixedSnapshotMax = 4u << 20;
+    // gather_overlays en tres partes, para juntar varios streams de un draw con una sola pareja de barreras.
+    using GatherParts = std::vector<std::pair<const Overlay*, uint64_t>>;  // overlay e inicio de su rango
+    struct GatherJob {
+        uint32_t stream = 0;
+        uint64_t address = 0, size = 0;
+        GatherParts parts;
+        Staging::Alloc al{};
+    };
+    bool gather_collect(uint64_t address, uint64_t size, GatherParts* parts);  // false: ningún overlay toca el rango
+    void gather_emit(const GatherJob& job);                                     // las copias; las barreras, de quien llama
     uint64_t submit_index_ = 0;  // envíos ejecutados: la caché de vértices revisa una vez por envío
     std::vector<Texture*> frame_targets_, frame_uploads_;  // para los volcados de depuración
     void dump(Texture& t, const std::string& name, uint32_t layer = 0, int forced_mip = -1);
@@ -3681,6 +3714,8 @@ void Executor::read_flags() {
     keep_gpu_overlays_ = !NVN_FLAG("no_keep_overlays");
     merge_reads_ = !NVN_FLAG("no_merge_reads");
     split_overlays_ = !NVN_FLAG("no_split_overlays");
+    gather_vertex_streams_ = !NVN_FLAG("no_gather_vertex_streams");
+    mixed_snapshot_off_ = NVN_FLAG("no_mixed_snapshot");
     vigilar_nan_ = NVN_FLAG("watch_nan");  // DEPURACIÓN
     trace_on_print_ = NVN_FLAG("trace_print");  // DEPURACIÓN
     read_after_ = NVN_FLAG("read_after_dispatch");  // DEPURACIÓN
@@ -3918,14 +3953,22 @@ void Executor::apply(const Command& c) {
                             (unsigned long long)v.size);
                 // Si el origen lo escribió la GPU (overlay), la copia se hace en la GPU: p. ej. NieR copia el número
                 // de balas que cuenta un compute al instanceCount de un draw indirecto.
-                if (copy_from_overlay(v.src, v.dst, v.size)) {
+                if (!v.size || v.src == v.dst) return;
+                std::vector<uint8_t> snapshot;
+                const auto source = copy_from_overlay(v.src, v.dst, v.size, snapshot);
+                if (source == BufferCopySource::Error) {
+                    NVN_LOG("CopyBuffer failed: %#llx -> %#llx (%llu bytes)\n", (unsigned long long)v.src,
+                            (unsigned long long)v.dst, (unsigned long long)v.size);
+                    return;
+                }
+                if (source == BufferCopySource::Copied) {
                     copied_.clear();
                     drop_bindless(v.dst, v.size);
                     return;
                 }
                 // Los buffers son memoria del juego: la copia de la GPU es una copia de memoria aquí (y, si cae entera
                 // dentro de un overlay, también en él: patch_overlay).
-                if (vigilar_nan_) {  // DEPURACIÓN: ¿había algo de la GPU en el origen que no se copia?
+                if (vigilar_nan_ && source == BufferCopySource::Guest) {  // DEPURACIÓN: ¿había algo de la GPU en el origen que no se copia?
                     char b[96];
                     snprintf(b, sizeof b, "CopyBuffer de la CPU a %#llx (%llu bytes)", static_cast<unsigned long long>(v.dst),
                              static_cast<unsigned long long>(v.size));
@@ -3935,7 +3978,8 @@ void Executor::apply(const Command& c) {
                 auto keep = overlay_containing(v.dst, v.size);  // antes de escribir: ¿sigue valiendo?
                 const std::vector<uint64_t> partial =
                     keep == overlays_.end() ? overlays_before_cpu_write(v.dst, v.size) : std::vector<uint64_t>{};
-                memmove(reinterpret_cast<void*>(v.dst), reinterpret_cast<const void*>(v.src), v.size);
+                const void* bytes = source == BufferCopySource::Snapshot ? snapshot.data() : reinterpret_cast<const void*>(v.src);
+                memmove(reinterpret_cast<void*>(v.dst), bytes, v.size);
                 cpu_wrote_mirrors(v.dst, v.size);
                 if (keep != overlays_.end()) {
                     patch_overlay(keep, v.dst, v.size);
@@ -8148,6 +8192,203 @@ void Executor::draw(const cmd::Draw& in) {
         skip_draw(4);  // (no_vs)
         return;
     }
+    // 0. Vértices (antes del pase): la ventana de vértices del draw y, para los streams que la GPU escribió solo en
+    // parte, la unión de lo de la CPU y lo de la GPU. Una unión copia (barrera + copias), y eso no cabe dentro de un
+    // pase; por eso va aquí, y solo cuando hace falta: find_overlay exige que UN overlay cubra el rango pedido, y si
+    // la GPU escribió solo una parte del stream (o el rango enlazado es mayor que lo escrito) el draw leía la memoria
+    // vieja del juego y parpadeaba. Sin overlays (casi siempre) esto no cuesta nada.
+    const uint8_t* indices = d.index_type >= 0 ? reinterpret_cast<const uint8_t*>(d.index_address) : nullptr;
+    const uint32_t isize = indices ? index_size(d.index_type) : 0;
+    VkBuffer gpu_index = VK_NULL_HANDLE;  // índices que escribió la GPU
+    VkDeviceSize gpu_index_offset = 0;
+    if (indices)
+        if (const Overlay* o = find_overlay(d.index_address, VkDeviceSize{isize} * std::max(d.count, 1), &gpu_index_offset))
+            gpu_index = o->buffer;
+    if ((gpu_index || gpu_args) && (d.primitive == 7 || d.index_type == 0)) {
+        static int logged = 0;
+        if (logged++ < 8)
+            NVN_LOG("draw con datos de la GPU no soportado (primitiva %d, índices %d, args %d, índices en la GPU %d)\n",
+                    d.primitive, d.index_type, gpu_args != VK_NULL_HANDLE, gpu_index != VK_NULL_HANDLE);
+        skip_draw(10);  // (gpu_data)
+        return;
+    }
+    if (indices && !gpu_index) note_read(1, d.index_address, uint64_t{isize} * d.count);
+    // Multi-draw con los índices en la memoria del juego: de su ventana en espejo (revisada antes del pase).
+    VkBuffer mirror_index = VK_NULL_HANDLE;
+    VkDeviceSize mirror_index_offset = 0;
+    if (multi && indices && !gpu_index && d.index_type >= 1) {
+        uint64_t base = 0, size = 0;
+        VkDeviceSize off = 0;
+        if (index_window(d.index_address, &base, &size))
+            if (const Mirror* m = mirror(base, size, &off, false)) {
+                mirror_index = m->buffer;
+                mirror_index_offset = off + (d.index_address - base);
+            }
+    }
+    // Cuántos índices leer: los del draw; con el número en la GPU y los índices en la CPU (p. ej. quads de
+    // balas o partículas, que la GPU cuenta) no se sabe: un rango generoso, hasta el final del memory pool.
+    size_t index_bytes = size_t{isize} * d.count;
+    if (gpu_args && indices && !gpu_index && !mirror_index) {
+        size_t avail = 0;
+        uint64_t pool_start = 0, pool_size = 0;
+        if (pool_range(d.index_address, &pool_start, &pool_size)) avail = pool_start + pool_size - d.index_address;
+        // Multi-draw: todas las mallas suelen compartir un buffer de índices (hasta lo que cabe en el staging).
+        index_bytes = std::min<size_t>(avail, multi ? kStagingChunk : size_t{1} << 20) / isize * isize;
+        if (frame_ == trace_frame_)
+            NVN_LOG("F indirecto en la GPU con índices de la CPU: %zu bytes desde %#llx\n", index_bytes,
+                    static_cast<unsigned long long>(d.index_address));
+    }
+    const BufferCache::Entry* cached_indices =
+        indices && !gpu_index && d.primitive != 7 && index_bytes
+            ? buffer_cache_.get(d.index_address, index_bytes, d.index_type, submit_index_)
+            : nullptr;
+    VkBuffer host_index = VK_NULL_HANDLE;  // ese rango, si cambia demasiado para la caché: copia directa
+    VkDeviceSize host_index_offset = 0;
+    if (gpu_args && indices && !gpu_index && !cached_indices && index_bytes && !mirror_index) {
+        Staging::Alloc al = staging_->alloc(index_bytes, 16);
+        if (!al.data) return;
+        memcpy(al.data, indices, index_bytes);
+        host_index = al.buffer;
+        host_index_offset = al.offset;
+    }
+    if (gpu_args && indices && !gpu_index && !cached_indices && !host_index && !mirror_index) {
+        skip_draw(11);  // (indices)
+        return;
+    }
+    // Con índices escritos por la GPU no se sabe cuántos vértices se leen: los streams se copian enteros. Con
+    // argumentos de la GPU pero índices de la CPU, el máximo del rango de índices acota los vértices (copiar los
+    // streams enteros en cada draw de partículas agotaba la RAM en segundos).
+    const bool unknown_vertices = gpu_index != VK_NULL_HANDLE || (gpu_args && !indices) || multi;
+    // Ventana de vértices: los streams por vértice se copian (y se enlazan) desde first_vertex, vertex_count
+    // vértices. En un draw directo empieza en el primer vértice que usa y el draw se desplaza para compensar:
+    // las mallas de la fábrica comparten un buffer de 4 MB con índices absolutos (149724…) y cada draw copiaba
+    // desde el vértice 0 hasta su máximo, 4 MB por draw y sin compartirse (cada uno con su máximo).
+    const bool direct = !gpu_args && !gpu_index;
+    uint32_t first_vertex = 0, vertex_count = 1u << 24;
+    int32_t vertex_offset = d.base_vertex;  // vertexOffset de los draws indexados
+    if (!unknown_vertices && !indices) {
+        first_vertex = direct ? static_cast<uint32_t>(d.first) : 0;
+        vertex_count = static_cast<uint32_t>(d.first + d.count) - first_vertex;
+    } else if (!unknown_vertices) {
+        uint32_t lo, hi;
+        if (cached_indices)
+            lo = cached_indices->min_index, hi = cached_indices->max_index;
+        else
+            BufferCache::index_range(indices, index_bytes, d.index_type, &lo, &hi);
+        if (lo > hi) lo = hi = 0;  // sin índices válidos
+        if (direct && d.base_vertex >= 0) {
+            first_vertex = lo + static_cast<uint32_t>(d.base_vertex);
+            vertex_count = hi - lo + 1;
+            vertex_offset = -static_cast<int32_t>(lo);
+        } else {
+            vertex_count = hi + 1 + static_cast<uint32_t>(std::max(d.base_vertex, 0));
+        }
+    }
+    // Mayor desplazamiento de atributo de cada stream: todos sus atributos comparten una entrada de la caché
+    // (con el desplazamiento de cada uno, un stream de 5 atributos se copiaba 5 veces).
+    uint32_t stream_offset[kMaxVertexBuffers] = {};
+    for (uint32_t k = 0; k < 16 && k < st_.attribs.size(); k++)
+        if ((vs->shader.input_generics & (1ull << k)) && st_.attribs[k].stream < kMaxVertexBuffers)
+            stream_offset[st_.attribs[k].stream] = std::max<uint32_t>(stream_offset[st_.attribs[k].stream], st_.attribs[k].offset);
+    VkBuffer gathered_buf[kMaxVertexBuffers] = {};  // streams resueltos aquí: buffer y desfase de su ventana
+    VkDeviceSize gathered_off[kMaxVertexBuffers] = {};
+    if (gather_vertex_streams_ && !overlays_.empty()) {
+        if (gather_frame_ != frame_) gather_frame_ = frame_, gather_frame_count_ = 0, gather_frame_bytes_ = 0;
+        // Un stream que la GPU escribió solo en parte se resuelve, de más barato a más caro:
+        //  1. un overlay cubre lo que lee el draw: se enlaza tal cual (sin copia ni corte del pase);
+        //  2. se une UNA vez (merge_overlays, como los SSBO que se leen): la unión queda de overlay y los draws siguientes
+        //     caen en el caso 1 hasta que la CPU o la GPU la reescriban. Corta el pase una vez, no en cada draw;
+        //  3. si no se puede unir (más de kMergeReadMax, nada que unir), se copia para este draw, con tope.
+        // Las uniones van antes que las copias: una unión tira los overlays de dentro y las copias guardan punteros a ellos.
+        struct Pending {
+            uint32_t stream;
+            uint64_t at;
+            VkDeviceSize window;
+        };
+        Pending pending[kMaxVertexBuffers];
+        uint32_t npending = 0, tried = 0;
+        for (uint32_t k = 0; k < 16; k++) {
+            if (!(vs->shader.input_generics & (1ull << k))) continue;
+            const VertexAttribState a = k < st_.attribs.size() ? st_.attribs[k] : VertexAttribState{};
+            if (a.stream >= kMaxVertexBuffers || (tried >> a.stream & 1)) continue;
+            tried |= 1u << a.stream;
+            const BufferRange range = st_.vertex_buffers[a.stream];
+            if (!range.address) continue;
+            const VertexStreamState sv = a.stream < st_.streams.size() ? st_.streams[a.stream] : VertexStreamState{};
+            const VkDeviceSize skip = sv.divisor ? 0 : VkDeviceSize{sv.stride} * first_vertex;
+            if (skip >= range.size || range.size <= stream_offset[a.stream]) continue;
+            VkDeviceSize off = 0;
+            if (find_overlay(range.address, range.size, &off)) continue;  // uno cubre todo: el paso 5 lo enlaza tal cual
+            const uint32_t elements = sv.divisor ? static_cast<uint32_t>(d.base_instance + d.instances) : vertex_count;
+            const VkDeviceSize need = sv.stride ? VkDeviceSize{sv.stride} * elements : 64;
+            const VkDeviceSize window = std::min<VkDeviceSize>(range.size - skip, stream_offset[a.stream] + need);
+            const uint64_t at = range.address + skip;
+            if (!window || !overlay_maybe_in(at, window)) continue;
+            if (const Overlay* o = find_overlay(at, window, &off)) {  // 1. cubre lo que lee el draw, aunque no el rango entero
+                gathered_buf[a.stream] = o->buffer;
+                gathered_off[a.stream] = off;
+                continue;
+            }
+            if (gather_frame_count_ >= kGatherMaxPerFrame) {  // cada unión o copia corta el pase: pasado el tope, como antes
+                prof_gather_capped_++;
+                continue;
+            }
+            if (const Overlay* m = merge_overlays(at, window, &off, true)) {  // 2. una vez, y queda de overlay
+                gathered_buf[a.stream] = m->buffer;
+                gathered_off[a.stream] = off;
+                gather_frame_count_++;
+                continue;
+            }
+            pending[npending++] = {a.stream, at, window};
+        }
+        std::vector<GatherJob> jobs;  // 3. sin reservar nada si ningún stream llega aquí
+        for (uint32_t i = 0; i < npending; i++) {
+            GatherJob job;
+            job.stream = pending[i].stream;
+            job.address = pending[i].at;
+            job.size = pending[i].window;
+            if (!gather_collect(job.address, job.size, &job.parts)) continue;  // ningún overlay toca la ventana
+            if (job.size > kGatherWindowMax) {  // demasiado para copiarlo en cada draw: como antes
+                prof_gather_capped_++;
+                continue;
+            }
+            jobs.push_back(std::move(job));
+        }
+        if (!jobs.empty()) {
+            uint64_t bytes = 0;
+            for (const GatherJob& job : jobs) bytes += job.size;
+            if (gather_frame_count_ >= kGatherMaxPerFrame || gather_frame_bytes_ + bytes > kGatherMaxBytesPerFrame) {
+                prof_gather_capped_ += jobs.size();  // pasado el tope del frame: de la memoria del juego, sin cortar el pase
+            } else {
+                bool staged = true;
+                for (GatherJob& job : jobs) {
+                    const VkDeviceSize size = std::max<VkDeviceSize>(job.size, 64);  // como el paso 5: nunca menos de 64
+                    job.al = staging_->alloc(size, 16);
+                    if (!job.al.data) {
+                        staged = false;
+                        break;
+                    }
+                    memcpy(job.al.data, reinterpret_cast<const void*>(job.address), job.size);  // lo de la CPU
+                    if (size > job.size) memset(static_cast<uint8_t*>(job.al.data) + job.size, 0, size - job.size);
+                }
+                if (staged) {  // una sola pareja de barreras para todos los streams del draw
+                    split_why_ = "copia de streams de vértices (paso 0)";
+                    barrier();
+                    for (const GatherJob& job : jobs) gather_emit(job);  // y encima lo de la GPU
+                    barrier();
+                    for (const GatherJob& job : jobs) {
+                        gathered_buf[job.stream] = job.al.buffer;
+                        gathered_off[job.stream] = job.al.offset;
+                    }
+                    gather_frame_count_++;
+                    gather_frame_bytes_ += bytes;
+                    prof_gather_++;
+                    prof_gather_streams_ += jobs.size();
+                    prof_gather_bytes_ += bytes;
+                }
+            }
+        }
+    }
     auto prof_t = prof_now();  // perfil por secciones (solo en los frames medidos)
     // 1. Texturas: crear y subir lo que falte (las subidas van fuera del render pass).
     struct Bound {
@@ -8728,97 +8969,9 @@ void Executor::draw(const cmd::Draw& in) {
     prof_mark(3, prof_t);
     auto prof_v = prof_t;  // los tramos de "vértices" (prof_split)
     // 5. Vértices: cada atributo usado, desde la caché si su stream no cambia; si no, copiado al staging.
-    const uint8_t* indices = d.index_type >= 0 ? reinterpret_cast<const uint8_t*>(d.index_address) : nullptr;
-    const uint32_t isize = indices ? index_size(d.index_type) : 0;
-    VkBuffer gpu_index = VK_NULL_HANDLE;  // índices que escribió la GPU
-    VkDeviceSize gpu_index_offset = 0;
-    if (indices)
-        if (const Overlay* o = find_overlay(d.index_address, VkDeviceSize{isize} * std::max(d.count, 1), &gpu_index_offset))
-            gpu_index = o->buffer;
-    if ((gpu_index || gpu_args) && (d.primitive == 7 || d.index_type == 0)) {
-        static int logged = 0;
-        if (logged++ < 8)
-            NVN_LOG("draw con datos de la GPU no soportado (primitiva %d, índices %d, args %d, índices en la GPU %d)\n",
-                    d.primitive, d.index_type, gpu_args != VK_NULL_HANDLE, gpu_index != VK_NULL_HANDLE);
-        skip_draw(10);  // (gpu_data)
-        return;
-    }
-    if (indices && !gpu_index) note_read(1, d.index_address, uint64_t{isize} * d.count);
-    // Multi-draw con los índices en la memoria del juego: de su ventana en espejo (revisada antes del pase).
-    VkBuffer mirror_index = VK_NULL_HANDLE;
-    VkDeviceSize mirror_index_offset = 0;
-    if (multi && indices && !gpu_index && d.index_type >= 1) {
-        uint64_t base = 0, size = 0;
-        VkDeviceSize off = 0;
-        if (index_window(d.index_address, &base, &size))
-            if (const Mirror* m = mirror(base, size, &off, false)) {
-                mirror_index = m->buffer;
-                mirror_index_offset = off + (d.index_address - base);
-            }
-    }
-    // Cuántos índices leer: los del draw; con el número en la GPU y los índices en la CPU (p. ej. quads de
-    // balas o partículas, que la GPU cuenta) no se sabe: un rango generoso, hasta el final del memory pool.
-    size_t index_bytes = size_t{isize} * d.count;
-    if (gpu_args && indices && !gpu_index && !mirror_index) {
-        size_t avail = 0;
-        uint64_t pool_start = 0, pool_size = 0;
-        if (pool_range(d.index_address, &pool_start, &pool_size)) avail = pool_start + pool_size - d.index_address;
-        // Multi-draw: todas las mallas suelen compartir un buffer de índices (hasta lo que cabe en el staging).
-        index_bytes = std::min<size_t>(avail, multi ? kStagingChunk : size_t{1} << 20) / isize * isize;
-        if (frame_ == trace_frame_)
-            NVN_LOG("F indirecto en la GPU con índices de la CPU: %zu bytes desde %#llx\n", index_bytes,
-                    static_cast<unsigned long long>(d.index_address));
-    }
-    const BufferCache::Entry* cached_indices =
-        indices && !gpu_index && d.primitive != 7 && index_bytes
-            ? buffer_cache_.get(d.index_address, index_bytes, d.index_type, submit_index_)
-            : nullptr;
-    VkBuffer host_index = VK_NULL_HANDLE;  // ese rango, si cambia demasiado para la caché: copia directa
-    VkDeviceSize host_index_offset = 0;
-    if (gpu_args && indices && !gpu_index && !cached_indices && index_bytes && !mirror_index) {
-        Staging::Alloc al = staging_->alloc(index_bytes, 16);
-        if (!al.data) return;
-        memcpy(al.data, indices, index_bytes);
-        host_index = al.buffer;
-        host_index_offset = al.offset;
-    }
-    if (gpu_args && indices && !gpu_index && !cached_indices && !host_index && !mirror_index) {
-        skip_draw(11);  // (indices)
-        return;
-    }
-    // Con índices escritos por la GPU no se sabe cuántos vértices se leen: los streams se copian enteros. Con
-    // argumentos de la GPU pero índices de la CPU, el máximo del rango de índices acota los vértices (copiar los
-    // streams enteros en cada draw de partículas agotaba la RAM en segundos).
-    const bool unknown_vertices = gpu_index != VK_NULL_HANDLE || (gpu_args && !indices) || multi;
-    // Ventana de vértices: los streams por vértice se copian (y se enlazan) desde first_vertex, vertex_count
-    // vértices. En un draw directo empieza en el primer vértice que usa y el draw se desplaza para compensar:
-    // las mallas de la fábrica comparten un buffer de 4 MB con índices absolutos (149724…) y cada draw copiaba
-    // desde el vértice 0 hasta su máximo, 4 MB por draw y sin compartirse (cada uno con su máximo).
-    const bool direct = !gpu_args && !gpu_index;
-    uint32_t first_vertex = 0, vertex_count = 1u << 24;
-    int32_t vertex_offset = d.base_vertex;  // vertexOffset de los draws indexados
-    if (!unknown_vertices && !indices) {
-        first_vertex = direct ? static_cast<uint32_t>(d.first) : 0;
-        vertex_count = static_cast<uint32_t>(d.first + d.count) - first_vertex;
-    } else if (!unknown_vertices) {
-        uint32_t lo, hi;
-        if (cached_indices)
-            lo = cached_indices->min_index, hi = cached_indices->max_index;
-        else
-            BufferCache::index_range(indices, index_bytes, d.index_type, &lo, &hi);
-        if (lo > hi) lo = hi = 0;  // sin índices válidos
-        if (direct && d.base_vertex >= 0) {
-            first_vertex = lo + static_cast<uint32_t>(d.base_vertex);
-            vertex_count = hi - lo + 1;
-            vertex_offset = -static_cast<int32_t>(lo);
-        } else {
-            vertex_count = hi + 1 + static_cast<uint32_t>(std::max(d.base_vertex, 0));
-        }
-    }
     prof_split(4, prof_v);
     // Mayor desplazamiento de atributo de cada stream: todos sus atributos comparten una entrada de la caché
     // (con el desplazamiento de cada uno, un stream de 5 atributos se copiaba 5 veces).
-    uint32_t stream_offset[kMaxVertexBuffers] = {};
     // De dónde sale cada stream (overlay, caché o copia): se resuelve con su primer atributo y los demás solo le
     // suman su desplazamiento. Los binds se juntan en una llamada, solo con lo que cambia respecto a cmd_.
     std::pair<VkBuffer, VkDeviceSize> stream_src[kMaxVertexBuffers] = {};
@@ -8831,9 +8984,6 @@ void Executor::draw(const cmd::Draw& in) {
         bind_off[k] = offset;
         bind_used |= 1u << k;
     };
-    for (uint32_t k = 0; k < 16 && k < st_.attribs.size(); k++)
-        if ((vs->shader.input_generics & (1ull << k)) && st_.attribs[k].stream < kMaxVertexBuffers)
-            stream_offset[st_.attribs[k].stream] = std::max<uint32_t>(stream_offset[st_.attribs[k].stream], st_.attribs[k].offset);
     for (uint32_t k = 0; k < 16; k++) {
         if (!(vs->shader.input_generics & (1ull << k))) continue;
         VertexAttribState a = k < st_.attribs.size() ? st_.attribs[k] : VertexAttribState{};
@@ -8852,6 +9002,11 @@ void Executor::draw(const cmd::Draw& in) {
             if (a.stream < kMaxVertexBuffers) stream_src[a.stream] = {buffer, base};
             bind(k, buffer, base + a.offset);
         };
+        if (a.stream < kMaxVertexBuffers && gathered_buf[a.stream]) {  // unión de lo de la CPU y lo de la GPU (paso 0)
+            remember(gathered_buf[a.stream], gathered_off[a.stream]);  // (antes que el espejo: este lo dejaría con lo viejo)
+            gpu_vertices = true;
+            continue;
+        }
         if (in_range) {
             VkDeviceSize ov_offset = 0;  // vértices escritos por la GPU (p. ej. instancias de un compute)
             if (const Overlay* o = find_overlay(range.address, range.size, &ov_offset)) {
@@ -9171,22 +9326,22 @@ const Executor::Overlay* Executor::find_overlay(uint64_t address, uint64_t size,
     return &o;
 }
 
-bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
+Executor::BufferCopySource Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size,
+                                                      std::vector<uint8_t>& snapshot) {
     VkDeviceSize src_offset = 0;
-    const Overlay* so = find_overlay(src, size, &src_offset);
-    // Origen escrito solo en parte por la GPU (o repartido en varios overlays): unido, se copia lo suyo y no la memoria
-    // del juego (la unión cierra el pase abierto, como la copia de abajo).
-    if (!so) {
-        if (vigilar_nan_) {  // DEPURACIÓN: quién crea la unión
-            char b[96];
-            snprintf(b, sizeof b, "CopyBuffer en la GPU: unión del origen %#llx, frame %llu", static_cast<unsigned long long>(src),
-                     static_cast<unsigned long long>(frame_));
-            writer_ = b;
-        }
-        so = merge_overlays(src, size, &src_offset, true);
+    VkBuffer src_buffer = VK_NULL_HANDLE;
+    const uint8_t* host = nullptr;
+    const bool overlap = (src < dst ? dst - src : src - dst) < size;
+    const Overlay* so = overlap ? nullptr : find_overlay(src, size, &src_offset);
+    if (so) {
+        src_buffer = so->buffer;
+        host = so->data + (src_offset - so->offset);
+    } else {
+        // Intersecting overlays can extend beyond either end of the source. Snapshot the
+        // exact bytes before allocating the destination, including GPU writes in this submit.
+        if (!gather_mixed(src, size, &src_buffer, &src_offset, &host)) return BufferCopySource::Error;
+        if (!src_buffer) return BufferCopySource::Guest;
     }
-    if (!so) return false;
-    const VkBuffer src_buffer = so->buffer;
     VkDeviceSize dst_offset = 0;
     if (vigilar_nan_) {  // DEPURACIÓN
         char b[96];
@@ -9195,7 +9350,23 @@ bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
         writer_ = b;
     }
     const Overlay* d = make_overlay(dst, size, &dst_offset);  // puede invalidar `so`: ya no se usa
-    if (!d) return false;
+    if (!d) {
+        // A large destination may not fit in the overlay arena. The CPU copy must still
+        // read the resolved source, whose allocation lives until this submission completes.
+        full_barrier();
+        VkMemoryBarrier visibility{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        visibility.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        visibility.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                             1, &visibility, 0, nullptr, 0, nullptr);
+        // Rare (the source is GPU-written and the destination doesn't fit the overlay arena): the one place this waits.
+        splitting_ = true;
+        finish(true);
+        splitting_ = false;
+        snapshot.assign(host, host + size);
+        begin();
+        return BufferCopySource::Snapshot;
+    }
     note_gpu_write_vs_mirrors(dst, size, "CopyBuffer");
     if (vigilar_nan_) {  // DEPURACIÓN: el destino lo escribe la GPU (written/writers no se marcan aquí)
         auto it = overlays_.upper_bound(dst);
@@ -9237,7 +9408,7 @@ bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
                 any_cpu_reads_ = true;
             }
         }
-    return true;
+    return BufferCopySource::Copied;
 }
 
 void Executor::note_gpu_write_vs_mirrors(uint64_t address, uint64_t size, const char* what) {
@@ -9595,10 +9766,9 @@ void Executor::reap_mirrors() {
         }
 }
 
-bool Executor::gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host) {
+bool Executor::gather_collect(uint64_t address, uint64_t size, GatherParts* parts) {
     auto it = overlays_.upper_bound(address);
     if (it != overlays_.begin()) --it;
-    std::vector<std::pair<const Overlay*, uint64_t>> parts;  // overlay e inicio de su rango
     while (it != overlays_.end() && it->first < address + size) {
         Overlay& o = it->second;
         if (it->first + o.size <= address) {
@@ -9615,25 +9785,57 @@ bool Executor::gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer
                 continue;
             }
         }
-        parts.push_back({&o, it->first});
+        parts->push_back({&o, it->first});
         ++it;
     }
-    if (parts.empty()) return false;
-    Staging::Alloc al = staging_->alloc(size, 16);
-    if (!al.data) return false;
-    memcpy(al.data, reinterpret_cast<const void*>(address), size);  // lo de la CPU, y encima lo de la GPU
+    return !parts->empty();
+}
+
+void Executor::gather_emit(const GatherJob& job) {
+    for (auto [o, start] : job.parts) {
+        const uint64_t from = std::max(job.address, start), to = std::min(job.address + job.size, start + o->size);
+        VkBufferCopy region{o->offset + (from - start), job.al.offset + (from - job.address), to - from};
+        note_gpu_work();
+        vkCmdCopyBuffer(cmd_, o->buffer, job.al.buffer, 1, &region);
+    }
+}
+
+bool Executor::gather_overlays(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host) {
+    GatherJob job;
+    job.address = address;
+    job.size = size;
+    if (!gather_collect(address, size, &job.parts)) return false;
+    job.al = staging_->alloc(size, 16);
+    if (!job.al.data) return false;
+    memcpy(job.al.data, reinterpret_cast<const void*>(address), size);  // lo de la CPU, y encima lo de la GPU
     split_why_ = "unión de overlays (argumentos indirectos)";
     barrier();
-    for (auto [o, start] : parts) {
-        const uint64_t from = std::max(address, start), to = std::min(address + size, start + o->size);
-        VkBufferCopy region{o->offset + (from - start), al.offset + (from - address), to - from};
-        note_gpu_work();
-        vkCmdCopyBuffer(cmd_, o->buffer, al.buffer, 1, &region);
-    }
+    gather_emit(job);
     barrier();
-    *buffer = al.buffer;
-    *offset = al.offset;
-    if (host) *host = al.data;
+    *buffer = job.al.buffer;
+    *offset = job.al.offset;
+    if (host) *host = job.al.data;
+    return true;
+}
+
+bool Executor::gather_mixed(uint64_t address, uint64_t size, VkBuffer* buffer, VkDeviceSize* offset, const uint8_t** host) {
+    *buffer = VK_NULL_HANDLE;
+    if (!size || overlays_.empty()) return true;
+    if (size <= 65536 && !overlay_maybe_in(address, size)) return true;
+    GatherJob job;
+    job.address = address;
+    job.size = size;
+    if (!gather_collect(address, size, &job.parts)) return true;
+    job.al = staging_->alloc(size, 16);
+    if (!job.al.data) return false;
+    memcpy(job.al.data, reinterpret_cast<const void*>(address), size);
+    split_why_ = "unión de overlays (buffer mixto)";
+    barrier();
+    gather_emit(job);
+    barrier();
+    *buffer = job.al.buffer;
+    *offset = job.al.offset;
+    if (host) *host = job.al.data;
     return true;
 }
 
@@ -10001,10 +10203,11 @@ static bool compute_binding_crosses(const StageBindings& bindings, const Program
 
 // Ver la declaración. Mismos rangos y tamaños que los descriptores del dispatch (los SSBO de la tabla de c0; los UBE son
 // uniform buffers aunque se lean como storage: no se unen).
-void Executor::prepare_dispatch_overlays() {
-    if (!keep_gpu_overlays_ || overlays_.empty()) return;
+uint32_t Executor::prepare_dispatch_overlays() {
+    if (!keep_gpu_overlays_ || overlays_.empty()) return 0;
     const StageBindings& sb = st_.bindings[static_cast<int>(Stage::Compute)];
     VkDeviceSize off = 0;
+    uint32_t snapshot_reads = 0;
     for (const Resource& r : st_.compute->shader.resources) {
         if (r.kind != Resource::StorageBuffer || r.cbuf_index != kComputeDriverBank || r.cbuf_offset < kComputeStorageBase)
             continue;
@@ -10021,10 +10224,27 @@ void Executor::prepare_dispatch_overlays() {
                 !compute_binding_crosses(sb, *st_.compute, {range.address, size}))
                 o = merge_overlays(range.address, size, &off, false);
             if (o || make_overlay(range.address, size, &off)) note_overlay_written(range.address, kWrittenByCompute);
-        } else if (!find_overlay(range.address, size, &off)) {
-            merge_overlays(range.address, size, &off, true);
+        } else if (!find_overlay(range.address, std::min<uint64_t>(range.size, vk()->props.limits.maxStorageBufferRange), &off)) {
+            const auto part = first_overlay_touching(range.address);
+            if (part == overlays_.end() || part->first >= range.address + range.size) continue;
+            // Aliases used by this dispatch must share a live backing. Other read-only
+            // windows (including the face normal remap) only need the bytes at this point.
+            const auto& resources = st_.compute->shader.resources;
+            const bool aliases_writer = std::any_of(resources.begin(), resources.end(), [&](const Resource& w) {
+                if (w.kind != Resource::StorageBuffer || !w.is_written || w.cbuf_index != kComputeDriverBank ||
+                    w.cbuf_offset < kComputeStorageBase) return false;
+                const uint32_t slot = (w.cbuf_offset - kComputeStorageBase) / 16;
+                if (slot >= kMaxStorage) return false;
+                const auto& other = sb.storage[slot];
+                return other.address && other.size && (range.address >= other.address ?
+                    range.address - other.address < other.size : other.address - range.address < range.size);
+            });
+            const uint64_t window = std::min<uint64_t>(range.size, vk()->props.limits.maxStorageBufferRange);
+            if (aliases_writer || mixed_snapshot_off_ || window > kMixedSnapshotMax) merge_overlays(range.address, size, &off, true);
+            else snapshot_reads |= 1u << index;
         }
     }
+    return snapshot_reads;
 }
 
 // Ver la declaración. Antes de que la CPU escriba: los overlays que toca, con lo de la GPU y al día.
@@ -10128,7 +10348,7 @@ void Executor::read_after_dispatch(const ProgramStage& cs, uint32_t x, uint32_t 
                  static_cast<unsigned long long>(r.size), r.from);
         in += b;
         const uint64_t words = std::min<uint64_t>(r.size / 4, r.words);
-        const uint8_t* p = !r.address ? nullptr
+        const uint8_t* p = r.snapshot ? r.snapshot : !r.address ? nullptr
                            : strcmp(r.from, "overlay") == 0 ? gpu(r.address, words * 4)
                                                             : reinterpret_cast<const uint8_t*>(r.address);
         for (uint64_t i = 0; p && i < words; i++) {
@@ -10540,7 +10760,7 @@ void Executor::dispatch(const cmd::Dispatch& v) {
     // Las uniones de overlays, antes de los descriptores (ver prepare_dispatch_overlays). Tras descartar los dispatch que
     // no se ejecutan (sin overlays para ellos) y con writer_ ya puesto (watch_nan). Los argumentos indirectos ya se
     // miraron: si una unión se traga su overlay, su hueco sigue intacto hasta que acabe este envío, y se leen antes.
-    prepare_dispatch_overlays();
+    const uint32_t snapshot_reads = prepare_dispatch_overlays();
     auto skipped = [&](const char* why) {  // DEPURACIÓN
         static int logged = 0;
         if (vigilar_nan_ && logged++ < 64) NVN_LOG("[vigía] dispatch descartado (%s): %s\n", why, writer_.c_str());
@@ -10657,11 +10877,16 @@ void Executor::dispatch(const cmd::Dispatch& v) {
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(limits.minUniformBufferOffsetAlignment, 16);
     const VkDeviceSize ssbo_align = std::max<VkDeviceSize>(limits.minStorageBufferOffsetAlignment, 16);
     std::vector<std::pair<uint64_t, uint64_t>> read_ranges;  // DEPURACIÓN (read_after_dispatch): overlays a leer
+    VkDescriptorBufferInfo face_remap{};
+    const bool trace_face_remap = full_trace_ && frame_ == trace_frame_ && cs->print == 0x525985a9ccdd7b21ULL;
+    const std::string remap_file = trace_face_remap ? "/storage/emulated/0/NieR-volcados/normal-remap-f" +
+        std::to_string(frame_) + "-cs" + std::to_string(dispatches_) : std::string{};
     std::vector<ReadInput> read_inputs;
     for (const Resource& r : cs->shader.resources) {
         if (r.kind != Resource::UniformBuffer && r.kind != Resource::StorageBuffer) continue;
         BufferRange range{};
         const void* src = nullptr;
+        bool snapshot_read = false;
         if (r.kind == Resource::UniformBuffer) {
             if (r.cbuf_index == kComputeDriverBank || (r.cbuf_index == kTextureHandleBank && compute_c2)) {
                 src = driver;
@@ -10683,7 +10908,10 @@ void Executor::dispatch(const cmd::Dispatch& v) {
                         static_cast<unsigned long long>(range.size));
         } else if (r.cbuf_index == kComputeDriverBank && r.cbuf_offset >= kComputeStorageBase) {
             int index = static_cast<int>((r.cbuf_offset - kComputeStorageBase) / 16);
-            if (index < kMaxStorage) range = sb.storage[index];
+            if (index < kMaxStorage) {
+                range = sb.storage[index];
+                snapshot_read = !r.is_written && (snapshot_reads & (1u << index));
+            }
             if (range.address && !r.is_written) note_read(5, range.address, range.size);
         }
         if (!src && range.address) src = reinterpret_cast<const void*>(range.address);
@@ -10694,8 +10922,9 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         const Overlay* ov = nullptr;
         if (src == reinterpret_cast<const void*>(range.address) && range.address && range.size) {
             // Sin uniones aquí (las hizo prepare_dispatch_overlays): una tiraría un overlay cuyo descriptor ya está en buffers.
+            const uint64_t read_size = snapshot_read ? std::min<uint64_t>(range.size, limits.maxStorageBufferRange) : size;
             ov = r.kind == Resource::StorageBuffer && r.is_written ? make_overlay(range.address, size, &ov_offset, false)
-                                                                    : find_overlay(range.address, size, &ov_offset);
+                                                                    : find_overlay(range.address, read_size, &ov_offset);
             if (ov && r.kind == Resource::StorageBuffer && r.is_written) {
                 note_overlay_written(range.address, kWrittenByCompute);
                 if (log_state_ && range.size <= 64 && (small_state_.size() < 32 || small_state_.count(range.address))) {
@@ -10722,14 +10951,24 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         const bool cacheable = src == reinterpret_cast<const void*>(range.address) && range.size &&
                                !(r.kind == Resource::StorageBuffer && r.is_written);
         VkDeviceSize mirror_offset = 0;
-        const Mirror* mir = !ov && cacheable && r.kind == Resource::StorageBuffer ? mirror(range.address, range.size, &mirror_offset)
+        VkBuffer snapshot_buffer = VK_NULL_HANDLE;
+        VkDeviceSize snapshot_offset = 0;
+        const uint8_t* snapshot_data = nullptr;
+        const VkDeviceSize snapshot_size = std::min<VkDeviceSize>(range.size, limits.maxStorageBufferRange);
+        if (!ov && snapshot_read && !gather_mixed(range.address, snapshot_size, &snapshot_buffer, &snapshot_offset, &snapshot_data)) {
+            return skipped("mixed SSBO snapshot failed");
+        }
+        const Mirror* mir = !ov && !snapshot_buffer && cacheable && r.kind == Resource::StorageBuffer ? mirror(range.address, range.size, &mirror_offset)
                                                                                   : nullptr;
-        if (vigilar_nan_ && !ov && r.kind == Resource::StorageBuffer && range.address && range.size)  // DEPURACIÓN
+        if (vigilar_nan_ && !ov && !snapshot_buffer && r.kind == Resource::StorageBuffer && range.address && range.size)
             note_partial_read(r.is_written ? "un compute (SSBO escrito)" : "un compute", range.address, size);
         const char* from = "staging";  // DEPURACIÓN (read_after_dispatch)
         if (ov) {
             from = "overlay";
             buffers.push_back({ov->buffer, ov_offset, size});
+        } else if (snapshot_buffer) {
+            from = "snapshot";
+            buffers.push_back({snapshot_buffer, snapshot_offset, snapshot_size});
         } else if (mir) {
             from = "espejo";
             buffers.push_back({mir->buffer, mirror_offset, range.size});
@@ -10750,6 +10989,19 @@ void Executor::dispatch(const cmd::Dispatch& v) {
                 writebacks.push_back({a.data, range.address, static_cast<size_t>(size)});
             buffers.push_back({a.buffer, a.offset, size});
         }
+        if (trace_face_remap && r.kind == Resource::StorageBuffer && r.cbuf_index == kComputeDriverBank &&
+            r.cbuf_offset == kComputeStorageBase + 16 && range.address && range.size) {
+            // The shader masks each S1 word to 22 bits and indexes 12-byte entries in S0.
+            // Snapshot both views so the first bad input can be assigned to the upload or the guest.
+            face_remap = buffers.back();
+            mkdir("/storage/emulated/0/NieR-volcados", 0775);
+            std::ofstream guest(remap_file + ".guest.bin", std::ios::binary);
+            guest.write(reinterpret_cast<const char*>(range.address), face_remap.range);
+            guest.close();
+            NVN_LOG("normal remap: %s guest=%s source=%s address=%#llx map_bytes=%llu sums_bytes=%llu\n",
+                    remap_file.c_str(), guest ? "saved" : "failed", from, (unsigned long long)range.address,
+                    (unsigned long long)face_remap.range, (unsigned long long)sb.storage[0].size);
+        }
         if (read_after_) {  // DEPURACIÓN (read_after_dispatch): lo que recibe de verdad, para registrarlo tras ejecutarse
             char b[32];
             const bool driver_bank = r.cbuf_index == kComputeDriverBank;
@@ -10762,7 +11014,7 @@ void Executor::dispatch(const cmd::Dispatch& v) {
             else
                 snprintf(b, sizeof b, "ssbo c%u[0x%x]", r.cbuf_index, r.cbuf_offset);
             read_inputs.push_back({b, src == driver ? 0 : range.address, range.size, from,
-                                   r.kind == Resource::UniformBuffer ? 16u : 4u, buffers.back()});
+                                   r.kind == Resource::UniformBuffer ? 16u : 4u, buffers.back(), snapshot_data});
             if (ov && r.kind == Resource::StorageBuffer && r.is_written && read_after_size(range.size))
                 read_ranges.push_back({range.address, range.size});
         }
@@ -10832,6 +11084,10 @@ void Executor::dispatch(const cmd::Dispatch& v) {
         begin();
     }
     if (!read_ranges.empty()) read_after_dispatch(*cs, x, y, z, read_ranges, read_inputs);  // DEPURACIÓN
+    if (face_remap.buffer) {
+        dump_gpu_buffer(face_remap, face_remap.range, remap_file + ".gpu.bin");
+        begin();
+    }
 }
 
 bool Executor::blit(Texture& t, const VkRect2D& crop, VkImage dst, VkFormat format, VkExtent2D extent,
@@ -11961,6 +12217,12 @@ void Executor::profile_frame() {
         prof_lost_.clear();
         prof_merged_ = prof_merged_parts_ = prof_merged_bytes_ = prof_partial_patched_ = prof_split_ = 0;
     }
+    if (prof_gather_ || prof_gather_capped_)  // cada unión corta el pase: aquí se ve lo que cuestan
+        NVN_LOG("perfil overlays: %.1f copias de streams de vértices por frame (%.1f streams, %.1f KB; cada una corta el "
+                "pase), %.1f saltadas por el tope%s\n",
+                prof_gather_ / double(period), prof_gather_streams_ / double(period), prof_gather_bytes_ / 1024.0 / double(period),
+                prof_gather_capped_ / double(period), !gather_vertex_streams_ ? " (no_gather_vertex_streams)" : "");
+    prof_gather_ = prof_gather_streams_ = prof_gather_bytes_ = prof_gather_capped_ = 0;
     prof_overlay_new_bytes_ = prof_overlay_reused_bytes_ = prof_compactions_ = prof_compact_wait_us_ = prof_compact_copy_us_ = 0;
     prof_partial_ = 0;
     memset(prof_reads_, 0, sizeof prof_reads_);
